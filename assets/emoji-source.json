@@ -1,0 +1,13 @@
+{
+  "name": "Noto Emoji",
+  "copyright": "Copyright 2013 Google LLC",
+  "license": "OFL-1.1",
+  "repository": "https://github.com/googlefonts/noto-emoji",
+  "commit": "99701e07d3d1fe1bdbcdb14964547f0fd592966f",
+  "font_path": "2D/fonts/NotoColorEmoji.ttf",
+  "font_sha256": "15671215ab769fdc7162a045d56fd7d7e477c51b04e6b3c761d914d8fdd6cc44",
+  "license_path": "licenses/NotoEmoji-LICENSE.txt",
+  "license_sha256": "500bb1ccf43df7bbb522112f9133a52b16e1c35e809632f5d8609b179152de5b",
+  "generator": "scripts/generate_emoji_sheet.py",
+  "output": "assets/emoji-sheet.png"
+}

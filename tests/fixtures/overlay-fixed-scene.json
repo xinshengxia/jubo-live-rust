@@ -1,0 +1,85 @@
+{
+ "initial_delay_ms": 1200,
+ "interval_ms": 160,
+ "events": [
+  {
+   "SuperChat": {
+    "id": "sc-1",
+    "user": "合成舰长",
+    "text": "右上角付费留言，用于验证固定弹幕避让",
+    "price_cents": 3000,
+    "duration_secs": 300
+   }
+  },
+  {
+   "Message": {
+    "id": "f1",
+    "user": "甲",
+    "text": "顶部固定留言",
+    "color": 16776960,
+    "mode": "Top",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "f2",
+    "user": "乙",
+    "text": "底部固定留言",
+    "color": 16776960,
+    "mode": "Bottom",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "f3",
+    "user": "丙",
+    "text": "这条顶部固定留言很长，用来验证固定弹幕水平居中与换行边界",
+    "color": 16777215,
+    "mode": "Top",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "f4",
+    "user": "丁",
+    "text": "底部固定弹幕二",
+    "color": 16711680,
+    "mode": "Bottom",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "s1",
+    "user": "戊",
+    "text": "滚动弹幕从右进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "s2",
+    "user": "己",
+    "text": "第二条滚动弹幕",
+    "color": 65280,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "s3",
+    "user": "庚",
+    "text": "逆向弹幕向左",
+    "color": 255,
+    "mode": "Reverse",
+    "font_size": 25
+   }
+  }
+ ]
+}

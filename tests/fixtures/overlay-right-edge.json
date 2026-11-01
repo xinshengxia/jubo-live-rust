@@ -1,0 +1,16 @@
+{
+ "initial_delay_ms": 3900,
+ "interval_ms": 100,
+ "events": [
+  {
+   "Message": {
+    "id": "right-1",
+    "user": "右缘",
+    "text": "右缘进入测试",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 27
+   }
+  }
+ ]
+}

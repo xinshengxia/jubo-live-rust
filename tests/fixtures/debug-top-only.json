@@ -1,0 +1,26 @@
+{
+ "initial_delay_ms": 800,
+ "interval_ms": 200,
+ "events": [
+  {
+   "Message": {
+    "id": "t1",
+    "user": "甲",
+    "text": "顶部固定一",
+    "color": 16776960,
+    "mode": "Top",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "t2",
+    "user": "乙",
+    "text": "顶部固定二",
+    "color": 16776960,
+    "mode": "Top",
+    "font_size": 25
+   }
+  }
+ ]
+}

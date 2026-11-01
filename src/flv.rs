@@ -1,0 +1,797 @@
+//! Bounded FLV framing and a reconnect timeline, implemented from the file format.
+//!
+//! The relay forwards complete tags only. A truncated upstream tag is discarded
+//! with that upstream connection rather than spliced into the next response.
+
+use std::io::{self, ErrorKind, Read};
+
+pub const MAX_TAG_PAYLOAD: usize = 8 * 1024 * 1024;
+pub const MAX_HEADER_BYTES: usize = 4096;
+
+fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(ErrorKind::InvalidData, message)
+}
+
+/// Read the FLV header, optional header extension, and PreviousTagSize0.
+pub fn read_header<R: Read>(input: &mut R) -> io::Result<Vec<u8>> {
+    let mut basic = [0_u8; 9];
+    input.read_exact(&mut basic)?;
+    if &basic[..3] != b"FLV" || basic[3] != 1 || basic[4] & !5 != 0 {
+        return Err(invalid("invalid FLV header"));
+    }
+    let offset = u32::from_be_bytes(basic[5..9].try_into().unwrap()) as usize;
+    if !(9..=MAX_HEADER_BYTES).contains(&offset) {
+        return Err(invalid("invalid FLV data offset"));
+    }
+    let mut header = vec![0; offset + 4];
+    header[..9].copy_from_slice(&basic);
+    input.read_exact(&mut header[9..])?;
+    if header[offset..] != [0, 0, 0, 0] {
+        return Err(invalid("invalid FLV initial previous-tag size"));
+    }
+    Ok(header)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlvTag {
+    bytes: Vec<u8>,
+}
+
+impl FlvTag {
+    /// Construct a standard tag, useful for adapters and synthetic fixtures.
+    pub fn new(kind: u8, timestamp: u32, payload: &[u8]) -> io::Result<Self> {
+        if !matches!(kind, 8 | 9 | 18) || payload.len() > MAX_TAG_PAYLOAD {
+            return Err(invalid("invalid FLV tag kind or size"));
+        }
+        let length = payload.len();
+        let mut bytes = vec![0; 11 + length + 4];
+        bytes[0] = kind;
+        bytes[1] = (length >> 16) as u8;
+        bytes[2] = (length >> 8) as u8;
+        bytes[3] = length as u8;
+        bytes[11..11 + length].copy_from_slice(payload);
+        bytes[11 + length..].copy_from_slice(&((11 + length) as u32).to_be_bytes());
+        let mut tag = Self { bytes };
+        tag.set_timestamp(timestamp);
+        Ok(tag)
+    }
+
+    pub fn kind(&self) -> u8 {
+        self.bytes[0]
+    }
+    pub fn timestamp(&self) -> u32 {
+        (u32::from(self.bytes[7]) << 24)
+            | (u32::from(self.bytes[4]) << 16)
+            | (u32::from(self.bytes[5]) << 8)
+            | u32::from(self.bytes[6])
+    }
+    pub fn set_timestamp(&mut self, timestamp: u32) {
+        self.bytes[4] = (timestamp >> 16) as u8;
+        self.bytes[5] = (timestamp >> 8) as u8;
+        self.bytes[6] = timestamp as u8;
+        self.bytes[7] = (timestamp >> 24) as u8;
+    }
+    pub fn payload(&self) -> &[u8] {
+        &self.bytes[11..self.bytes.len() - 4]
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Hand the framed bytes back to the caller so a relay loop can move the
+    /// allocation into its scratch buffer instead of freeing it per tag.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// AAC, AVC/HEVC, or enhanced-video sequence initialization packets.
+    /// These frequently carry timestamp zero and must survive reconnects.
+    pub fn is_codec_header(&self) -> bool {
+        let p = self.payload();
+        if p.len() < 2 {
+            return false;
+        }
+        match self.kind() {
+            8 => p[0] >> 4 == 10 && p[1] == 0,
+            9 => {
+                ((matches!(p[0] & 15, 7 | 12)) && p[1] == 0)
+                    || (p[0] & 0x80 != 0 && p[0] & 15 == 0 && p.len() >= 5)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// EOF is normal only at a tag boundary; partial headers/bodies are errors.
+pub fn read_tag<R: Read>(input: &mut R) -> io::Result<Option<FlvTag>> {
+    let mut header = [0_u8; 11];
+    loop {
+        match input.read(&mut header[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    input.read_exact(&mut header[1..])?;
+    if !matches!(header[0], 8 | 9 | 18) || header[8..11] != [0, 0, 0] {
+        return Err(invalid("invalid FLV tag header"));
+    }
+    let length =
+        (usize::from(header[1]) << 16) | (usize::from(header[2]) << 8) | usize::from(header[3]);
+    if length > MAX_TAG_PAYLOAD {
+        return Err(invalid("FLV tag exceeds size limit"));
+    }
+    let mut bytes = vec![0; 11 + length + 4];
+    bytes[..11].copy_from_slice(&header);
+    input.read_exact(&mut bytes[11..])?;
+    let previous_size = u32::from_be_bytes(bytes[11 + length..].try_into().unwrap());
+    if previous_size != (11 + length) as u32 {
+        return Err(invalid("invalid FLV previous-tag size"));
+    }
+    Ok(Some(FlvTag { bytes }))
+}
+
+/// Same framing rules as read_tag, but reuses the caller's buffer so a relay
+/// forwarding tens of thousands of tags per second does not allocate and free
+/// one Vec per tag. The buffer is consumed by the returned tag; call
+/// FlvTag::into_bytes after forwarding to hand the allocation back.
+///
+/// The buffer keeps whatever capacity the largest recycled tag needed. A relay
+/// should drop it after an unusually large tag instead of pinning that memory.
+pub fn read_tag_reusing<R: Read>(
+    input: &mut R,
+    scratch: &mut Vec<u8>,
+) -> io::Result<Option<FlvTag>> {
+    let mut header = [0_u8; 11];
+    loop {
+        match input.read(&mut header[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    input.read_exact(&mut header[1..])?;
+    if !matches!(header[0], 8 | 9 | 18) || header[8..11] != [0, 0, 0] {
+        return Err(invalid("invalid FLV tag header"));
+    }
+    let length =
+        (usize::from(header[1]) << 16) | (usize::from(header[2]) << 8) | usize::from(header[3]);
+    if length > MAX_TAG_PAYLOAD {
+        return Err(invalid("FLV tag exceeds size limit"));
+    }
+    let mut bytes = std::mem::take(scratch);
+    bytes.resize(11 + length + 4, 0);
+    bytes[..11].copy_from_slice(&header);
+    input.read_exact(&mut bytes[11..])?;
+    let previous_size = u32::from_be_bytes(bytes[11 + length..].try_into().unwrap());
+    if previous_size != (11 + length) as u32 {
+        return Err(invalid("invalid FLV previous-tag size"));
+    }
+    Ok(Some(FlvTag { bytes }))
+}
+
+/// Bounded onMetaData summary used by the diagnostic streaminfo command.
+/// A stream without a leading script tag simply reports None.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StreamInfo {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    pub video_kbps: u32,
+    pub codec: Option<CodecKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodecKind {
+    H264,
+    Hevc,
+    H263,
+    Vp6,
+}
+
+impl CodecKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+            Self::H263 => "h263",
+            Self::Vp6 => "vp6",
+        }
+    }
+
+    fn from_id(id: u32) -> Option<Self> {
+        match id {
+            2 => Some(Self::H263),
+            4 => Some(Self::Vp6),
+            7 => Some(Self::H264),
+            12 => Some(Self::Hevc),
+            _ => None,
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        let lower = name.to_ascii_lowercase();
+        if lower.contains("avc") || lower.contains("h264") {
+            return Some(Self::H264);
+        }
+        if lower.contains("hev") || lower.contains("h265") {
+            return Some(Self::Hevc);
+        }
+        None
+    }
+}
+
+/// Upper bound on the onMetaData payload parsed by read_stream_info.
+pub const MAX_STREAM_INFO_BYTES: usize = 64 * 1024;
+const WINDOW_RECYCLE_LIMIT: usize = 1024 * 1024;
+
+/// Read the FLV header and first tag; when that tag is an onMetaData script tag,
+/// return its bounded summary. Consumes exactly the header plus that one tag, so
+/// a following live measurement can continue at the next tag boundary.
+pub fn read_stream_info<R: Read>(input: &mut R) -> io::Result<Option<StreamInfo>> {
+    read_header(input)?;
+    let mut scratch = Vec::new();
+    let Some(tag) = read_tag_reusing(input, &mut scratch)? else {
+        return Ok(None);
+    };
+    if tag.kind() != 18 || tag.payload().len() > MAX_STREAM_INFO_BYTES {
+        return Ok(None);
+    }
+    Ok(parse_stream_info(tag.payload()))
+}
+
+/// Parse an onMetaData AMF0 script payload without allocating per property.
+/// Unsupported AMF0 value kinds end the scan instead of guessing; numeric
+/// fields already parsed stay usable, matching the reference diagnostics.
+fn parse_stream_info(payload: &[u8]) -> Option<StreamInfo> {
+    if payload.first() != Some(&0x02) {
+        return None;
+    }
+    let mut p = 1usize;
+    let name_len = usize::from(u16::from_be_bytes([*payload.get(p)?, *payload.get(p + 1)?]));
+    p += 2 + name_len;
+    let table = *payload.get(p)?;
+    p += match table {
+        0x08 => 5,
+        0x03 => 1,
+        _ => return None,
+    };
+    let mut info = StreamInfo::default();
+    let mut found = false;
+    while p + 3 <= payload.len() {
+        if payload[p..p + 3] == [0, 0, 9] {
+            break;
+        }
+        let key_len = usize::from(u16::from_be_bytes([payload[p], payload[p + 1]]));
+        p += 2;
+        if key_len == 0 || p + key_len >= payload.len() {
+            break;
+        }
+        let key = String::from_utf8_lossy(&payload[p..p + key_len]).into_owned();
+        p += key_len;
+        let marker = payload[p];
+        p += 1;
+        match marker {
+            0x00 => {
+                if p + 8 > payload.len() {
+                    break;
+                }
+                let value = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap());
+                p += 8;
+                match key.as_str() {
+                    "width" => {
+                        info.width = value.max(0.0).round() as u32;
+                        found = true;
+                    }
+                    "height" => {
+                        info.height = value.max(0.0).round() as u32;
+                        found = true;
+                    }
+                    "framerate" => {
+                        info.fps = value.max(0.0);
+                        found = true;
+                    }
+                    "videodatarate" => {
+                        info.video_kbps = value.max(0.0).round() as u32;
+                        found = true;
+                    }
+                    "videocodecid" => {
+                        info.codec = CodecKind::from_id(value.max(0.0).round() as u32);
+                        found |= info.codec.is_some();
+                    }
+                    _ => {}
+                }
+            }
+            0x01 => p += 1,
+            0x02 => {
+                if p + 2 > payload.len() {
+                    break;
+                }
+                let len = usize::from(u16::from_be_bytes([payload[p], payload[p + 1]]));
+                if p + 2 + len > payload.len() {
+                    break;
+                }
+                if key.as_str() == "codecname" && info.codec.is_none() {
+                    info.codec = CodecKind::from_name(&String::from_utf8_lossy(
+                        &payload[p + 2..p + 2 + len],
+                    ));
+                }
+                p += 2 + len;
+            }
+            0x0c => {
+                if p + 4 > payload.len() {
+                    break;
+                }
+                let len = u32::from_be_bytes(payload[p..p + 4].try_into().unwrap()) as usize;
+                if p + 4 + len > payload.len() {
+                    break;
+                }
+                p += 4 + len;
+            }
+            0x05 | 0x06 => {}
+            0x0b => p += 10,
+            _ => break,
+        }
+    }
+    (found || info.codec.is_some()).then_some(info)
+}
+
+/// Largest per-tag timestamp step accepted as one continuous media interval.
+/// Larger steps (ad splice, absolute-time base change, stream discontinuity)
+/// are counted as anomalies instead of stretching the measured window.
+pub const MAX_TIMELINE_JUMP_MS: i64 = 2000;
+
+/// Video-track measurement over a bounded live window. The media span is the
+/// sum of accepted consecutive timestamp steps, not the raw last-first span:
+/// some CDNs splice absolute-time or disconnected segments into one response,
+/// and the raw span then reports thousands of seconds for a 3 second window.
+/// Raw span, wall clock and anomaly count are kept as diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VideoWindow {
+    pub frames: u64,
+    pub intervals: u64,
+    pub video_bytes: u64,
+    pub span_ms: u64,
+    pub raw_span_ms: u64,
+    pub wall_ms: u64,
+    pub fps: f64,
+    pub kbps: u32,
+    pub median_delta_ms: f64,
+    pub anomalies: u64,
+    /// True when timestamps cannot be trusted as continuous milliseconds
+    /// (media span far beyond the wall clock, an implausible interval rate, or
+    /// a majority of discontinuities). Consumers must treat fps/kbps as
+    /// unavailable in that case.
+    pub timeline_suspect: bool,
+}
+
+/// Read complete tags until the byte budget or deadline, then derive the video
+/// frame rate and bitrate. Returns None when the window had no usable span.
+/// The caller must position the reader at a tag boundary: streaminfo calls this
+/// after read_stream_info.
+pub fn measure_video_window<R: Read>(
+    input: &mut R,
+    max_bytes: usize,
+    deadline: std::time::Instant,
+) -> io::Result<Option<VideoWindow>> {
+    let started = std::time::Instant::now();
+    let mut scratch = Vec::new();
+    let mut frames = 0u64;
+    let mut intervals = 0u64;
+    let mut video_bytes = 0u64;
+    let mut raw_first: Option<u32> = None;
+    let mut raw_last = 0u32;
+    let mut previous: Option<u32> = None;
+    let mut span_ms = 0u64;
+    let mut anomalies = 0u64;
+    let mut deltas: Vec<u32> = Vec::new();
+    let mut budget = max_bytes;
+    while budget > 0 && std::time::Instant::now() < deadline {
+        let Some(tag) = read_tag_reusing(input, &mut scratch)? else {
+            break;
+        };
+        let framed = tag.as_bytes().len();
+        budget = budget.saturating_sub(framed);
+        if tag.kind() == 9 {
+            let timestamp = tag.timestamp();
+            raw_first.get_or_insert(timestamp);
+            raw_last = raw_last.max(timestamp);
+            if let Some(previous) = previous {
+                let delta = i64::from(timestamp) - i64::from(previous);
+                if delta > 0 && delta <= MAX_TIMELINE_JUMP_MS {
+                    span_ms = span_ms.saturating_add(delta as u64);
+                    intervals += 1;
+                    if deltas.len() < 8192 {
+                        deltas.push(delta as u32);
+                    }
+                } else {
+                    // A duplicate, backward reset or multi-second jump starts a
+                    // new continuous interval instead of stretching the window.
+                    anomalies += 1;
+                }
+            }
+            frames += 1;
+            video_bytes += framed as u64;
+            previous = Some(timestamp);
+        }
+        if framed <= WINDOW_RECYCLE_LIMIT {
+            scratch = tag.into_bytes();
+        }
+    }
+    let Some(first_timestamp) = raw_first else {
+        return Ok(None);
+    };
+    let wall_ms = started.elapsed().as_millis() as u64;
+    if frames < 2 || intervals == 0 || span_ms <= 200 {
+        return Ok(None);
+    }
+    let raw_span_ms = u64::from(raw_last.saturating_sub(first_timestamp));
+    deltas.sort_unstable();
+    let median_delta_ms = f64::from(deltas[deltas.len() / 2]);
+    let seconds = span_ms as f64 / 1000.0;
+    let fps = intervals as f64 / seconds;
+    let kbps = (video_bytes as f64 * 8.0 / 1000.0 / seconds).round() as u32;
+    // A real bounded window cannot contain many times more media time than the
+    // wall clock it was captured in (an initial GOP burst stays well under 4x),
+    // and fewer than 1 or more than 240 intervals per second means the tags do
+    // not carry plain millisecond timestamps.
+    let total_steps = intervals + anomalies;
+    let timeline_suspect = span_ms > wall_ms.saturating_mul(4).saturating_add(2000)
+        || !(1.0..=240.0).contains(&fps)
+        || (total_steps > 0 && anomalies.saturating_mul(4) > total_steps.saturating_mul(3));
+    Ok(Some(VideoWindow {
+        frames,
+        intervals,
+        video_bytes,
+        span_ms,
+        raw_span_ms,
+        wall_ms,
+        fps,
+        kbps,
+        median_delta_ms,
+        anomalies,
+        timeline_suspect,
+    }))
+}
+
+/// Media tracks have separate watermarks: equal audio/video timestamps are valid.
+/// Duplicate filtering is enabled only while catching up after a reconnect.
+#[derive(Debug, Default)]
+pub struct ReconnectTimeline {
+    last: [Option<u64>; 2],
+    catching_up: [bool; 2],
+    shift: u64,
+    rebased: bool,
+}
+
+impl ReconnectTimeline {
+    pub fn begin_reconnect(&mut self) {
+        self.catching_up = [self.last[0].is_some(), self.last[1].is_some()];
+        self.rebased = false;
+    }
+
+    /// Return true when the complete tag should be forwarded.
+    pub fn accept(&mut self, tag: &mut FlvTag) -> bool {
+        let boundary = self.last.iter().flatten().copied().max().unwrap_or(0);
+        if tag.is_codec_header() {
+            tag.set_timestamp(boundary.min(u64::from(u32::MAX)) as u32);
+            return true;
+        }
+        let slot = match tag.kind() {
+            8 => 0,
+            9 => 1,
+            _ => return true,
+        };
+        let raw = u64::from(tag.timestamp());
+        let mut adjusted = raw.saturating_add(self.shift);
+        if self.catching_up[slot] {
+            let last = self.last[slot].unwrap_or(0);
+            if adjusted > last {
+                self.catching_up[slot] = false;
+            } else if !self.rebased && raw < 1000 && last.saturating_sub(self.shift) > 5000 {
+                // A fresh upstream clock is distinct from a short overlapping tail.
+                self.shift = boundary.saturating_add(1).saturating_sub(raw);
+                adjusted = raw.saturating_add(self.shift);
+                self.rebased = true;
+                self.catching_up[slot] = false;
+            } else {
+                return false;
+            }
+        }
+        // A 32-bit FLV timestamp cannot represent a rebased session beyond this.
+        // End this segment rather than silently wrapping and corrupting its clock.
+        if adjusted > u64::from(u32::MAX) {
+            return false;
+        }
+        self.last[slot] = Some(self.last[slot].unwrap_or(0).max(adjusted));
+        tag.set_timestamp(adjusted as u32);
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn media(kind: u8, timestamp: u32) -> FlvTag {
+        FlvTag::new(
+            kind,
+            timestamp,
+            if kind == 8 {
+                &[0xaf, 1, 9]
+            } else {
+                &[0x27, 1, 9]
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn validates_header_and_preserves_extensions() {
+        let header = b"FLV\x01\x05\x00\x00\x00\x0bXY\0\0\0\0";
+        assert_eq!(read_header(&mut Cursor::new(header)).unwrap(), header);
+        assert!(read_header(&mut Cursor::new(b"FLV\x01\x05\xff\xff\xff\xff")).is_err());
+        assert!(read_header(&mut Cursor::new(b"FLV\x01\x05\0\0\0\x09\0\0\0\x01")).is_err());
+    }
+
+    #[test]
+    fn tag_roundtrip_and_truncation() {
+        let tag = media(9, 0xfedcba98);
+        let bytes = tag.as_bytes();
+        assert_eq!(
+            read_tag(&mut Cursor::new(bytes)).unwrap(),
+            Some(tag.clone())
+        );
+        for len in 1..bytes.len() {
+            assert!(read_tag(&mut Cursor::new(&bytes[..len])).is_err());
+        }
+        assert!(read_tag(&mut Cursor::new([])).unwrap().is_none());
+    }
+
+    #[test]
+    fn reusing_reader_matches_read_tag_and_recycles_the_allocation() {
+        let mut framed = Vec::new();
+        for (kind, timestamp) in [(9_u8, 1000_u32), (8, 1000), (9, 1010), (18, 0)] {
+            framed.extend_from_slice(&media(kind, timestamp).as_bytes());
+        }
+        let mut expected = Cursor::new(framed.clone());
+        let mut actual = Cursor::new(framed.clone());
+        let mut scratch = Vec::new();
+        loop {
+            let expected_tag = read_tag(&mut expected).unwrap();
+            let Some(tag) = read_tag_reusing(&mut actual, &mut scratch).unwrap() else {
+                assert!(expected_tag.is_none());
+                break;
+            };
+            assert_eq!(Some(tag.clone()), expected_tag);
+            let framed_len = tag.as_bytes().len();
+            scratch = tag.into_bytes();
+            assert_eq!(scratch.len(), framed_len);
+        }
+        // Truncation and bad framing behave exactly like read_tag.
+        let mut tag = media(8, 10).as_bytes().to_vec();
+        *tag.last_mut().unwrap() ^= 1;
+        assert!(read_tag_reusing(&mut Cursor::new(tag), &mut scratch).is_err());
+    }
+
+    #[test]
+    fn reusing_reader_keeps_capacity_for_later_smaller_tags() {
+        let large = FlvTag::new(9, 10, &vec![0x27_u8; 64 * 1024]).unwrap();
+        let small = media(8, 20);
+        let mut scratch = Vec::new();
+        let mut cursor = Cursor::new(large.as_bytes());
+        let tag = read_tag_reusing(&mut cursor, &mut scratch)
+            .unwrap()
+            .unwrap();
+        scratch = tag.into_bytes();
+        let capacity = scratch.capacity();
+        assert!(capacity >= 64 * 1024);
+        let mut cursor = Cursor::new(small.as_bytes());
+        let tag = read_tag_reusing(&mut cursor, &mut scratch)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tag, small);
+        scratch = tag.into_bytes();
+        assert_eq!(scratch.capacity(), capacity, "capacity must be reused");
+    }
+
+    fn amf0_key(key: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        out.extend_from_slice(key.as_bytes());
+        out
+    }
+
+    fn amf0_number(key: &str, value: f64) -> Vec<u8> {
+        let mut out = amf0_key(key);
+        out.push(0x00);
+        out.extend_from_slice(&value.to_be_bytes());
+        out
+    }
+
+    fn metadata_payload() -> Vec<u8> {
+        let mut out = vec![0x02];
+        out.extend_from_slice(&(b"onMetaData".len() as u16).to_be_bytes());
+        out.extend_from_slice(b"onMetaData");
+        out.push(0x08);
+        out.extend_from_slice(&5_u32.to_be_bytes());
+        out.extend_from_slice(&amf0_number("width", 1280.0));
+        out.extend_from_slice(&amf0_number("height", 720.0));
+        out.extend_from_slice(&amf0_number("framerate", 30.0));
+        out.extend_from_slice(&amf0_number("videodatarate", 2500.0));
+        out.extend_from_slice(&amf0_number("videocodecid", 7.0));
+        out.extend_from_slice(&[0x00, 0x00, 0x09]);
+        out
+    }
+
+    #[test]
+    fn stream_info_parses_on_metadata_and_rejects_missing_script_tag() {
+        let mut stream = b"FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00".to_vec();
+        stream.extend_from_slice(FlvTag::new(18, 0, &metadata_payload()).unwrap().as_bytes());
+        let mut cursor = Cursor::new(&stream);
+        let info = read_stream_info(&mut cursor).unwrap().unwrap();
+        assert_eq!((info.width, info.height), (1280, 720));
+        assert!((info.fps - 30.0).abs() < f64::EPSILON);
+        assert_eq!(info.video_kbps, 2500);
+        assert_eq!(info.codec, Some(CodecKind::H264));
+        // Consumes the header plus exactly one script tag.
+        assert_eq!(cursor.position() as usize, stream.len());
+
+        let mut media_only = b"FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00".to_vec();
+        media_only.extend_from_slice(media(9, 0).as_bytes());
+        assert!(
+            read_stream_info(&mut Cursor::new(media_only))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn video_window_measures_fps_and_bitrate_from_video_tags_only() {
+        let mut stream = Vec::new();
+        for index in 0..11_u32 {
+            stream.extend_from_slice(media(8, index * 100).as_bytes());
+            let video = FlvTag::new(9, index * 100, &[0x27, 1, 7, 2, 3]).unwrap();
+            stream.extend_from_slice(video.as_bytes());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let window = measure_video_window(&mut Cursor::new(&stream), 1 << 20, deadline)
+            .unwrap()
+            .unwrap();
+        assert_eq!(window.frames, 11);
+        assert_eq!(window.span_ms, 1000);
+        assert!((window.fps - 10.0).abs() < 1e-9);
+        let expected_kbps = (window.video_bytes as f64 * 8.0 / 1000.0).round() as u32;
+        assert_eq!(window.kbps, expected_kbps);
+
+        let mut audio_only = Vec::new();
+        for index in 0..11_u32 {
+            audio_only.extend_from_slice(media(8, index * 100).as_bytes());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert!(
+            measure_video_window(&mut Cursor::new(audio_only), 1 << 20, deadline)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn video_window_ignores_timestamp_splices_and_absolute_time_bases() {
+        // Three 30 fps frames, then a CDN absolute-time base change, then the
+        // same cadence continues. The splice must not stretch the window.
+        let mut stream = Vec::new();
+        for timestamp in [0_u32, 100, 200] {
+            stream.extend_from_slice(FlvTag::new(9, timestamp, &[0x27, 1, 7]).unwrap().as_bytes());
+        }
+        for timestamp in [1_700_000_000_u32, 1_700_000_100, 1_700_000_200] {
+            stream.extend_from_slice(FlvTag::new(9, timestamp, &[0x27, 1, 7]).unwrap().as_bytes());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let window = measure_video_window(&mut Cursor::new(&stream), 1 << 20, deadline)
+            .unwrap()
+            .unwrap();
+        assert_eq!(window.frames, 6);
+        assert_eq!(window.intervals, 4);
+        assert_eq!(window.anomalies, 1);
+        assert_eq!(window.span_ms, 400, "only the accepted 100 ms steps count");
+        assert_eq!(window.raw_span_ms, 1_700_000_200);
+        assert!((window.fps - 10.0).abs() < 0.01);
+        assert!(!window.timeline_suspect);
+    }
+
+    #[test]
+    fn video_window_counts_duplicate_and_backward_timestamps_as_anomalies() {
+        let mut stream = Vec::new();
+        for timestamp in [0_u32, 100, 200, 200, 300, 250] {
+            stream.extend_from_slice(FlvTag::new(9, timestamp, &[0x27, 1, 7]).unwrap().as_bytes());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let window = measure_video_window(&mut Cursor::new(&stream), 1 << 20, deadline)
+            .unwrap()
+            .unwrap();
+        assert_eq!(window.frames, 6);
+        assert_eq!(window.intervals, 3);
+        assert_eq!(window.anomalies, 2);
+        assert_eq!(window.span_ms, 300);
+        assert!((window.fps - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn video_window_marks_implausible_timeline_unreliable() {
+        // 5 accepted intervals of 1.9 s can never fit a real bounded window:
+        // this stands in for a non-millisecond timestamp unit and must be
+        // reported as unreliable rather than as a tiny fps.
+        let mut stream = Vec::new();
+        let mut timestamp = 0_u32;
+        for _ in 0..6 {
+            stream.extend_from_slice(FlvTag::new(9, timestamp, &[0x27, 1, 7]).unwrap().as_bytes());
+            timestamp = timestamp.wrapping_add(1900);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let window = measure_video_window(&mut Cursor::new(&stream), 1 << 20, deadline)
+            .unwrap()
+            .unwrap();
+        assert_eq!(window.intervals, 5);
+        assert_eq!(window.span_ms, 9500);
+        assert!(window.timeline_suspect, "span far outside the wall window");
+        assert!(window.fps < 1.0);
+    }
+
+    #[test]
+    fn rejects_bad_previous_size_and_oversize_before_allocating() {
+        let mut tag = media(8, 10).as_bytes().to_vec();
+        *tag.last_mut().unwrap() ^= 1;
+        assert!(read_tag(&mut Cursor::new(tag)).is_err());
+        let mut oversized = [0_u8; 11];
+        oversized[0] = 9;
+        oversized[1] = 0x80;
+        oversized[3] = 1;
+        assert_eq!(
+            read_tag(&mut Cursor::new(oversized)).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn only_reconnect_overlap_is_dropped_and_tracks_are_independent() {
+        let mut timeline = ReconnectTimeline::default();
+        for kind in [8, 9] {
+            assert!(timeline.accept(&mut media(kind, 2000)));
+            assert!(timeline.accept(&mut media(kind, 2000)));
+        }
+        timeline.begin_reconnect();
+        for kind in [8, 9] {
+            assert!(!timeline.accept(&mut media(kind, 1999)));
+            assert!(!timeline.accept(&mut media(kind, 2000)));
+            assert!(timeline.accept(&mut media(kind, 2001)));
+            assert!(timeline.accept(&mut media(kind, 2001)));
+        }
+    }
+
+    #[test]
+    fn repeated_clock_resets_rebase_both_tracks_and_preserve_codec_headers() {
+        let mut timeline = ReconnectTimeline::default();
+        assert!(timeline.accept(&mut media(8, 9000)));
+        assert!(timeline.accept(&mut media(9, 9000)));
+        timeline.begin_reconnect();
+        let mut codec = FlvTag::new(9, 0, &[0x17, 0, 1]).unwrap();
+        assert!(timeline.accept(&mut codec));
+        assert_eq!(codec.timestamp(), 9000);
+        let mut audio = media(8, 0);
+        assert!(timeline.accept(&mut audio));
+        assert_eq!(audio.timestamp(), 9001);
+        let mut video = media(9, 0);
+        assert!(timeline.accept(&mut video));
+        assert_eq!(video.timestamp(), 9001);
+        assert!(timeline.accept(&mut media(8, 7000)));
+        assert!(timeline.accept(&mut media(9, 7000)));
+        timeline.begin_reconnect();
+        let mut reset = media(9, 0);
+        assert!(timeline.accept(&mut reset));
+        assert_eq!(reset.timestamp(), 16002);
+    }
+}

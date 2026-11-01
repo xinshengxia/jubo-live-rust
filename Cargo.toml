@@ -1,0 +1,41 @@
+[package]
+name = "live-hub-rust"
+version = "1.0.0"
+edition = "2024"
+publish = false
+description = "Native Rust live-stream launcher and FLV relay"
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+eframe = { version = "0.33", optional = true, default-features = false, features = ["default_fonts", "glow"] }
+fs2 = "0.4"
+flate2 = "1"
+md5 = "0.7"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+qrcode = { version = "0.14.1", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls", "gzip", "deflate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+tungstenite = { version = "0.28", features = ["native-tls"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[[bin]]
+name = "live-hub-rust"
+path = "src/main.rs"

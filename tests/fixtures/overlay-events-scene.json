@@ -1,0 +1,108 @@
+{
+ "initial_delay_ms": 1200,
+ "interval_ms": 200,
+ "events": [
+  {
+   "Live": {
+    "id": "gift-1",
+    "kind": "Gift",
+    "user": "合成观众A",
+    "text": "小心心",
+    "count": 3
+   }
+  },
+  {
+   "Live": {
+    "id": "gift-2",
+    "kind": "Gift",
+    "user": "合成观众B",
+    "text": "小心心",
+    "count": 1
+   }
+  },
+  {
+   "Live": {
+    "id": "guard-1",
+    "kind": "Guard",
+    "user": "合成提督",
+    "text": "开通提督",
+    "count": 1
+   }
+  },
+  {
+   "Live": {
+    "id": "enter-1",
+    "kind": "Enter",
+    "user": "合成观众C",
+    "text": "",
+    "count": 1
+   }
+  },
+  {
+   "Live": {
+    "id": "notice-1",
+    "kind": "Notice",
+    "user": "",
+    "text": "合成直播间公告",
+    "count": 1
+   }
+  },
+  {
+   "Live": {
+    "id": "status-1",
+    "kind": "Status",
+    "user": "",
+    "text": "看过 1234",
+    "count": 1
+   }
+  },
+  {
+   "Live": {
+    "id": "status-2",
+    "kind": "Status",
+    "user": "",
+    "text": "点赞 5678",
+    "count": 1
+   }
+  },
+  {
+   "Live": {
+    "id": "status-3",
+    "kind": "Status",
+    "user": "",
+    "text": "高能榜 9",
+    "count": 1
+   }
+  },
+  {
+   "Message": {
+    "id": "e1",
+    "user": "甲",
+    "text": "事件避让 1",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "e2",
+    "user": "乙",
+    "text": "事件避让 2",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "e3",
+    "user": "丙",
+    "text": "事件避让 3",
+    "color": 65280,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  }
+ ]
+}

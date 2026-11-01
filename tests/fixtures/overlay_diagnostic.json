@@ -1,0 +1,87 @@
+{
+  "initial_delay_ms": 6000,
+  "interval_ms": 320,
+  "events": [
+    {
+      "Status": "合成离线弹幕源 · 诊断 fixture（无网络）"
+    },
+    {
+      "Message": {
+        "id": "syn-1",
+        "user": "合成用户A",
+        "text": "欢迎来到合成直播间！",
+        "color": 16777215,
+        "mode": "Scroll",
+        "font_size": 25
+      }
+    },
+    {
+      "Message": {
+        "id": "syn-2",
+        "user": "合成用户B",
+        "text": "这条弹幕用于验证透明覆盖层渲染",
+        "color": 16766720,
+        "mode": "Scroll",
+        "font_size": 25
+      }
+    },
+    {
+      "SuperChat": {
+        "id": "syn-sc-1",
+        "user": "合成舰长",
+        "text": "合成 SC 卡片，验证付费消息渲染",
+        "price_cents": 3000,
+        "duration_secs": 60
+      }
+    },
+    {
+      "Message": {
+        "id": "syn-3",
+        "user": "合成用户C",
+        "text": "1234567890 abcXYZ test",
+        "color": 65535,
+        "mode": "Scroll",
+        "font_size": 25
+      }
+    },
+    {
+      "Message": {
+        "id": "syn-4",
+        "user": "合成用户D",
+        "text": "第三条滚动弹幕（测试轨道分配）",
+        "color": 16711935,
+        "mode": "Scroll",
+        "font_size": 25
+      }
+    },
+    {
+      "SuperChat": {
+        "id": "syn-sc-2",
+        "user": "合成提督",
+        "text": "第二张 SC 卡片（橙色档位）",
+        "price_cents": 15000,
+        "duration_secs": 120
+      }
+    },
+    {
+      "Message": {
+        "id": "syn-5",
+        "user": "合成用户E",
+        "text": "覆盖层鼠标穿透与窗口跟随验收",
+        "color": 16777215,
+        "mode": "Scroll",
+        "font_size": 27
+      }
+    },
+    {
+      "Message": {
+        "id": "syn-6",
+        "user": "合成用户F",
+        "text": "最后一条合成弹幕",
+        "color": 255,
+        "mode": "Scroll",
+        "font_size": 25
+      }
+    }
+  ]
+}

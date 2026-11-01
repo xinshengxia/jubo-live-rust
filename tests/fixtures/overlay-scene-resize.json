@@ -1,0 +1,406 @@
+{
+ "initial_delay_ms": 1200,
+ "interval_ms": 260,
+ "events": [
+  {
+   "Message": {
+    "id": "r0",
+    "user": "u0",
+    "text": "resize 场景弹幕 1 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Top",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r1",
+    "user": "u1",
+    "text": "resize 场景弹幕 2 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r2",
+    "user": "u2",
+    "text": "resize 场景弹幕 3 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r3",
+    "user": "u3",
+    "text": "resize 场景弹幕 4 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r4",
+    "user": "u4",
+    "text": "resize 场景弹幕 5 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r5",
+    "user": "u5",
+    "text": "resize 场景弹幕 6 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r6",
+    "user": "u6",
+    "text": "resize 场景弹幕 7 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r7",
+    "user": "u7",
+    "text": "resize 场景弹幕 8 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Reverse",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r8",
+    "user": "u8",
+    "text": "resize 场景弹幕 9 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r9",
+    "user": "u9",
+    "text": "resize 场景弹幕 10 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Top",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r10",
+    "user": "u10",
+    "text": "resize 场景弹幕 11 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r11",
+    "user": "u11",
+    "text": "resize 场景弹幕 12 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Bottom",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r12",
+    "user": "u12",
+    "text": "resize 场景弹幕 13 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r13",
+    "user": "u13",
+    "text": "resize 场景弹幕 14 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r14",
+    "user": "u14",
+    "text": "resize 场景弹幕 15 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Reverse",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r15",
+    "user": "u15",
+    "text": "resize 场景弹幕 16 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r16",
+    "user": "u16",
+    "text": "resize 场景弹幕 17 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r17",
+    "user": "u17",
+    "text": "resize 场景弹幕 18 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r18",
+    "user": "u18",
+    "text": "resize 场景弹幕 19 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Top",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r19",
+    "user": "u19",
+    "text": "resize 场景弹幕 20 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r20",
+    "user": "u20",
+    "text": "resize 场景弹幕 21 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r21",
+    "user": "u21",
+    "text": "resize 场景弹幕 22 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Reverse",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r22",
+    "user": "u22",
+    "text": "resize 场景弹幕 23 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Bottom",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r23",
+    "user": "u23",
+    "text": "resize 场景弹幕 24 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r24",
+    "user": "u24",
+    "text": "resize 场景弹幕 25 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r25",
+    "user": "u25",
+    "text": "resize 场景弹幕 26 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r26",
+    "user": "u26",
+    "text": "resize 场景弹幕 27 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r27",
+    "user": "u27",
+    "text": "resize 场景弹幕 28 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Top",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r28",
+    "user": "u28",
+    "text": "resize 场景弹幕 29 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Reverse",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r29",
+    "user": "u29",
+    "text": "resize 场景弹幕 30 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r30",
+    "user": "u30",
+    "text": "resize 场景弹幕 31 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r31",
+    "user": "u31",
+    "text": "resize 场景弹幕 32 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r32",
+    "user": "u32",
+    "text": "resize 场景弹幕 33 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r33",
+    "user": "u33",
+    "text": "resize 场景弹幕 34 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Bottom",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r34",
+    "user": "u34",
+    "text": "resize 场景弹幕 35 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r35",
+    "user": "u35",
+    "text": "resize 场景弹幕 36 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Reverse",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r36",
+    "user": "u36",
+    "text": "resize 场景弹幕 37 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Top",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r37",
+    "user": "u37",
+    "text": "resize 场景弹幕 38 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r38",
+    "user": "u38",
+    "text": "resize 场景弹幕 39 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "r39",
+    "user": "u39",
+    "text": "resize 场景弹幕 40 · 验证缩放后保持轨道与进度",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  }
+ ]
+}

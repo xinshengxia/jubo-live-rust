@@ -1,0 +1,606 @@
+{
+ "initial_delay_ms": 1200,
+ "interval_ms": 200,
+ "events": [
+  {
+   "Message": {
+    "id": "c0",
+    "user": "观众0",
+    "text": "连续弹幕 1 号进入",
+    "color": 16711680,
+    "mode": "Top",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c1",
+    "user": "观众1",
+    "text": "连续弹幕 2 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c2",
+    "user": "观众2",
+    "text": "连续弹幕 3 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c3",
+    "user": "观众3",
+    "text": "连续弹幕 4 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c4",
+    "user": "观众4",
+    "text": "连续弹幕 5 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c5",
+    "user": "观众5",
+    "text": "连续弹幕 6 号进入",
+    "color": 16711680,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c6",
+    "user": "观众6",
+    "text": "连续弹幕 7 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c7",
+    "user": "观众7",
+    "text": "连续弹幕 8 号进入",
+    "color": 65280,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c8",
+    "user": "观众8",
+    "text": "连续弹幕 9 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c9",
+    "user": "观众0",
+    "text": "连续弹幕 10 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c10",
+    "user": "观众1",
+    "text": "连续弹幕 11 号进入",
+    "color": 16711680,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c11",
+    "user": "观众2",
+    "text": "连续弹幕 12 号进入",
+    "color": 16777215,
+    "mode": "Reverse",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c12",
+    "user": "观众3",
+    "text": "连续弹幕 13 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c13",
+    "user": "观众4",
+    "text": "连续弹幕 14 号进入",
+    "color": 16777215,
+    "mode": "Top",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c14",
+    "user": "观众5",
+    "text": "连续弹幕 15 号进入",
+    "color": 65280,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c15",
+    "user": "观众6",
+    "text": "连续弹幕 16 号进入",
+    "color": 16711680,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c16",
+    "user": "观众7",
+    "text": "连续弹幕 17 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c17",
+    "user": "观众8",
+    "text": "连续弹幕 18 号进入",
+    "color": 16777215,
+    "mode": "Bottom",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c18",
+    "user": "观众0",
+    "text": "连续弹幕 19 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c19",
+    "user": "观众1",
+    "text": "连续弹幕 20 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c20",
+    "user": "观众2",
+    "text": "连续弹幕 21 号进入",
+    "color": 16711680,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c21",
+    "user": "观众3",
+    "text": "连续弹幕 22 号进入",
+    "color": 65280,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c22",
+    "user": "观众4",
+    "text": "连续弹幕 23 号进入",
+    "color": 16777215,
+    "mode": "Reverse",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c23",
+    "user": "观众5",
+    "text": "连续弹幕 24 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c24",
+    "user": "观众6",
+    "text": "连续弹幕 25 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c25",
+    "user": "观众7",
+    "text": "连续弹幕 26 号进入",
+    "color": 16711680,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c26",
+    "user": "观众8",
+    "text": "连续弹幕 27 号进入",
+    "color": 16777215,
+    "mode": "Top",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c27",
+    "user": "观众0",
+    "text": "连续弹幕 28 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c28",
+    "user": "观众1",
+    "text": "连续弹幕 29 号进入",
+    "color": 65280,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c29",
+    "user": "观众2",
+    "text": "连续弹幕 30 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c30",
+    "user": "观众3",
+    "text": "连续弹幕 31 号进入",
+    "color": 16711680,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c31",
+    "user": "观众4",
+    "text": "连续弹幕 32 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c32",
+    "user": "观众5",
+    "text": "连续弹幕 33 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c33",
+    "user": "观众6",
+    "text": "连续弹幕 34 号进入",
+    "color": 16777215,
+    "mode": "Reverse",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c34",
+    "user": "观众7",
+    "text": "连续弹幕 35 号进入",
+    "color": 16777215,
+    "mode": "Bottom",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c35",
+    "user": "观众8",
+    "text": "连续弹幕 36 号进入",
+    "color": 16711680,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c36",
+    "user": "观众0",
+    "text": "连续弹幕 37 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c37",
+    "user": "观众1",
+    "text": "连续弹幕 38 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c38",
+    "user": "观众2",
+    "text": "连续弹幕 39 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c39",
+    "user": "观众3",
+    "text": "连续弹幕 40 号进入",
+    "color": 16777215,
+    "mode": "Top",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c40",
+    "user": "观众4",
+    "text": "连续弹幕 41 号进入",
+    "color": 16711680,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c41",
+    "user": "观众5",
+    "text": "连续弹幕 42 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c42",
+    "user": "观众6",
+    "text": "连续弹幕 43 号进入",
+    "color": 65280,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c43",
+    "user": "观众7",
+    "text": "连续弹幕 44 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c44",
+    "user": "观众8",
+    "text": "连续弹幕 45 号进入",
+    "color": 16777215,
+    "mode": "Reverse",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c45",
+    "user": "观众0",
+    "text": "连续弹幕 46 号进入",
+    "color": 16711680,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c46",
+    "user": "观众1",
+    "text": "连续弹幕 47 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c47",
+    "user": "观众2",
+    "text": "连续弹幕 48 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c48",
+    "user": "观众3",
+    "text": "连续弹幕 49 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c49",
+    "user": "观众4",
+    "text": "连续弹幕 50 号进入",
+    "color": 65280,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c50",
+    "user": "观众5",
+    "text": "连续弹幕 51 号进入",
+    "color": 16711680,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c51",
+    "user": "观众6",
+    "text": "连续弹幕 52 号进入",
+    "color": 16777215,
+    "mode": "Bottom",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c52",
+    "user": "观众7",
+    "text": "连续弹幕 53 号进入",
+    "color": 16777215,
+    "mode": "Top",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c53",
+    "user": "观众8",
+    "text": "连续弹幕 54 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c54",
+    "user": "观众0",
+    "text": "连续弹幕 55 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c55",
+    "user": "观众1",
+    "text": "连续弹幕 56 号进入",
+    "color": 16711680,
+    "mode": "Reverse",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c56",
+    "user": "观众2",
+    "text": "连续弹幕 57 号进入",
+    "color": 65280,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c57",
+    "user": "观众3",
+    "text": "连续弹幕 58 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c58",
+    "user": "观众4",
+    "text": "连续弹幕 59 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "c59",
+    "user": "观众5",
+    "text": "连续弹幕 60 号进入",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  }
+ ]
+}

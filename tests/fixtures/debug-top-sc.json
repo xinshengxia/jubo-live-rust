@@ -1,0 +1,35 @@
+{
+ "initial_delay_ms": 800,
+ "interval_ms": 200,
+ "events": [
+  {
+   "SuperChat": {
+    "id": "sc",
+    "user": "舰长",
+    "text": "SC",
+    "price_cents": 3000,
+    "duration_secs": 300
+   }
+  },
+  {
+   "Message": {
+    "id": "t1",
+    "user": "甲",
+    "text": "顶部固定一",
+    "color": 16776960,
+    "mode": "Top",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "t2",
+    "user": "乙",
+    "text": "顶部固定二",
+    "color": 16776960,
+    "mode": "Top",
+    "font_size": 25
+   }
+  }
+ ]
+}

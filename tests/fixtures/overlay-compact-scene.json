@@ -1,0 +1,27 @@
+{
+ "initial_delay_ms": 1200,
+ "interval_ms": 300,
+ "events": [
+  {
+   "SuperChat": {
+    "id": "sc-long",
+    "user": "很长的用户名测试一下省略号",
+    "message_trans": "translated line for the paid message",
+    "text": "这是一条很长的付费留言，用于验证 compact 形态下正文按剩余宽度截断并加省略号，同时离关闭按钮留出间距。",
+    "price_cents": 3000,
+    "duration_secs": 300
+   }
+  },
+  {
+   "SuperChat": {
+    "id": "sc-frame",
+    "user": "头像框测试",
+    "text": "头像框与译文渲染（离线无网络时走占位）",
+    "price_cents": 10000,
+    "duration_secs": 120,
+    "face": "https://i0.hdslb.com/bfs/face/synthetic.png",
+    "face_frame": "https://i0.hdslb.com/bfs/face/frame-synthetic.png"
+   }
+  }
+ ]
+}

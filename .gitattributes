@@ -1,0 +1,13 @@
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.rs text eol=lf
+*.ps1 text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+LICENSE -text
+licenses/** -text
+assets/fonts/LICENSE.txt -text
+*.png -text
+*.ttf -text
+*.ico -text

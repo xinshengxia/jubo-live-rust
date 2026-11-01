@@ -1,0 +1,9 @@
+[http]
+ssl-version = { min = "tlsv1.2" }
+check-revoke = true
+
+[net]
+retry = 2
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-self-contained=yes"]

@@ -1,0 +1,201 @@
+{
+ "initial_delay_ms": 2200,
+ "interval_ms": 120,
+ "events": [
+  {
+   "Status": "合成离线弹幕源 · 对照原版 demo（无网络）"
+  },
+  {
+   "SuperChat": {
+    "id": "sc-3",
+    "user": "明明就是颜值哥",
+    "text": "今天有没有水滴石穿环节？",
+    "price_cents": 3000,
+    "duration_secs": 60,
+    "background_color": 15332607,
+    "background_bottom_color": 2777266,
+    "background_color_start": 3240402,
+    "message_font_color": 10745599,
+    "name_color": 6710886
+   }
+  },
+  {
+   "SuperChat": {
+    "id": "sc-2",
+    "user": "卜一杉嗯",
+    "text": "帮帮我，史瓦象先生！大象：我没招啊",
+    "price_cents": 10000,
+    "duration_secs": 120,
+    "background_color": 16774102,
+    "background_bottom_color": 13210688,
+    "background_color_start": 14066770,
+    "message_font_color": 16777215,
+    "name_color": 8016384
+   }
+  },
+  {
+   "SuperChat": {
+    "id": "sc-1",
+    "user": "土豪本豪",
+    "text": "这个月的生活费就靠这一条了，主播加油！这是一条很长的醒目留言，用来测试自动换行与卡片高度。",
+    "price_cents": 200000,
+    "duration_secs": 300,
+    "background_color": 16640488,
+    "background_bottom_color": 12005681,
+    "background_color_start": 12860476,
+    "message_font_color": 16777215,
+    "name_color": 3355443
+   }
+  },
+  {
+   "Message": {
+    "id": "m1",
+    "user": "甲",
+    "text": "哈哈哈哈",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "m2",
+    "user": "乙",
+    "text": "混合测试 abc → 中文",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "m3",
+    "user": "丙",
+    "text": "这段太顶了",
+    "color": 16711680,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "m4",
+    "user": "丁",
+    "text": "恭喜 🎉🎊 ×2",
+    "color": 65280,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "m5",
+    "user": "戊",
+    "text": "这个弹幕有点长啊，测试一下长弹幕的滚动速度和轨道占用情况",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "m6",
+    "user": "己",
+    "text": "顶部固定留言",
+    "color": 16776960,
+    "mode": "Top",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "m7",
+    "user": "庚",
+    "text": "底部固定留言",
+    "color": 16776960,
+    "mode": "Bottom",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "m8",
+    "user": "辛",
+    "text": "逆向弹幕 → 向右",
+    "color": 16711935,
+    "mode": "Reverse",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "m9",
+    "user": "壬",
+    "text": "彩色 emoji 😀🎉👍🐍",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "m10",
+    "user": "癸",
+    "text": "🎮🔥 键帽: 1️⃣",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "m11",
+    "user": "子",
+    "text": "6666666",
+    "color": 16711680,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "m12",
+    "user": "丑",
+    "text": "上号上号",
+    "color": 255,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "m13",
+    "user": "寅",
+    "text": "恭喜 🎉🎊",
+    "color": 65280,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "m14",
+    "user": "卯",
+    "text": "笑死我了 😂😂😂",
+    "color": 16777215,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  },
+  {
+   "Message": {
+    "id": "m15",
+    "user": "辰",
+    "text": "全网最高难度",
+    "color": 16711935,
+    "mode": "Scroll",
+    "font_size": 25
+   }
+  }
+ ]
+}
