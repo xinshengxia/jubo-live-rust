@@ -148,7 +148,9 @@
     "sc-wheel-legacy-step",
     "launcher-windows11-rounded-corners",
     "huya-short-room-state-fallback",
-    "favorites-home-sidebar-order-and-scroll"
+    "favorites-home-sidebar-order-and-scroll",
+    "relay-in-response-timeline-jump-rebasing",
+    "relay-player-write-timeout-and-media-reconnect-tuning"
   ],
   "pending": [
     "full-rich-media-and-sc-style-parity",
@@ -165,7 +167,7 @@
     "douyin-web-assist-fallback",
     "color-emoji-plain-sheet-cell-alignment"
   ],
-  "verification": "Offline regression and release verification scopes are documented in docs/validation.md; real accounts, paid services and live-platform acceptance are not implied. 1.0.1 adds the Douyin emoji/list dictionary fetch, VP8L WebP emote rendering through the bounded image path, and overlay dictionary refresh; verified by the full offline matrix plus a real anonymous live-room overlay check.",
-  "version": "1.0.1",
+  "verification": "Offline regression and release verification scopes are documented in docs/validation.md; real accounts, paid services and live-platform acceptance are not implied. 1.0.2 adds in-response FLV timeline-jump rebasing for the loopback relay (audio and video share one correction), a 15 s player write timeout and a shorter reconnect delay after a productive CDN segment; verified by offline unit and contract tests plus read-only live relay measurements.",
+  "version": "1.0.2",
   "updated": "2026-11-01"
 }

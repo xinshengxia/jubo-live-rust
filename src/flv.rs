@@ -456,20 +456,51 @@ pub fn measure_video_window<R: Read>(
     }))
 }
 
+/// Gap inserted after a mid-stream discontinuity so the forwarded timeline keeps
+/// advancing even when the upstream clock jumps over dropped content.
+const MEDIA_JUMP_GAP_MS: u64 = 20;
+
 /// Media tracks have separate watermarks: equal audio/video timestamps are valid.
 /// Duplicate filtering is enabled only while catching up after a reconnect.
+///
+/// Besides reconnect overlap, the timeline also absorbs discontinuities that a
+/// live CDN can inject inside one HTTP response: when the client falls behind,
+/// huya drops its own queued data and resumes at the live edge, which shows up
+/// as a multi-second (measured: +114 s) timestamp jump. Forwarding that jump
+/// makes the player treat the stream as restarted and rebuild its demuxer
+/// cache, which is a visible re-buffer. The timeline rebases such a jump onto
+/// the already forwarded clock (the skipped content stays lost, the clock does
+/// not break). The correction is shared by both tracks so A/V stay aligned.
 #[derive(Debug, Default)]
 pub struct ReconnectTimeline {
     last: [Option<u64>; 2],
     catching_up: [bool; 2],
-    shift: u64,
+    /// Signed correction from the raw upstream clock to the forwarded clock.
+    shift: i64,
     rebased: bool,
+    jumps: u64,
+    last_jump_ms: i64,
 }
 
 impl ReconnectTimeline {
     pub fn begin_reconnect(&mut self) {
         self.catching_up = [self.last[0].is_some(), self.last[1].is_some()];
         self.rebased = false;
+    }
+
+    /// In-response discontinuities rebased since this timeline was created.
+    pub fn jumps(&self) -> u64 {
+        self.jumps
+    }
+
+    /// Signed raw jump of the most recently rebased discontinuity (diagnostics).
+    pub fn last_jump_ms(&self) -> i64 {
+        self.last_jump_ms
+    }
+
+    fn adjusted(&self, raw: u64) -> u64 {
+        let adjusted = i128::from(raw).saturating_add(i128::from(self.shift));
+        adjusted.clamp(0, i128::from(u32::MAX)) as u64
     }
 
     /// Return true when the complete tag should be forwarded.
@@ -485,19 +516,49 @@ impl ReconnectTimeline {
             _ => return true,
         };
         let raw = u64::from(tag.timestamp());
-        let mut adjusted = raw.saturating_add(self.shift);
+        let mut adjusted = self.adjusted(raw);
         if self.catching_up[slot] {
             let last = self.last[slot].unwrap_or(0);
             if adjusted > last {
                 self.catching_up[slot] = false;
-            } else if !self.rebased && raw < 1000 && last.saturating_sub(self.shift) > 5000 {
-                // A fresh upstream clock is distinct from a short overlapping tail.
-                self.shift = boundary.saturating_add(1).saturating_sub(raw);
-                adjusted = raw.saturating_add(self.shift);
+            } else if !self.rebased
+                && raw < 1000
+                && last.saturating_sub(adjusted) > MAX_TIMELINE_JUMP_MS as u64
+            {
+                // A fresh upstream clock that restarted near zero is distinct from
+                // a short overlapping tail: continue the forwarded clock instead of
+                // dropping the rest of the new segment as duplicate overlap.
+                let target = boundary.saturating_add(1);
+                self.shift = (i128::from(target) - i128::from(raw))
+                    .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+                    as i64;
+                adjusted = self.adjusted(raw);
                 self.rebased = true;
                 self.catching_up[slot] = false;
             } else {
                 return false;
+            }
+        } else if let (Some(boundary), Some(track_last)) = (
+            self.last.iter().flatten().copied().max(),
+            self.last[slot],
+        ) {
+            // A forward jump means the CDN skipped queued media; a large backwards
+            // jump means its clock restarted. Both would reset the player demuxer.
+            let forward = i128::from(adjusted) - i128::from(boundary);
+            let backward = i128::from(track_last) - i128::from(adjusted);
+            let limit = i128::from(MAX_TIMELINE_JUMP_MS);
+            if forward > limit || backward > limit {
+                let target = boundary.saturating_add(MEDIA_JUMP_GAP_MS);
+                self.shift = (i128::from(self.shift) + i128::from(target) - i128::from(adjusted))
+                    .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+                    as i64;
+                adjusted = target;
+                self.jumps = self.jumps.saturating_add(1);
+                self.last_jump_ms = if forward > limit {
+                    forward as i64
+                } else {
+                    -(backward as i64)
+                };
             }
         }
         // A 32-bit FLV timestamp cannot represent a rebased session beyond this.
@@ -527,6 +588,59 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn rebases_a_mid_stream_forward_discontinuity_without_a_reconnect() {
+        let mut timeline = ReconnectTimeline::default();
+        let mut video = media(9, 1000);
+        assert!(timeline.accept(&mut video));
+        assert_eq!(video.timestamp(), 1000);
+        let mut audio = media(8, 1000);
+        assert!(timeline.accept(&mut audio));
+        assert_eq!(audio.timestamp(), 1000);
+        let mut video = media(9, 1016);
+        assert!(timeline.accept(&mut video));
+        assert_eq!(video.timestamp(), 1016);
+        assert_eq!(timeline.jumps(), 0);
+
+        // A live CDN skipped 113 s of queued media inside the same response.
+        let mut jumped = media(9, 116_016);
+        assert!(timeline.accept(&mut jumped));
+        assert_eq!(timeline.jumps(), 1);
+        assert_eq!(timeline.last_jump_ms(), 116_016 - 1016);
+        assert_eq!(jumped.timestamp(), 1016 + 20);
+        assert_eq!(timeline.jumps(), 1);
+
+        // Following tags keep the corrected clock; no further rebase is needed.
+        let mut following_video = media(9, 116_032);
+        assert!(timeline.accept(&mut following_video));
+        assert_eq!(following_video.timestamp(), 1052);
+        let mut following_audio = media(8, 116_040);
+        assert!(timeline.accept(&mut following_audio));
+        assert_eq!(following_audio.timestamp(), 1060);
+        assert_eq!(timeline.jumps(), 1);
+    }
+
+    #[test]
+    fn rebases_a_mid_stream_backward_discontinuity() {
+        let mut timeline = ReconnectTimeline::default();
+        let mut first = media(9, 5000);
+        assert!(timeline.accept(&mut first));
+        let mut next = media(9, 5016);
+        assert!(timeline.accept(&mut next));
+
+        // The upstream clock restarted far behind the forwarded timeline.
+        let mut restarted = media(9, 0);
+        assert!(timeline.accept(&mut restarted));
+        assert_eq!(timeline.jumps(), 1);
+        assert_eq!(timeline.last_jump_ms(), -5016);
+        assert_eq!(restarted.timestamp(), 5016 + 20);
+
+        let mut following_audio = media(8, 24);
+        assert!(timeline.accept(&mut following_audio));
+        assert_eq!(following_audio.timestamp(), 5060);
+        assert_eq!(timeline.jumps(), 1);
     }
 
     #[test]
@@ -787,11 +901,19 @@ mod tests {
         let mut video = media(9, 0);
         assert!(timeline.accept(&mut video));
         assert_eq!(video.timestamp(), 9001);
-        assert!(timeline.accept(&mut media(8, 7000)));
-        assert!(timeline.accept(&mut media(9, 7000)));
+        // A +7 s jump inside one response is compressed onto the forwarded clock
+        // instead of being forwarded as a discontinuity (the player stays synced).
+        let mut forward = media(8, 7000);
+        assert!(timeline.accept(&mut forward));
+        assert_eq!(forward.timestamp(), 9021);
+        let mut forward_video = media(9, 7000);
+        assert!(timeline.accept(&mut forward_video));
+        assert_eq!(forward_video.timestamp(), 9021);
+        assert_eq!(timeline.jumps(), 1);
+        // A later upstream clock restart still rebases after the forwarded clock.
         timeline.begin_reconnect();
         let mut reset = media(9, 0);
         assert!(timeline.accept(&mut reset));
-        assert_eq!(reset.timestamp(), 16002);
+        assert_eq!(reset.timestamp(), 9022);
     }
 }

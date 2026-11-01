@@ -66,7 +66,11 @@ impl Default for RelayConfig {
             idle_timeout: Duration::from_secs(180),
             request_timeout: Duration::from_secs(5),
             upstream_timeout: Duration::from_secs(5),
-            write_timeout: Duration::from_secs(5),
+            // The legacy launcher used a 15 s send timeout. A live player
+            // (PotPlayer) can stop reading for a few seconds while it rebuilds
+            // its own cache; a shorter timeout turned that pause into a closed
+            // connection, a fresh upstream request and a visible re-buffer.
+            write_timeout: Duration::from_secs(15),
             retry_delay: Duration::from_secs(1),
             max_reconnects: 500,
             allow_loopback_fixture: false,
@@ -106,6 +110,11 @@ pub const STABLE_MEDIA_TAGS: u64 = 24;
 pub const STABLE_MEDIA_BYTES: u64 = 8 * 1024;
 pub const STABLE_MEDIA_SPAN_MS: u32 = 1_000;
 const MIN_RETRY_DELAY: Duration = Duration::from_millis(5);
+/// A CDN segment that ended after forwarding stable media is a normal boundary
+/// (huya rotates short responses). Reconnect promptly instead of leaving the
+/// player without media for the whole failure backoff; duplicate overlap is
+/// trimmed by the reconnect timeline either way.
+const MEDIA_SEGMENT_RETRY_DELAY: Duration = Duration::from_millis(150);
 const RECENT_CONNECTIONS: usize = 8;
 /// Upstream response bytes are copied through this buffer once. Without it the
 /// blocking reqwest Response reader was entered once per 1-11 byte header read,
@@ -202,6 +211,10 @@ pub struct RelayConnectionStatistics {
     pub forwarded_bytes: u64,
     pub last_error: Option<RelayFailure>,
     pub waiting_state: Option<String>,
+    /// In-response timeline discontinuities rebased so the player clock stays
+    /// continuous (the CDN dropped queued media without reconnecting).
+    #[serde(default)]
+    pub timeline_jumps: u64,
 }
 
 /// A resolver has positively identified a room state rather than a network
@@ -254,6 +267,9 @@ pub struct RelayStatistics {
     pub forwarded_tags: u64,
     pub forwarded_bytes: u64,
     pub budget_exhaustions: u64,
+    /// In-response timeline discontinuities rebased across every connection.
+    #[serde(default)]
+    pub timeline_jumps: u64,
     /// Bounded onMetaData summary of the stream currently being forwarded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_info: Option<RelayStreamInfo>,
@@ -303,6 +319,7 @@ impl StreamStatistics {
                 forwarded_bytes: 0,
                 last_error: None,
                 waiting_state: None,
+                timeline_jumps: 0,
             });
         }
         let statistics = Self {
@@ -474,6 +491,23 @@ impl StreamStatistics {
                 stats.stream_info = Some(info);
             }
         });
+    }
+
+    /// One in-response media timeline discontinuity was rebased so the player
+    /// clock stays continuous. The skipped content is gone (the CDN dropped it);
+    /// the player must not rebuild its demuxer cache over the raw jump.
+    fn timeline_jump(&self, raw_jump_ms: i64) {
+        self.update(|stats, record| {
+            stats.timeline_jumps = stats.timeline_jumps.saturating_add(1);
+            record.timeline_jumps = record.timeline_jumps.saturating_add(1);
+        });
+        self.log(
+            diag::Level::Warn,
+            format!(
+                "connection #{} media timeline jump {raw_jump_ms:+}ms rebased to keep the player clock continuous",
+                self.id
+            ),
+        );
     }
 }
 
@@ -1567,6 +1601,10 @@ fn pump(
     let mut header_sent = false;
     let mut reconnect = false;
     let mut consecutive_failures = 0usize;
+    // A productive segment that ends is a normal CDN boundary, not a failure:
+    // reconnect quickly so the player is not starved for the whole backoff.
+    let mut last_segment_stable = false;
+    let mut reported_jumps = 0_u64;
     // The stream's onMetaData tag arrives immediately after the FLV header; read it
     // once so the title hints can show a bitrate without a second upstream probe.
     let mut metadata_checked = false;
@@ -1580,7 +1618,12 @@ fn pump(
         }
         if reconnect {
             timeline.begin_reconnect();
-            if !wait_retry(stream, config.retry_delay.max(MIN_RETRY_DELAY)) {
+            let reconnect_delay = if last_segment_stable {
+                config.retry_delay.min(MEDIA_SEGMENT_RETRY_DELAY)
+            } else {
+                config.retry_delay
+            };
+            if !wait_retry(stream, reconnect_delay.max(MIN_RETRY_DELAY)) {
                 statistics.finish(
                     RelayConnectionState::PlayerDisconnected,
                     Some(RelayFailure::PlayerDisconnected),
@@ -1706,6 +1749,10 @@ fn pump(
                     }
                 };
                 if timeline.accept(&mut tag) {
+                    if timeline.jumps() != reported_jumps {
+                        reported_jumps = timeline.jumps();
+                        statistics.timeline_jump(timeline.last_jump_ms());
+                    }
                     if matches!(tag.kind(), 8 | 9) && !tag.is_codec_header() {
                         pending_media_tags = pending_media_tags.saturating_add(1);
                     }
@@ -1741,6 +1788,7 @@ fn pump(
         } else {
             consecutive_failures = consecutive_failures.saturating_add(1);
         }
+        last_segment_stable = progress.stable;
         statistics.interrupted(segment_failure, consecutive_failures, progress.stable);
         if config.max_reconnects == 0 {
             statistics.finish(RelayConnectionState::Ended, None);
