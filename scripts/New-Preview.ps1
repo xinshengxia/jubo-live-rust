@@ -28,6 +28,9 @@ try {
     # Keep compiler source paths out of a distributable binary. No host/tool
     # inventory, absolute build roots, or private logs are written to manifests.
     $flags = @('-C', 'link-self-contained=yes', ('--remap-path-prefix=' + $repoPath + '=.'), ('--remap-path-prefix=\\?\' + $repoPath + '=.'))
+    # Generated GL bindings and import-library symbols can carry output paths.
+    $flags += ('--remap-path-prefix=' + $targetPath + '=/build')
+    $flags += ('--remap-path-prefix=\\?\' + $targetPath + '=/build')
     if ($ToolchainRoot) {
         $toolPath = [IO.Path]::GetFullPath($ToolchainRoot)
         $flags += ('--remap-path-prefix=' + $toolPath + '=/toolchain')
