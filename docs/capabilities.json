@@ -38,6 +38,7 @@
     "production-potplayer-video-and-danmaku",
     "one-hour-production-default-synthetic-soak",
     "bounded-image-webp-rendering",
+    "douyin-emoticon-dictionary-and-webp-rendering",
     "gift-and-enter-events-bili-douyu",
     "chat-filter-delay-and-merge",
     "cross-platform-search-and-avatar",
@@ -164,7 +165,7 @@
     "douyin-web-assist-fallback",
     "color-emoji-plain-sheet-cell-alignment"
   ],
-  "verification": "Offline regression and release verification scopes are documented in docs/validation.md; real accounts, paid services and live-platform acceptance are not implied.",
-  "version": "1.0.0",
+  "verification": "Offline regression and release verification scopes are documented in docs/validation.md; real accounts, paid services and live-platform acceptance are not implied. 1.0.1 adds the Douyin emoji/list dictionary fetch, VP8L WebP emote rendering through the bounded image path, and overlay dictionary refresh; verified by the full offline matrix plus a real anonymous live-room overlay check.",
+  "version": "1.0.1",
   "updated": "2026-11-01"
 }

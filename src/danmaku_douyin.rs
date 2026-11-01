@@ -34,7 +34,7 @@ use crate::danmaku::{
     MAX_EXPANDED_BYTES, MAX_TEXT_CHARS, MAX_WIRE_BYTES, emit,
 };
 use crate::platforms::CookieSource;
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use flate2::read::GzDecoder;
 use serde_json::Value;
 use std::io::{ErrorKind, Read};
@@ -82,6 +82,9 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 const BROWSER_VERSION: &str = "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
     (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 const DOUYIN_HOST: &str = "live.douyin.com";
+/// Platform-wide Douyin web emoji dictionary; no room id is involved.
+/// Validated through `crate::network::approved_url` before any request.
+pub const EMOJI_LIST_URL: &str = "https://www.douyin.com/aweme/v1/web/emoji/list/";
 
 // ---------------------------------------------------------------------------
 // Pure signing: md5(X-MS-STUB) -> frontierSign / X-Bogus
@@ -1240,6 +1243,65 @@ fn http_client() -> Result<reqwest::blocking::Client> {
         .deflate(true)
         .build()
         .map_err(|_| anyhow!("抖音 HTTP 客户端初始化失败"))
+}
+
+/// Fetches the platform-wide Douyin emoji dictionary
+/// (`[捂脸]` -> image URL) through the approved, browser-UA client.
+///
+/// Unlike B站 GetEmoticons this endpoint takes no room id: one dictionary
+/// covers every Douyin room. Every step keeps its own error context (URL
+/// approval, client, scoped cookie, HTTP status, response bound, UTF-8, parse,
+/// empty result), and only "has a cookie" is ever reported as a boolean — the
+/// cookie value itself is never logged.
+pub fn fetch_emoticons_result(
+    source: Option<&dyn CookieSource>,
+) -> Result<crate::danmaku::rich::EmoticonDictionary> {
+    use crate::danmaku::rich;
+    let approved = crate::network::approved_url(EMOJI_LIST_URL, &["www.douyin.com"], &[])
+        .context("抖音表情接口地址未通过白名单")?;
+    let client = http_client().context("抖音表情接口客户端初始化失败")?;
+    let cookie = crate::danmaku::session::scoped_cookie(source, Platform::Douyin, EMOJI_LIST_URL)
+        .context("抖音表情接口 Cookie 组装失败")?;
+    let has_cookie = cookie.as_ref().is_some_and(|value| !value.is_empty());
+    let mut request = client
+        .get(approved)
+        .header("Referer", "https://www.douyin.com/")
+        .header("Accept", "application/json, text/plain, */*")
+        .header("Accept-Language", "zh-CN,zh;q=0.9");
+    if let Some(cookie) = cookie {
+        request = request.header("Cookie", cookie);
+    }
+    let response = request.send().map_err(|error| {
+        anyhow!("抖音表情接口请求失败（已带抖音 cookie={has_cookie}）: {error}")
+    })?;
+    let status = response.status();
+    ensure!(
+        status.is_success(),
+        "抖音表情接口 HTTP {status}（已带抖音 cookie={has_cookie}）"
+    );
+    if response
+        .content_length()
+        .is_some_and(|length| length > rich::MAX_EMOTICON_JSON_BYTES as u64)
+    {
+        bail!("抖音表情接口响应超过大小上限");
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(rich::MAX_EMOTICON_JSON_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("读取抖音表情接口响应失败")?;
+    ensure!(
+        bytes.len() <= rich::MAX_EMOTICON_JSON_BYTES,
+        "抖音表情接口响应超过大小上限"
+    );
+    let text = std::str::from_utf8(&bytes).context("抖音表情接口响应不是 UTF-8")?;
+    let dictionary = rich::parse_douyin_emoticons(text).context("抖音表情字典解析失败")?;
+    ensure!(
+        !dictionary.is_empty(),
+        "抖音表情接口返回空字典（已解析 {} 条可用表情）",
+        dictionary.len()
+    );
+    Ok(dictionary)
 }
 
 fn safe_redirect(current: &str, location: &str) -> Result<String> {

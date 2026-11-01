@@ -68,7 +68,10 @@ fn capabilities_report_pending_migration_work_explicitly() {
     let output = cli().arg("capabilities").output().unwrap();
     assert!(output.status.success());
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["stage"], "migration-preview");
+    // 1.0.0 shipped as a release build, so the capability document's stage moved
+    // from the migration-preview marker to "release"; this contract kept asserting
+    // the old marker and only surfaced once the full matrix was run again.
+    assert_eq!(json["stage"], "release");
     assert!(
         json["pending"]
             .as_array()

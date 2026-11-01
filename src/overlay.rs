@@ -2035,8 +2035,10 @@ pub fn default_emoji_sheet_path() -> Option<std::path::PathBuf> {
     resolve_emoji_sheet(explicit.as_deref(), exe_dir.as_deref(), cwd.as_deref())
 }
 
-/// Loads a local B站-shaped emoticon dictionary. Bounded and silent: a missing
-/// or malformed file simply leaves literal codes as text.
+/// Loads a local emoticon dictionary used by offline acceptance runs. Both the
+/// B站 GetEmoticons shape and the raw Douyin `emoji/list` shape are accepted
+/// (the Douyin endpoint is what the live receiver fetches). Bounded and silent:
+/// a missing or malformed file simply leaves literal codes as text.
 fn load_local_emoticons(path: &Path) -> Option<crate::danmaku::rich::EmoticonDictionary> {
     let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() > MAX_LOCAL_EMOTICON_BYTES {
@@ -2046,6 +2048,18 @@ fn load_local_emoticons(path: &Path) -> Option<crate::danmaku::rich::EmoticonDic
     crate::danmaku::rich::parse_bili_emoticons(&text)
         .ok()
         .filter(|dictionary| !dictionary.is_empty())
+        .or_else(|| {
+            crate::danmaku::rich::parse_douyin_emoticons(&text)
+                .ok()
+                .filter(|dictionary| !dictionary.is_empty())
+        })
+}
+
+/// The painter replaces its dictionary snapshot only when the receiver publishes
+/// a new cache generation. Comparing generations (instead of "is the current
+/// dictionary empty?") also refreshes after switching rooms or platforms.
+fn emoticons_refresh_due(current_version: u64, cache_version: u64) -> bool {
+    cache_version != current_version
 }
 
 struct Overlay {
@@ -2064,6 +2078,9 @@ struct Overlay {
     image_textures: std::collections::BTreeMap<String, egui::TextureHandle>,
     color_emoji: Option<ColorEmojiSheet>,
     emoticons: crate::danmaku::rich::EmoticonDictionary,
+    /// Cache generation of `emoticons`; the receiver thread bumps it whenever it
+    /// publishes a new room/platform dictionary, and a change re-reads the cache.
+    emoticons_version: u64,
     live_events: std::collections::VecDeque<(f64, LiveEvent)>,
     native_hotkeys: Receiver<OverlayHotkey>,
     status: String,
@@ -2222,6 +2239,7 @@ impl Overlay {
             image_textures: Default::default(),
             color_emoji,
             emoticons,
+            emoticons_version: 0,
             live_events: Default::default(),
             super_chats: ScCardStack::new(),
             scheduler,
@@ -2497,10 +2515,15 @@ impl Overlay {
 
     fn drain_events(&mut self, now: f64) {
         // The receiver thread shares the room emoticon dictionary through the
-        // process cache; pick it up once it arrives.
-        if self.emoticons.is_empty() {
+        // process cache. It bumps the cache generation each time it publishes a
+        // dictionary, so this painter picks up the first snapshot *and* later
+        // replacements (another room or another platform) instead of freezing
+        // the first one forever.
+        let cache_version = danmaku::cached_emoticons_version();
+        if emoticons_refresh_due(self.emoticons_version, cache_version) {
             if let Some(dictionary) = danmaku::cached_emoticons() {
                 self.emoticons = dictionary;
+                self.emoticons_version = cache_version;
             }
         }
         // Both a count and a time budget prevent bursts from monopolizing a frame.
@@ -6093,6 +6116,46 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         assert!(load_local_emoticons(&path).is_none());
         assert!(load_local_emoticons(&directory.path().join("missing.json")).is_none());
+    }
+
+    #[test]
+    fn local_douyin_emoji_dictionary_wires_the_render_path_too() {
+        // Offline acceptance can point LIVE_HUB_EMOTICON_JSON at the raw
+        // Douyin emoji/list response shape, which is what the live receiver
+        // caches; both shapes must reach the same render path.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("emoji-list.json");
+        std::fs::write(
+            &path,
+            r#"{"status_code":0,"emoji_list":[
+                {"display_name":"[合成捂脸]","emoji_url":{"url_list":[
+                    "https://p3.douyinpic.com/obj/synthetic.webp"]}}]}"#,
+        )
+        .unwrap();
+        let dictionary = load_local_emoticons(&path).expect("douyin dictionary");
+        assert_eq!(dictionary.len(), 1);
+        assert_eq!(
+            dictionary.get("[合成捂脸]"),
+            Some("https://p3.douyinpic.com/obj/synthetic.webp")
+        );
+        let segments = label_segments("[合成捂脸]", Some(&dictionary), None);
+        assert!(
+            matches!(
+                segments.as_slice(),
+                [crate::danmaku::rich::TextSegment::Emoticon { .. }]
+            ),
+            "{segments:?}"
+        );
+    }
+
+    #[test]
+    fn dictionary_cache_generation_changes_trigger_a_painter_refresh() {
+        // The first snapshot and every later room/platform replacement arrive
+        // as a new cache generation; only then does the painter swap.
+        assert!(!emoticons_refresh_due(0, 0));
+        assert!(emoticons_refresh_due(0, 1));
+        assert!(emoticons_refresh_due(2, 3));
+        assert!(!emoticons_refresh_due(3, 3));
     }
 
     #[test]

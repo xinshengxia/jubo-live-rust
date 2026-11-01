@@ -21,7 +21,7 @@ use std::{
     net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread,
@@ -1139,6 +1139,21 @@ fn connect_inner(
         // merely because they were imported for the platform's other features.
         Platform::Huya => return crate::danmaku_huya::connect(target, sender, cancellation),
         Platform::Douyin => {
+            // The platform-wide Douyin emoji dictionary is resolved in the
+            // background exactly like B站's room dictionary: a slow, rejected or
+            // unapproved request must never delay or break the WebSocket
+            // handshake. A failed spawn is ignored for the same reason.
+            let emoticon_source = source.clone();
+            let emoticon_cancel = cancellation.clone();
+            let _ = thread::Builder::new()
+                .name("douyin-emoticons".into())
+                .spawn(move || {
+                    if let Some(dictionary) = fetch_douyin_emoticons(emoticon_source.as_deref()) {
+                        if !emoticon_cancel.is_cancelled() {
+                            cache_emoticons(dictionary);
+                        }
+                    }
+                });
             return crate::danmaku_douyin::connect_with_cookie_source(
                 target,
                 sender,
@@ -1375,19 +1390,30 @@ fn bili_once(
 /// probe matches every event variant exhaustively). The dictionary is a
 /// best-effort supplement; a failed fetch keeps the previous snapshot.
 static EMOTICON_CACHE: Mutex<Option<rich::EmoticonDictionary>> = Mutex::new(None);
+/// Generation of the snapshot above. Bumped exactly once per stored
+/// dictionary so the overlay repaints when the first (or a replacement)
+/// dictionary arrives, without cloning the dictionary every frame.
+static EMOTICON_CACHE_VERSION: AtomicU64 = AtomicU64::new(0);
 
 /// Latest room emoticon dictionary received by this process, if any.
 pub fn cached_emoticons() -> Option<rich::EmoticonDictionary> {
     EMOTICON_CACHE.lock().ok().and_then(|guard| guard.clone())
 }
 
-/// Replaces the snapshot; an empty dictionary never erases a working one.
+/// Generation of the cached dictionary; `0` while nothing was published.
+pub fn cached_emoticons_version() -> u64 {
+    EMOTICON_CACHE_VERSION.load(Ordering::Acquire)
+}
+
+/// Replaces the snapshot; an empty dictionary never erases a working one, and
+/// only an actual store bumps `cached_emoticons_version`.
 pub fn cache_emoticons(dictionary: rich::EmoticonDictionary) {
     if dictionary.is_empty() {
         return;
     }
     if let Ok(mut guard) = EMOTICON_CACHE.lock() {
         *guard = Some(dictionary);
+        EMOTICON_CACHE_VERSION.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -1542,6 +1568,33 @@ pub fn fetch_bili_emoticons_anonymous_result(room: u64) -> Result<rich::Emoticon
 
 pub fn fetch_bili_emoticons_anonymous(room: u64) -> Option<rich::EmoticonDictionary> {
     fetch_bili_emoticons_anonymous_result(room).ok()
+}
+
+/// Detailed Douyin `emoji/list` fetch. The dedicated platform module owns the
+/// approved request and bounded parsing; the dictionary is platform-wide, so
+/// no room id is involved.
+pub fn fetch_douyin_emoticons_result(
+    source: Option<&dyn CookieSource>,
+) -> Result<rich::EmoticonDictionary> {
+    crate::danmaku_douyin::fetch_emoticons_result(source)
+}
+
+/// Best-effort Douyin dictionary: failures are silent by design and only cost
+/// the literal bracketed codes, never the danmaku stream.
+pub fn fetch_douyin_emoticons(
+    source: Option<&dyn CookieSource>,
+) -> Option<rich::EmoticonDictionary> {
+    fetch_douyin_emoticons_result(source).ok()
+}
+
+/// Anonymous variant used by the opt-in live acceptance test; the default
+/// offline suite never contacts the platform.
+pub fn fetch_douyin_emoticons_anonymous_result() -> Result<rich::EmoticonDictionary> {
+    fetch_douyin_emoticons_result(None)
+}
+
+pub fn fetch_douyin_emoticons_anonymous() -> Option<rich::EmoticonDictionary> {
+    fetch_douyin_emoticons_anonymous_result().ok()
 }
 
 fn douyu_once(
@@ -2225,5 +2278,33 @@ impl LaneScheduler {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The process cache is shared with the overlay painter, so the generation
+    /// must move exactly once per stored dictionary and never for an empty one.
+    /// This module is the only writer in the lib test binary.
+    #[test]
+    fn emoticon_cache_version_tracks_stored_dictionaries() {
+        let start = cached_emoticons_version();
+        let mut dictionary = rich::EmoticonDictionary::new();
+        assert!(dictionary.add("[微笑]", "https://p3.douyinpic.com/a.webp"));
+        cache_emoticons(dictionary);
+        assert_eq!(cached_emoticons_version(), start + 1);
+        let cached = cached_emoticons().expect("cached dictionary");
+        assert_eq!(
+            cached.get("[微笑]"),
+            Some("https://p3.douyinpic.com/a.webp")
+        );
+
+        // An empty dictionary must neither erase the working snapshot nor bump
+        // the generation.
+        cache_emoticons(rich::EmoticonDictionary::new());
+        assert_eq!(cached_emoticons_version(), start + 1);
+        assert_eq!(cached_emoticons().expect("still cached").len(), 1);
     }
 }

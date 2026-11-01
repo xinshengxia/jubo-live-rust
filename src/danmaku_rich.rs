@@ -435,6 +435,8 @@ pub fn parse_bili_emoticons(json: &str) -> Result<EmoticonDictionary> {
 
 /// Parses the Douyin emoji/list response
 /// {"emoji_list":[{"display_name":"[微笑]","emoji_url":{"url_list":["..."]}}]}.
+/// Only already-approved CDN URLs are kept; the live response lists several
+/// CDN mirrors per emoji, so every entry is tried until one is approved.
 pub fn parse_douyin_emoticons(json: &str) -> Result<EmoticonDictionary> {
     ensure!(
         json.len() <= MAX_EMOTICON_JSON_BYTES,
@@ -444,13 +446,18 @@ pub fn parse_douyin_emoticons(json: &str) -> Result<EmoticonDictionary> {
     let mut dictionary = EmoticonDictionary::new();
     if let Some(items) = value["emoji_list"].as_array() {
         for item in items.iter().take(MAX_EMOTICONS) {
-            let code = item["display_name"].as_str().unwrap_or("");
-            let url = item["emoji_url"]["url_list"]
-                .as_array()
-                .and_then(|urls| urls.first())
-                .and_then(|url| url.as_str())
-                .unwrap_or("");
-            if approved_emoticon_url(url) {
+            let code = item["display_name"].as_str().unwrap_or("").trim();
+            if code.is_empty() {
+                continue;
+            }
+            let Some(urls) = item["emoji_url"]["url_list"].as_array() else {
+                continue;
+            };
+            if let Some(url) = urls
+                .iter()
+                .filter_map(|url| url.as_str())
+                .find(|url| approved_emoticon_url(url))
+            {
                 dictionary.add(code, url);
             }
         }
@@ -1028,6 +1035,28 @@ mod tests {
         let dictionary = parse_douyin_emoticons(douyin).unwrap();
         assert_eq!(dictionary.len(), 1);
         assert!(dictionary.get("[微笑]").is_some());
+        assert!(dictionary.get("[坏]").is_none());
+    }
+
+    #[test]
+    fn douyin_emoticons_try_every_listed_url_and_skip_empty_codes() {
+        let douyin = r#"{"emoji_list":[
+            {"display_name":"[捂脸]","emoji_url":{"url_list":[
+                "https://evil.invalid/a.png",
+                "https://p3.douyinpic.com/approved.png",
+                "https://p6.douyinpic.com/second.png"]}},
+            {"display_name":"[坏]","emoji_url":{"url_list":[
+                "https://evil.invalid/b.png",
+                "https://127.0.0.1/b.png"]}},
+            {"display_name":"   ","emoji_url":{"url_list":[
+                "https://p3.douyinpic.com/blank.png"]}}]}"#;
+        let dictionary = parse_douyin_emoticons(douyin).unwrap();
+        assert_eq!(dictionary.len(), 1);
+        assert_eq!(
+            dictionary.get("[捂脸]"),
+            Some("https://p3.douyinpic.com/approved.png")
+        );
+        // All mirrors unapproved: the code stays literal text.
         assert!(dictionary.get("[坏]").is_none());
     }
 

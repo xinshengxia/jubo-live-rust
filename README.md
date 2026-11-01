@@ -2,11 +2,11 @@
 
 「看直播」的 Rust 版本，面向 Windows x64。支持 B站、虎牙、斗鱼和抖音，使用 mpv 或 PotPlayer 播放，提供弹幕 / SC 覆盖层、主播搜索、账号登录、收藏、历史和多播放会话。
 
-**当前版本：1.0.0。** [下载 Windows 程序包](https://github.com/xinshengxia/jubo-live-rust/releases/latest) · [C# 原项目](https://github.com/xinshengxia/jubo-live)
+**当前版本：1.0.1。** [下载 Windows 程序包](https://github.com/xinshengxia/jubo-live-rust/releases/latest) · [C# 原项目](https://github.com/xinshengxia/jubo-live)
 
 ## 下载和使用
 
-1. 在 Releases 下载 `jubo-live-rust-1.0.0-win-x64-lite.zip`，解压到可写目录。
+1. 在 Releases 下载 `jubo-live-rust-1.0.1-win-x64-lite.zip`，解压到可写目录。
 2. 双击 `live-hub-rust.exe`，在设置中选择自己安装的 mpv 或 PotPlayer。
 3. 输入房间号或官方直播间链接，选择画质后打开；登录、收藏与弹幕设置在对应页面管理。
 
@@ -27,7 +27,13 @@ lite 包不附带 mpv、PotPlayer 或 yt-dlp，播放器由用户自行安装。
 
 Rust 版与 C# 版使用独立数据目录。需要迁移收藏时，由用户主动导出、导入；不要直接复制旧程序的账号目录。
 
-## 1.0.0 修复
+## 1.0.1 修复
+
+- **抖音弹幕图片表情**：Rust 版此前没有拉取抖音 `emoji/list` 表情字典，`[捂脸]` 一类平台表情码按原始文字显示。现在连接抖音时在后台拉取并缓存整份字典，覆盖层按缓存代次刷新后把表情渲染为图片（真实表情为 VP8L 无损 WebP，96×96）；换房间或切平台也会更新字典。拉取或解码失败只退回文字，不影响弹幕接收。
+- **表情字典离线验证入口**：本地 `LIVE_HUB_EMOTICON_JSON` 现在同时接受抖音 `emoji/list` 与 B站 `GetEmoticons` 两种响应形状，便于离线回归。
+- 另修正 1.0.0 遗留的一条全量测试契约断言（能力清单 stage 已是 `release`），不涉及用户功能。
+
+### 1.0.0 修复（历史）
 
 - 头像解码前限制尺寸和分配，后台生成 48px 缩略图；图片与纹理缓存设有上限。
 - 头像下载完成立即释放名额，切换查询不再阻塞后续头像。
