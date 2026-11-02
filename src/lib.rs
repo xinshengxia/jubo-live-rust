@@ -5,6 +5,7 @@ pub mod broadcast;
 pub mod chat_pipeline;
 pub mod core;
 pub mod danmaku;
+pub mod danmaku_douyu_emoticons;
 pub mod danmaku_douyin;
 pub mod danmaku_huya;
 pub mod danmaku_rules;

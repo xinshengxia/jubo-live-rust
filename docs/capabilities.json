@@ -150,7 +150,9 @@
     "huya-short-room-state-fallback",
     "favorites-home-sidebar-order-and-scroll",
     "relay-in-response-timeline-jump-rebasing",
-    "relay-player-write-timeout-and-media-reconnect-tuning"
+    "relay-player-write-timeout-and-media-reconnect-tuning",
+    "huya-default-and-supplement-emoticon-rendering",
+    "douyu-default-emoticon-rendering"
   ],
   "pending": [
     "full-rich-media-and-sc-style-parity",
@@ -167,7 +169,7 @@
     "douyin-web-assist-fallback",
     "color-emoji-plain-sheet-cell-alignment"
   ],
-  "verification": "Offline regression and release verification scopes are documented in docs/validation.md; real accounts, paid services and live-platform acceptance are not implied. 1.0.2 adds in-response FLV timeline-jump rebasing for the loopback relay (audio and video share one correction), a 15 s player write timeout and a shorter reconnect delay after a productive CDN segment; verified by offline unit and contract tests plus read-only live relay measurements.",
-  "version": "1.0.2",
-  "updated": "2026-11-01"
+  "verification": "Offline regression and release verification scopes are documented in docs/validation.md; real accounts, paid services and live-platform acceptance are not implied. 1.0.2 adds in-response FLV timeline-jump rebasing for the loopback relay (audio and video share one correction), a 15 s player write timeout and a shorter reconnect delay after a productive CDN segment; verified by offline unit and contract tests plus read-only live relay measurements. 1.0.3 adds pre-connection Huya (40 unique codes) and Douyu (250 codes) default dictionaries, exact Huya package CDN approval, mixed-text segmentation regressions, and opt-in production image-loader acceptance for all 290 mapped assets. Unknown/server-only emotes retain text.",
+  "version": "1.0.3",
+  "updated": "2026-11-02"
 }

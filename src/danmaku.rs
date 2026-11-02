@@ -1161,7 +1161,12 @@ fn connect_inner(
                 source,
             );
         }
-        Platform::Bili | Platform::Douyu => {}
+        Platform::Douyu => {
+            if !cancellation.is_cancelled() {
+                cache_emoticons(crate::danmaku_douyu_emoticons::dictionary());
+            }
+        }
+        Platform::Bili => {}
     }
     let mut attempt = 0_u32;
     while !cancellation.is_cancelled() {

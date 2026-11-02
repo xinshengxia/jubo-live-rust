@@ -14,6 +14,8 @@ use std::{
 use url::Url;
 pub const MAX_BODY: usize = 2 * 1024 * 1024;
 pub const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
+// Huya's additional package asset host; other huya.com services stay excluded.
+const EXACT_HOSTS: &[&str] = &["fileserver.cdn.huya.com"];
 const FAMILIES: &[&str] = &[
     "hdslb.com",
     "biliimg.com",
@@ -28,7 +30,7 @@ const FAMILIES: &[&str] = &[
     "snssdk.com",
 ];
 pub fn approved_url(address: &str) -> Result<Url> {
-    network::approved_url(address, &[], FAMILIES)
+    network::approved_url(address, EXACT_HOSTS, FAMILIES)
 }
 #[derive(Clone)]
 pub struct ImageData {
@@ -65,7 +67,7 @@ impl ImageLoader {
         address: &str,
         notify: impl FnOnce() + Send + 'static,
     ) -> Option<Arc<ImageData>> {
-        let url = network::approved_url(address, &[], FAMILIES).ok()?;
+        let url = approved_url(address).ok()?;
         let key = url.to_string();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.clock = state.clock.wrapping_add(1);
@@ -162,7 +164,7 @@ fn evict(state: &mut State) {
 }
 fn download(mut url: Url) -> Result<ImageData> {
     for _ in 0..=3 {
-        let client = network::client(&url, &[], FAMILIES, Duration::from_secs(6))?;
+        let client = network::client(&url, EXACT_HOSTS, FAMILIES, Duration::from_secs(6))?;
         let response = client
             .get(url.clone())
             .send()
@@ -173,7 +175,7 @@ fn download(mut url: Url) -> Result<ImageData> {
                 .get("location")
                 .and_then(|h| h.to_str().ok())
                 .ok_or_else(|| anyhow!("图片重定向无效"))?;
-            url = network::approved_url(url.join(location)?.as_str(), &[], FAMILIES)?;
+            url = approved_url(url.join(location)?.as_str())?;
             continue;
         }
         ensure!(response.status().is_success(), "图片暂不可用");

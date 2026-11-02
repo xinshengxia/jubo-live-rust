@@ -90,6 +90,89 @@ const CMD_HEARTBEAT: i32 = 3;
 /// 唯一承载聊天正文的 uri（MessageNotice）。
 const URI_MESSAGE_NOTICE: i64 = 1400;
 
+// Same platform mappings as the legacy client: Huya's default web package,
+// followed by the public CDN overrides observed in the official chat view.
+// Only URLs are stored; platform artwork is downloaded at runtime.
+const DEFAULT_EMOTICONS: &[(&str, &str)] = &[
+    ("大笑", "dx"),
+    ("送花", "sh"),
+    ("偷笑", "tx"),
+    ("大哭", "dk"),
+    ("嘿哈", "hh"),
+    ("666", "66"),
+    ("感动", "gd"),
+    ("疑问", "yw"),
+    ("喜欢", "xh"),
+    ("奸笑", "jx"),
+    ("赞", "zan"),
+    ("可爱", "ka"),
+    ("傲慢", "am"),
+    ("开心", "kx"),
+    ("拜拜", "88"),
+    ("害羞", "hx"),
+    ("衰", "zs"),
+    ("吐血", "pu"),
+    ("嘴馋", "zc"),
+    ("生气", "sq"),
+    ("扶额", "fe"),
+    ("闭嘴", "bz"),
+    ("枯萎", "kw"),
+    ("嘘", "xu"),
+    ("笑哭", "xk"),
+    ("流汗", "lh"),
+    ("不看", "bk"),
+    ("哈欠", "hq"),
+    ("调皮", "tp"),
+    ("鬼脸", "gl"),
+    ("戳脸", "cl"),
+    ("大哥", "dg"),
+    ("困", "kun"),
+    ("拥抱", "yb"),
+    ("猪头", "zt"),
+    ("骷髅", "kl"),
+    ("臭臭", "cc"),
+    ("心动", "xd"),
+    ("刀", "dao"),
+];
+const EMOTICON_OVERRIDES: &[(&str, &str)] = &[
+    (
+        "满头问号",
+        "https://fileserver.cdn.huya.com/web_admin_material_zip_url/92ad65721cac4f79beae2ae9b3d58d09/expressconfig/steam_3.png",
+    ),
+    (
+        "吐血",
+        "https://cdnfile2.msstatic.com/cdnfile/material_manage/web_base_material_16141735632789_pic.png",
+    ),
+    (
+        "偷笑",
+        "https://cdnfile2.msstatic.com/cdnfile/material_manage/web_base_material_15790913779295_pic.png",
+    ),
+    (
+        "大哥",
+        "https://cdnfile2.msstatic.com/cdnfile/material_manage/web_base_material_16141742503895_pic.png",
+    ),
+    (
+        "送花",
+        "https://cdnfile2.msstatic.com/cdnfile/material_manage/web_base_material_16141715844572_pic.png",
+    ),
+];
+
+/// Credential-free fallback package, available before room lookup or socket I/O.
+/// Unknown/server-only packages retain their original text; never guess a URL.
+pub fn emoticon_dictionary() -> crate::danmaku::rich::EmoticonDictionary {
+    let mut dictionary = crate::danmaku::rich::EmoticonDictionary::new();
+    for (name, file) in DEFAULT_EMOTICONS {
+        dictionary.add(
+            name,
+            &format!("https://a.msstatic.com/huya/main/emot_png/{file}.png"),
+        );
+    }
+    for (name, url) in EMOTICON_OVERRIDES {
+        dictionary.add(name, url);
+    }
+    dictionary
+}
+
 // ------------------------------------------------------------------ Tars/JCE 子集
 
 /// Tars 类型编号，与旧实现 TarsType 一致。
@@ -1378,6 +1461,11 @@ pub fn connect(
         "虎牙弹幕客户端只接受虎牙房间"
     );
     target.validate().context("虎牙房间号无效")?;
+    if cancellation.is_cancelled() {
+        return Ok(());
+    }
+    // Publish before connecting so early messages use the normal image path.
+    crate::danmaku::cache_emoticons(emoticon_dictionary());
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 1..=MAX_ATTEMPTS {
         if cancellation.is_cancelled() {

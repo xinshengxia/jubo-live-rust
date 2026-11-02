@@ -334,6 +334,10 @@ impl EmoticonDictionary {
         self.by_code.get(code).map(String::as_str)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.by_code.iter().map(|(code, url)| (code.as_str(), url.as_str()))
+    }
+
     fn note_unknown(&mut self, code: &str) {
         if self.by_code.is_empty() || self.unknown.len() >= MAX_UNKNOWN_CODES {
             return;

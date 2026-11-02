@@ -1,6 +1,6 @@
 [package]
 name = "live-hub-rust"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 publish = false
 description = "Native Rust live-stream launcher and FLV relay"

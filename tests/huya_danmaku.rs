@@ -8,6 +8,119 @@
 
 use live_hub_rust::danmaku::{DanmakuEvent, DanmakuMode, MAX_TEXT_CHARS, MAX_WIRE_BYTES};
 use live_hub_rust::danmaku_huya::decode;
+use live_hub_rust::danmaku::rich::{TextSegment, split_text_segments};
+use live_hub_rust::danmaku_huya::emoticon_dictionary;
+
+#[test]
+fn huya_package_covers_every_default_and_supplement_with_approved_images() {
+    let dictionary = emoticon_dictionary();
+    let names = [
+        "大笑",
+        "送花",
+        "偷笑",
+        "大哭",
+        "嘿哈",
+        "666",
+        "感动",
+        "疑问",
+        "喜欢",
+        "奸笑",
+        "赞",
+        "可爱",
+        "傲慢",
+        "开心",
+        "拜拜",
+        "害羞",
+        "衰",
+        "吐血",
+        "嘴馋",
+        "生气",
+        "扶额",
+        "闭嘴",
+        "枯萎",
+        "嘘",
+        "笑哭",
+        "流汗",
+        "不看",
+        "哈欠",
+        "调皮",
+        "鬼脸",
+        "戳脸",
+        "大哥",
+        "困",
+        "拥抱",
+        "猪头",
+        "骷髅",
+        "臭臭",
+        "心动",
+        "刀",
+        "满头问号",
+    ];
+    assert_eq!(dictionary.len(), names.len());
+    for name in names {
+        let code = format!("[{name}]");
+        let url = dictionary.get(&code).expect("missing Huya emote");
+        assert!(live_hub_rust::images::approved_url(url).is_ok(), "{code}");
+        assert_eq!(
+            split_text_segments(&code, Some(&dictionary), None),
+            vec![TextSegment::Emoticon {
+                code,
+                url: url.into()
+            },]
+        );
+    }
+    assert_eq!(
+        dictionary.get("[666]"),
+        Some("https://a.msstatic.com/huya/main/emot_png/66.png")
+    );
+    assert!(
+        dictionary
+            .get("[吐血]")
+            .unwrap()
+            .contains("web_base_material_16141735632789_pic.png")
+    );
+}
+
+#[test]
+fn huya_v1_and_v2_emotes_reach_render_segments_without_losing_mixed_text() {
+    let text = "中文[666][666]中间[笑哭][满头问号]结尾[合成未知]";
+    let notice = message_notice("合成用户", text, None);
+    let dictionary = emoticon_dictionary();
+    for frame in [
+        command(7, &push_v1(1400, &notice)),
+        command(22, &push_v2(&[(1400, notice)])),
+    ] {
+        let events = decode(&frame).unwrap();
+        let item = message(&events[0]);
+        assert_eq!(item.text, text);
+        let segments = split_text_segments(&item.text, Some(&dictionary), None);
+        assert_eq!(segments.len(), 7);
+        assert_eq!(segments[0], TextSegment::Text("中文".into()));
+        assert_eq!(segments[3], TextSegment::Text("中间".into()));
+        assert_eq!(segments[6], TextSegment::Text("结尾[合成未知]".into()));
+        for index in [1, 2, 4, 5] {
+            assert!(matches!(&segments[index], TextSegment::Emoticon { .. }));
+        }
+        assert_eq!(
+            split_text_segments(&item.text, None, None),
+            vec![TextSegment::Text(text.into())]
+        );
+    }
+}
+
+#[test]
+fn huya_extra_asset_host_does_not_allow_other_services_or_lookalikes() {
+    for url in [
+        "https://fileserver.cdn.huya.com.attacker.invalid/a.png",
+        "https://other.cdn.huya.com/a.png",
+        "https://www.huya.com/a.png",
+        "https://user:pass@fileserver.cdn.huya.com/a.png",
+        "https://fileserver.cdn.huya.com:8080/a.png",
+        "https://127.0.0.1/a.png",
+    ] {
+        assert!(live_hub_rust::images::approved_url(url).is_err(), "{url}");
+    }
+}
 
 /// 测试用最小 Tars 写入器：独立实现，只覆盖构造合成报文需要的类型。
 struct TarsWriter {

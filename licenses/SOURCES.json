@@ -52,6 +52,23 @@
       "revision": "0e506f3cf935beede946296602af2e52d57ecea2",
       "usage": "Native frontierSign signature adaptation and public test vectors",
       "repository": "https://github.com/jwwsjlm/douyinLive"
+    },
+    {
+      "name": "Huya and Douyu public web emoticon mappings",
+      "repository": "https://www.huya.com/",
+      "references": [
+        "https://www.douyu.com/",
+        "https://a.msstatic.com/huya/main/emot_png/66.png"
+      ],
+      "modules": [
+        "src/danmaku_huya.rs",
+        "src/danmaku_douyu_emoticons.rs"
+      ],
+      "usage": "Public name-to-CDN URL facts migrated from the same GPL-3.0 legacy application; no platform image bytes bundled",
+      "license": {
+        "path": "LICENSE",
+        "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+      }
     }
   ],
   "emoji": {
