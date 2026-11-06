@@ -10,12 +10,36 @@
 //!   browser, or third-party signing service is used.
 //! * A WebSocket binary frame is a `PushFrame` with field 8 = payload. The payload
 //!   is a single layer of gzip over a `Response` protobuf. `Response.field1` is a
-//!   repeated `Message` (`method`, `payload`); only `WebcastChatMessage` is turned
-//!   into events.
+//!   repeated `Message` (`method`, `payload`): `WebcastChatMessage` becomes a chat
+//!   event, and `WebcastGiftMessage` / `WebcastMemberMessage` /
+//!   `WebcastLikeMessage` become the shared `DanmakuEvent::Live` gift / enter /
+//!   room-statistics events. No shared event variant was added.
+//! * The rich-event field numbers are **not guesses**. They were verified against
+//!   two independently maintained, MIT-licensed public Douyin webcast definitions
+//!   and their routing code:
+//!   - lulajax/DouyinLiveJava, MIT (Copyright (c) 2026 DouyinLiveJava
+//!     contributors), commit `b812242787ae9b5f4bbbf4e2239e4eec43318119`,
+//!     `client/src/main/proto/douyin.proto` and `MessageRouter.java`;
+//!   - jwwsjlm/douyinlive-proto, MIT (Copyright (c) 2026 jwwsjlm), commit
+//!     `0d661be57c8f80947054b2ef0cd1ac2fdce3cc4b`, `protobuf/new_douyin.proto`.
+//!   Both agree on every number used below (GiftMessage common=1, repeat_count=5,
+//!   combo_count=6, user=7, gift=15; GiftStruct name=16; MemberMessage user=2;
+//!   LikeMessage count=2/total=3; Common msg_id=2; User nickname=3). This is
+//!   protocol-source verification only, **not a live-platform acceptance**: the
+//!   adapter has not been run against a real Douyin room, so which optional fields
+//!   a given server build populates remains unverified.
 //! * No super-chat equivalent exists on Douyin: the legacy research checked every
-//!   protobuf message and found no paid-message amount/duration fields. Gift and
-//!   entry messages are decoded only far enough to bound them and are not
-//!   forwarded, because the shared `DanmakuEvent` contract has no gift variant.
+//!   protobuf message and found no paid-message amount/duration fields.
+//!   `WebcastSocialMessage` (follow/share), `WebcastRoomUserSeqMessage` and
+//!   `WebcastEmojiChatMessage` are still not forwarded.
+//!
+//! Rich payloads are best-effort overlay material: a malformed or incomplete
+//! gift/member/like payload is skipped without dropping ordinary chat messages
+//! from the same frame, and every parser keeps the existing field-count / length /
+//! depth / per-frame-event bounds. Dynamic (animated) emotes and room-scoped
+//! emoticon packages are **not** implemented here: the Douyin emoji endpoint is
+//! platform-wide and the image pipeline decodes one static frame only (see
+//! `danmaku_rich.rs` and the task report for the exact gap).
 //!
 //! Scope: pure signing, bounded PushFrame/gzip/protobuf codecs, join-URL assembly,
 //! heartbeat/ACK wire packets and a bounded WebSocket lifecycle. The default test
@@ -30,8 +54,8 @@ use crate::auth::CookieVault;
 use crate::core::{Platform, Target};
 use crate::danmaku::session::{DouyinSessionCookies, now_seconds};
 use crate::danmaku::{
-    Cancellation, DanmakuEvent, DanmakuMessage, DanmakuMode, Delivery, MAX_EVENTS_PER_FRAME,
-    MAX_EXPANDED_BYTES, MAX_TEXT_CHARS, MAX_WIRE_BYTES, emit,
+    Cancellation, DanmakuEvent, DanmakuMessage, DanmakuMode, Delivery, LiveEvent, LiveEventKind,
+    MAX_EVENTS_PER_FRAME, MAX_EXPANDED_BYTES, MAX_TEXT_CHARS, MAX_WIRE_BYTES, emit, rich,
 };
 use crate::platforms::CookieSource;
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -41,7 +65,6 @@ use std::io::{ErrorKind, Read};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::SyncSender;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::client::IntoClientRequest;
@@ -51,9 +74,16 @@ use tungstenite::{Message, WebSocket};
 
 /// `webcast_sdk_version` sent on the join URL and folded into the X-MS-STUB md5.
 pub const SDK_VERSION: &str = "1.0.15";
-/// A bounded number of reconnect attempts after the first connection, like the
-/// legacy client but explicitly finite.
+/// Legacy bound on reconnect attempts. Kept only for diagnostics that still
+/// read the constant: recovery is no longer limited by a session-lifetime
+/// counter (it uses a consecutive-failure backoff that resets after a stable
+/// connection, like `danmaku-10-douyin.cs` Run()).
 pub const MAX_RECONNECTS: u32 = 3;
+/// One connection that stayed up this long resets the consecutive-failure
+/// budget; the legacy client reset its attempt counter right after Connect(),
+/// this waits for sustained delivery so a handshake that immediately drops
+/// still counts as a failure.
+const STABLE_CONNECTION: Duration = Duration::from_secs(30);
 /// Heartbeat pacing of the legacy client; a heartbeat reply is expected within
 /// `HEARTBEAT_ACK_TIMEOUT_MS`, and two consecutive misses end the connection.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -704,11 +734,23 @@ fn parse_message(raw: &[u8], depth: usize, inspection: &mut FrameInspection) -> 
     }
     // Whitelist early-drop: real rooms are dominated by entry/commerce messages,
     // exactly as the legacy client observed.
-    if method != "WebcastChatMessage" {
+    let Some(payload) = payload else {
         return Ok(());
-    }
-    if let Some(payload) = payload {
-        parse_chat(payload, depth + 1, &mut inspection.events)?;
+    };
+    match method {
+        "WebcastChatMessage" => parse_chat(payload, depth + 1, &mut inspection.events)?,
+        // Rich events are best-effort overlay material: one malformed payload is
+        // dropped instead of failing the frame, so chat keeps flowing.
+        "WebcastGiftMessage" => {
+            let _ = parse_gift(payload, depth + 1, &mut inspection.events);
+        }
+        "WebcastMemberMessage" => {
+            let _ = parse_member(payload, depth + 1, &mut inspection.events);
+        }
+        "WebcastLikeMessage" => {
+            let _ = parse_like(payload, depth + 1, &mut inspection.events);
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -786,6 +828,211 @@ fn parse_chat_user(raw: &[u8], depth: usize) -> Result<ChatUser> {
 }
 
 // ---------------------------------------------------------------------------
+// Rich live events: gift / member-enter / like
+// ---------------------------------------------------------------------------
+//
+// Field numbers are verified against two MIT-licensed public Douyin webcast
+// definitions (see the module header); nothing here guesses a field number. The
+// mapping into the shared `DanmakuEvent::Live` contract follows the MIT
+// DouyinLiveJava router: gift name + repeat_count, member -> enter, like total ->
+// the passive room-statistics row. Only fields that exist in both definitions are
+// read; missing fields fall back to the same display defaults the B站 adapter uses.
+
+/// `Common { uint64 msg_id = 2; ... }` — the only sub-field the overlay needs is
+/// the event id used for its 15 s de-duplication window.
+fn parse_common_msg_id(raw: &[u8], depth: usize) -> Result<u64> {
+    ensure!(depth <= MAX_PROTO_DEPTH, "抖音 protobuf 嵌套层级超出上限");
+    let mut reader = ProtoReader::new(raw);
+    let mut msg_id = 0_u64;
+    let mut fields = 0_usize;
+    while let Some((field, wire)) = reader.read_tag()? {
+        fields += 1;
+        ensure!(fields <= MAX_PROTO_FIELDS, "抖音 Common 字段数量超出上限");
+        match (field, wire) {
+            (2, 0) => msg_id = reader.read_varint()?,
+            _ => reader.skip(wire)?,
+        }
+    }
+    Ok(msg_id)
+}
+
+/// `GiftStruct { string name = 16; ... }` — the gift display name. The diamond
+/// value (field 12) is not part of the shared event contract and is not read.
+fn parse_gift_struct_name(raw: &[u8], depth: usize) -> Result<String> {
+    ensure!(depth <= MAX_PROTO_DEPTH, "抖音 protobuf 嵌套层级超出上限");
+    let mut reader = ProtoReader::new(raw);
+    let mut name = String::new();
+    let mut fields = 0_usize;
+    while let Some((field, wire)) = reader.read_tag()? {
+        fields += 1;
+        ensure!(
+            fields <= MAX_PROTO_FIELDS,
+            "抖音 GiftStruct 字段数量超出上限"
+        );
+        match (field, wire) {
+            (16, 2) => name = limit(reader.read_string()?),
+            _ => reader.skip(wire)?,
+        }
+    }
+    Ok(name)
+}
+
+/// `GiftMessage`:
+/// `Common common = 1; uint64 gift_id = 2; ... uint64 repeat_count = 5;
+/// uint64 combo_count = 6; User user = 7; int32 repeat_end = 9;
+/// uint64 group_id = 11; GiftStruct gift = 15; ...`
+///
+/// One row is emitted per message (the overlay merges combo rows for the same
+/// user/gift and keeps the highest count), so no combo state is cached here.
+fn parse_gift(raw: &[u8], depth: usize, events: &mut Vec<DanmakuEvent>) -> Result<()> {
+    ensure!(depth <= MAX_PROTO_DEPTH, "抖音 protobuf 嵌套层级超出上限");
+    let mut reader = ProtoReader::new(raw);
+    let mut msg_id = 0_u64;
+    let mut repeat_count = 0_u64;
+    let mut combo_count = 0_u64;
+    let mut user = ChatUser::default();
+    let mut gift_name = String::new();
+    let mut fields = 0_usize;
+    while let Some((field, wire)) = reader.read_tag()? {
+        fields += 1;
+        ensure!(
+            fields <= MAX_PROTO_FIELDS,
+            "抖音 GiftMessage 字段数量超出上限"
+        );
+        match (field, wire) {
+            (1, 2) => msg_id = parse_common_msg_id(reader.read_bytes()?, depth + 1)?,
+            (5, 0) => repeat_count = reader.read_varint()?,
+            (6, 0) => combo_count = reader.read_varint()?,
+            (7, 2) => user = parse_chat_user(reader.read_bytes()?, depth + 1)?,
+            (15, 2) => gift_name = parse_gift_struct_name(reader.read_bytes()?, depth + 1)?,
+            _ => reader.skip(wire)?,
+        }
+    }
+    // Synthetic shell payloads carry neither a user nor a gift; drop them instead
+    // of drawing an empty "赠送 礼物" row. A real message carries at least a gift
+    // name or a sender.
+    if user.nickname.is_empty() && gift_name.is_empty() {
+        return Ok(());
+    }
+    let name = if gift_name.is_empty() {
+        "礼物"
+    } else {
+        gift_name.as_str()
+    };
+    // repeat_count is the combo progress (settlement message = combo total); the
+    // combo_count fallback covers payloads that omit the former.
+    let count = if repeat_count != 0 {
+        repeat_count
+    } else {
+        combo_count
+    };
+    events.push(DanmakuEvent::Live(LiveEvent {
+        id: if msg_id == 0 {
+            String::new()
+        } else {
+            msg_id.to_string()
+        },
+        kind: LiveEventKind::Gift,
+        user: limit(&user.nickname),
+        text: rich::sanitize_event_text(name, MAX_TEXT_CHARS),
+        count: count.clamp(1, 999_999) as u32,
+    }));
+    ensure!(
+        events.len() <= MAX_EVENTS_PER_FRAME,
+        "抖音单帧弹幕事件数量超出上限"
+    );
+    Ok(())
+}
+
+/// `MemberMessage { Common common = 1; User user = 2; uint64 member_count = 3;
+/// ... uint64 action = 10; string action_description = 11; ... }`
+///
+/// Only the entering user becomes a row. No source verifies the `action` enum
+/// (field 10), so it is deliberately not interpreted — a payload without a user
+/// is skipped instead of inventing an action label.
+fn parse_member(raw: &[u8], depth: usize, events: &mut Vec<DanmakuEvent>) -> Result<()> {
+    ensure!(depth <= MAX_PROTO_DEPTH, "抖音 protobuf 嵌套层级超出上限");
+    let mut reader = ProtoReader::new(raw);
+    let mut msg_id = 0_u64;
+    let mut user = ChatUser::default();
+    let mut fields = 0_usize;
+    while let Some((field, wire)) = reader.read_tag()? {
+        fields += 1;
+        ensure!(
+            fields <= MAX_PROTO_FIELDS,
+            "抖音 MemberMessage 字段数量超出上限"
+        );
+        match (field, wire) {
+            (1, 2) => msg_id = parse_common_msg_id(reader.read_bytes()?, depth + 1)?,
+            (2, 2) => user = parse_chat_user(reader.read_bytes()?, depth + 1)?,
+            _ => reader.skip(wire)?,
+        }
+    }
+    if user.nickname.is_empty() {
+        return Ok(());
+    }
+    events.push(DanmakuEvent::Live(LiveEvent {
+        id: if msg_id == 0 {
+            String::new()
+        } else {
+            msg_id.to_string()
+        },
+        kind: LiveEventKind::Enter,
+        user: limit(&user.nickname),
+        text: "进入直播间".to_owned(),
+        count: 1,
+    }));
+    ensure!(
+        events.len() <= MAX_EVENTS_PER_FRAME,
+        "抖音单帧弹幕事件数量超出上限"
+    );
+    Ok(())
+}
+
+/// `LikeMessage { Common common = 1; uint64 count = 2; uint64 total = 3;
+/// uint64 color = 4; User user = 5; ... }`
+///
+/// `total` is the room's cumulative like count and becomes the passive status
+/// row (the shared contract has no dedicated like event and adding one is out of
+/// scope); `count` is the per-message increment and is only used when the total
+/// is absent.
+fn parse_like(raw: &[u8], depth: usize, events: &mut Vec<DanmakuEvent>) -> Result<()> {
+    ensure!(depth <= MAX_PROTO_DEPTH, "抖音 protobuf 嵌套层级超出上限");
+    let mut reader = ProtoReader::new(raw);
+    let mut count = 0_u64;
+    let mut total = 0_u64;
+    let mut fields = 0_usize;
+    while let Some((field, wire)) = reader.read_tag()? {
+        fields += 1;
+        ensure!(
+            fields <= MAX_PROTO_FIELDS,
+            "抖音 LikeMessage 字段数量超出上限"
+        );
+        match (field, wire) {
+            (2, 0) => count = reader.read_varint()?,
+            (3, 0) => total = reader.read_varint()?,
+            _ => reader.skip(wire)?,
+        }
+    }
+    let likes = if total != 0 { total } else { count };
+    if likes == 0 {
+        return Ok(());
+    }
+    events.push(DanmakuEvent::Live(LiveEvent {
+        id: String::new(),
+        kind: LiveEventKind::Status,
+        user: String::new(),
+        text: rich::sanitize_event_text(&format!("点赞 {likes}"), MAX_TEXT_CHARS),
+        count: 1,
+    }));
+    ensure!(
+        events.len() <= MAX_EVENTS_PER_FRAME,
+        "抖音单帧弹幕事件数量超出上限"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Heartbeat ACK watch and reconnect policy (pure, offline-testable)
 // ---------------------------------------------------------------------------
 
@@ -835,6 +1082,17 @@ impl HeartbeatAckWatch {
 /// Bounded reconnect backoff: 3 s, 6 s, 9 s, then capped at 30 s (legacy shape).
 pub fn reconnect_delay(reconnects: u32) -> Duration {
     Duration::from_secs((3_u64.saturating_mul(u64::from(reconnects.max(1)))).min(30))
+}
+
+/// Consecutive-failure budget with the legacy reset: a connection that stayed
+/// alive for [`STABLE_CONNECTION`] starts the counter over (returns 1 for its
+/// first new failure), so a long session is not killed by its lifetime total.
+fn next_reconnect_count(previous: u32, elapsed: Duration) -> u32 {
+    if elapsed >= STABLE_CONNECTION {
+        1
+    } else {
+        previous.saturating_add(1)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1513,7 +1771,7 @@ fn open_socket(
     Ok(socket)
 }
 
-fn send_status(sender: &SyncSender<DanmakuEvent>, text: impl Into<String>) -> bool {
+fn send_status(sender: &crate::danmaku::EventSender, text: impl Into<String>) -> bool {
     matches!(
         emit(sender, DanmakuEvent::Status(text.into())),
         Delivery::Closed
@@ -1533,7 +1791,7 @@ fn cancellable_wait(cancellation: &Cancellation, duration: Duration) {
 
 fn read_loop(
     mut socket: DouyinSocket,
-    sender: &SyncSender<DanmakuEvent>,
+    sender: &crate::danmaku::EventSender,
     cancellation: &Cancellation,
 ) -> Result<()> {
     let started = Instant::now();
@@ -1613,7 +1871,7 @@ fn read_loop(
 
 fn run_once(
     target: &Target,
-    sender: &SyncSender<DanmakuEvent>,
+    sender: &crate::danmaku::EventSender,
     cancellation: &Cancellation,
     source: Option<&dyn CookieSource>,
 ) -> Result<()> {
@@ -1717,18 +1975,50 @@ mod cookie_tests {
     }
 }
 
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+
+    #[test]
+    fn stable_connections_reset_the_consecutive_failure_budget() {
+        let mut count = 0;
+        for _ in 0..100 {
+            count = next_reconnect_count(count, STABLE_CONNECTION);
+            assert_eq!(count, 1, "a stable connection starts a fresh budget");
+        }
+        assert_eq!(
+            next_reconnect_count(5, Duration::from_secs(1)),
+            6,
+            "quick failures accumulate"
+        );
+        assert_eq!(
+            next_reconnect_count(u32::MAX, Duration::from_secs(1)),
+            u32::MAX,
+            "the counter saturates instead of overflowing"
+        );
+        // Legacy backoff shape: 3 s per consecutive failure, capped at 30 s.
+        assert_eq!(reconnect_delay(1), Duration::from_secs(3));
+        assert_eq!(reconnect_delay(10), Duration::from_secs(30));
+    }
+}
+
 /// Open the Douyin webcast WebSocket with signature/ACK/heartbeat lifecycle.
 ///
 /// Blocking worker function, matching `danmaku::connect`: it polls
 /// `Cancellation` between reads (500 ms socket timeout) and never waits for a
-/// slow event consumer. Reconnects are finite (`MAX_RECONNECTS`); after that a
-/// final error is returned. The default offline suite never contacts the
+/// slow event consumer. The default offline suite never contacts the
 /// platform; `tests/douyin_live_acceptance.rs` documents the manually verified
 /// anonymous handshake (opt-in, ignored). Browser-based risk verification remains
 /// outside this receiver.
+///
+/// Recovery is continuous like `danmaku-10-douyin.cs` Run(): transient failures
+/// retry with the capped `reconnect_delay` backoff and the consecutive-failure
+/// counter resets after a connection stayed up for `STABLE_CONNECTION`. Only a
+/// typed `DouyinRoomFailure::LoginRequired` stops the loop, because that needs a
+/// human login/verification step rather than another reconnect.
 pub fn connect(
     target: &Target,
-    sender: SyncSender<DanmakuEvent>,
+    sender: crate::danmaku::EventSender,
     cancellation: Cancellation,
 ) -> Result<()> {
     connect_with_cookie_source(target, sender, cancellation, None)
@@ -1736,7 +2026,7 @@ pub fn connect(
 
 pub fn connect_authenticated(
     target: &Target,
-    sender: SyncSender<DanmakuEvent>,
+    sender: crate::danmaku::EventSender,
     cancellation: Cancellation,
     vault: &CookieVault,
 ) -> Result<()> {
@@ -1746,7 +2036,7 @@ pub fn connect_authenticated(
 /// Explicit scoped source; no legacy-profile or credential discovery occurs.
 pub fn connect_with_cookie_source(
     target: &Target,
-    sender: SyncSender<DanmakuEvent>,
+    sender: crate::danmaku::EventSender,
     cancellation: Cancellation,
     source: Option<Arc<dyn CookieSource>>,
 ) -> Result<()> {
@@ -1760,6 +2050,7 @@ pub fn connect_with_cookie_source(
         if cancellation.is_cancelled() {
             return Ok(());
         }
+        let started = Instant::now();
         match run_once(target, &sender, &cancellation, source.as_deref()) {
             Ok(()) => return Ok(()),
             Err(error) => {
@@ -1783,21 +2074,12 @@ pub fn connect_with_cookie_source(
                         return Ok(());
                     }
                 }
-                reconnects = reconnects.saturating_add(1);
-                if reconnects > MAX_RECONNECTS {
-                    let _ = send_status(
-                        &sender,
-                        format!("抖音弹幕重连 {MAX_RECONNECTS} 次后仍失败，停止重试"),
-                    );
-                    return Err(
-                        error.context(format!("抖音弹幕重连 {MAX_RECONNECTS} 次后仍然失败"))
-                    );
-                }
+                reconnects = next_reconnect_count(reconnects, started.elapsed());
                 let delay = reconnect_delay(reconnects);
                 if send_status(
                     &sender,
                     format!(
-                        "抖音弹幕连接中断，{} 秒后重连（{reconnects}/{MAX_RECONNECTS}）",
+                        "抖音弹幕连接中断，{} 秒后重连（连续失败 {reconnects} 次）",
                         delay.as_secs()
                     ),
                 ) {

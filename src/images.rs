@@ -14,7 +14,8 @@ use std::{
 use url::Url;
 pub const MAX_BODY: usize = 2 * 1024 * 1024;
 pub const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
-// Huya's additional package asset host; other huya.com services stay excluded.
+// Huya's server-package CDN is outside its existing msstatic/huyaimg families.
+// Approve this exact asset host rather than every service under huya.com.
 const EXACT_HOSTS: &[&str] = &["fileserver.cdn.huya.com"];
 const FAMILIES: &[&str] = &[
     "hdslb.com",

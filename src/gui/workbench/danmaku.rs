@@ -8,9 +8,9 @@
 //! danmaku.json. This file owns no persistence or overlay logic.
 
 use super::*;
-use crate::core::{HotkeyBindings, ScCorner, ScMode};
-use crate::hotkeys::{HotkeyAction, HotkeyConfigError};
+use crate::core::{EmoteSizeMode, HotkeyBindings, ScCorner, ScMode};
 use crate::gui::{parse_reserved_areas, reserved_areas_text};
+use crate::hotkeys::{HotkeyAction, HotkeyConfigError};
 use eframe::egui::Pos2;
 
 // Original page geometry (logical pixels, 1240x720 design size).
@@ -92,6 +92,10 @@ const MERGE_ITEMS: [&str; 2] = ["逐条显示", "合并重复（×N）"];
 const MERGE_VALUES: [u16; 2] = [0, 1];
 const MERGE_WINDOW_ITEMS: [&str; 4] = ["3 秒", "5 秒", "8 秒", "10 秒"];
 const MERGE_WINDOW_VALUES: [u16; 4] = [3000, 5000, 8000, 10000];
+// Legacy "表情大小" choice: the platform large marker only enlarges emotes in
+// Platform mode, so Small really wins over a server large flag.
+const EMOTE_SIZE_ITEMS: [&str; 3] = ["小（不高于文字）", "按平台尺寸", "大（可占多行）"];
+const EMOTE_SIZE_VALUES: [u16; 3] = [0, 1, 2];
 const LINE_GAP_ITEMS: [&str; 7] = ["60%", "80%", "100%", "120%", "150%", "200%", "250%"];
 const LINE_GAP_VALUES: [u16; 7] = [60, 80, 100, 120, 150, 200, 250];
 
@@ -109,15 +113,7 @@ const SC_STACK_VALUES: [u16; 7] = [0, 1, 2, 3, 4, 6, 12];
 const SC_CORNER_ITEMS: [&str; 4] = ["右上（同 B站）", "右下", "左上", "左下"];
 const SC_SCALE_ITEMS: [&str; 6] = ["60%", "80%", "100%", "120%", "150%", "200%"];
 const SC_SCALE_VALUES: [u16; 6] = [60, 80, 100, 120, 150, 200];
-const SC_DURATION_ITEMS: [&str; 7] = [
-    "20%",
-    "50%",
-    "100%",
-    "150%",
-    "200%",
-    "300%",
-    "400%",
-];
+const SC_DURATION_ITEMS: [&str; 7] = ["20%", "50%", "100%", "150%", "200%", "300%", "400%"];
 const SC_DURATION_VALUES: [u16; 7] = [20, 50, 100, 150, 200, 300, 400];
 
 const MIN_LEVEL_ITEMS: [&str; 9] = [
@@ -132,7 +128,15 @@ const MIN_LEVEL_ITEMS: [&str; 9] = [
     "60 级",
 ];
 const MIN_LEVEL_VALUES: [u16; 9] = [0, 1, 5, 10, 20, 30, 40, 50, 60];
-const MIN_MEDAL_ITEMS: [&str; 7] = ["不过滤（0）", "1 级", "5 级", "10 级", "20 级", "30 级", "40 级"];
+const MIN_MEDAL_ITEMS: [&str; 7] = [
+    "不过滤（0）",
+    "1 级",
+    "5 级",
+    "10 级",
+    "20 级",
+    "30 级",
+    "40 级",
+];
 const MIN_MEDAL_VALUES: [u16; 7] = [0, 1, 5, 10, 20, 30, 40];
 
 const ADMISSION_ITEMS: [&str; 8] = [
@@ -156,7 +160,9 @@ const QUEUE_WAIT_ITEMS: [&str; 7] = [
     "1000 毫秒",
 ];
 const QUEUE_WAIT_VALUES: [u16; 7] = [0, 100, 200, 300, 500, 800, 1000];
-const QUEUE_CAPACITY_ITEMS: [&str; 7] = ["1 条", "8 条", "16 条", "32 条", "64 条", "128 条", "200 条"];
+const QUEUE_CAPACITY_ITEMS: [&str; 7] = [
+    "1 条", "8 条", "16 条", "32 条", "64 条", "128 条", "200 条",
+];
 const QUEUE_CAPACITY_VALUES: [u16; 7] = [1, 8, 16, 32, 64, 128, 200];
 const CROWDED_SCALE_ITEMS: [&str; 7] = ["70%", "75%", "80%", "85%", "90%", "95%", "100%"];
 const CROWDED_SCALE_VALUES: [u16; 7] = [70, 75, 80, 85, 90, 95, 100];
@@ -194,6 +200,22 @@ fn sc_corner_slot(corner: ScCorner) -> u16 {
     }
 }
 
+fn emote_size_slot(mode: EmoteSizeMode) -> u16 {
+    match mode {
+        EmoteSizeMode::Small => 0,
+        EmoteSizeMode::Platform => 1,
+        EmoteSizeMode::Large => 2,
+    }
+}
+
+fn emote_size_at(slot: u16) -> EmoteSizeMode {
+    match slot {
+        0 => EmoteSizeMode::Small,
+        2 => EmoteSizeMode::Large,
+        _ => EmoteSizeMode::Platform,
+    }
+}
+
 fn sc_corner_at(slot: u16) -> ScCorner {
     match slot {
         1 => ScCorner::BottomRight,
@@ -215,10 +237,8 @@ impl Launcher {
         let card_top = host.top() + FORM_TOP;
         let action_top = host.bottom() - 40.0;
         let viewport_h = (action_top - ACTION_GAP - card_top).max(160.0);
-        let content = Rect::from_min_size(
-            pos2(host.left(), card_top),
-            vec2(host.width(), viewport_h),
-        );
+        let content =
+            Rect::from_min_size(pos2(host.left(), card_top), vec2(host.width(), viewport_h));
         let tab = self.danmaku_tab.min(TAB_TITLES.len() - 1);
         let mut area = child(ui, content);
         scroll_area(&mut area, SCROLL_ID, |ui| {
@@ -305,6 +325,9 @@ impl Launcher {
         if self.blocked_keyword_text != saved.behavior.blocked_keywords.join("\n") {
             return true;
         }
+        if self.blocked_user_text != saved.behavior.blocked_users.join("\n")
+            || self.highlight_keyword_text != saved.behavior.highlight_keywords.join("\n")
+            || self.pin_keyword_text != saved.behavior.pin_keywords.join("\n") { return true; }
         if self.reserved_areas_text != reserved_areas_text(&saved.reserved_areas) {
             return true;
         }
@@ -312,14 +335,6 @@ impl Launcher {
     }
 
     fn danmaku_save(&mut self) {
-        let keywords: Vec<String> = self
-            .blocked_keyword_text
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_owned)
-            .take(201)
-            .collect();
         let areas = match parse_reserved_areas(&self.reserved_areas_text) {
             Ok(areas) => areas,
             Err(error) => {
@@ -332,7 +347,24 @@ impl Launcher {
             return;
         }
         let mut overlay = self.overlay_draft.clone();
-        overlay.behavior.blocked_keywords = keywords;
+        overlay.behavior.blocked_keywords = rule_lines(&self.blocked_keyword_text);
+        overlay.behavior.blocked_users = rule_lines(&self.blocked_user_text);
+        overlay.behavior.highlight_keywords = rule_lines(&self.highlight_keyword_text);
+        overlay.behavior.pin_keywords = rule_lines(&self.pin_keyword_text);
+        // Reject the save on the first invalid uid:/name:/re: rule: the overlay
+        // would otherwise skip it at runtime, so the user could not tell why the
+        // rule never matched. The compile check mirrors danmaku_rules::compile,
+        // which the overlay runs on the saved settings.
+        let rules = crate::danmaku_rules::compile_with_users(
+            &overlay.behavior.blocked_keywords,
+            &overlay.behavior.blocked_users,
+            &overlay.behavior.highlight_keywords,
+            &overlay.behavior.pin_keywords,
+        );
+        if let Some(error) = rules.errors.first() {
+            self.set_status(format!("弹幕规则未保存：{error}"), true);
+            return;
+        }
         overlay.reserved_areas = areas;
         self.overlay_draft = overlay;
         self.reserved_areas_text = reserved_areas_text(&self.overlay_draft.reserved_areas);
@@ -349,6 +381,8 @@ impl Launcher {
         self.overlay_draft = self.snapshot.settings.overlay.clone();
         self.blocked_keyword_text = self.overlay_draft.behavior.blocked_keywords.join("\n");
         self.blocked_user_text = self.overlay_draft.behavior.blocked_users.join("\n");
+        self.highlight_keyword_text = self.overlay_draft.behavior.highlight_keywords.join("\n");
+        self.pin_keyword_text = self.overlay_draft.behavior.pin_keywords.join("\n");
         self.reserved_areas_text = reserved_areas_text(&self.overlay_draft.reserved_areas);
         self.set_status("已重新读取已保存的弹幕设置。", false);
     }
@@ -396,6 +430,23 @@ fn check_slot(card: Rect, column: usize, row: usize) -> Rect {
     let x = card.left() + CARD_PAD + column as f32 * CHECK_COL_DX;
     let y = card.top() + CHECK_TOP + row as f32 * CHECK_PITCH;
     Rect::from_min_size(pos2(x, y), vec2(FIELD_W.min(480.0), CHECK_H))
+}
+
+/// Maximum rule lines one settings list may contain (DanmakuBehavior::validate
+/// enforces the same limit for hand-edited JSON).
+const MAX_RULE_LINES: usize = 200;
+
+/// Splits one rule textarea into rule lines: trims surrounding whitespace, drops
+/// blank lines, keeps `uid:`/`name:`/`re:` prefixes and the expression body
+/// exactly as typed, and caps the list one past the limit so the normal settings
+/// validation reports "too many entries" instead of silently dropping lines.
+fn rule_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(MAX_RULE_LINES + 1)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Numeric preset dropdown that also shows a custom current value instead of
@@ -562,18 +613,25 @@ impl Launcher {
         ) {
             self.overlay_draft.line_gap_percent = value;
         }
+        let (label, control) = form_slot(card, 1, 4);
+        field_label(ui, label, "表情大小", None, pal);
+        if let Some(value) = combo_numeric(
+            ui,
+            control,
+            "dm-emote-size",
+            &EMOTE_SIZE_ITEMS,
+            &EMOTE_SIZE_VALUES,
+            emote_size_slot(self.overlay_draft.emote_size),
+            pal,
+        ) {
+            self.overlay_draft.emote_size = emote_size_at(value);
+        }
 
         card_h
     }
 
     /// Tab 2: SC 醒目留言.
-    fn danmaku_tab_sc(
-        &mut self,
-        ui: &mut Ui,
-        origin: Pos2,
-        width: f32,
-        pal: &Pal,
-    ) -> f32 {
+    fn danmaku_tab_sc(&mut self, ui: &mut Ui, origin: Pos2, width: f32, pal: &Pal) -> f32 {
         let card_h = 292.0;
         let card = Rect::from_min_size(origin, vec2(width, card_h));
         danmaku_card(ui, card, pal);
@@ -664,7 +722,10 @@ impl Launcher {
             pal,
         );
         let hint_rect = Rect::from_min_size(
-            pos2(card.left() + CARD_PAD, card.top() + FORM_TOP + ROW_PITCH * 4.0 + 2.0),
+            pos2(
+                card.left() + CARD_PAD,
+                card.top() + FORM_TOP + ROW_PITCH * 4.0 + 2.0,
+            ),
             vec2((card.width() - CARD_PAD * 2.0).max(200.0), 18.0),
         );
         hint(
@@ -679,14 +740,8 @@ impl Launcher {
 
 impl Launcher {
     /// Tab 3: 过滤与开关. Two-column checkbox grid + level filters + blocked words.
-    fn danmaku_tab_filter(
-        &mut self,
-        ui: &mut Ui,
-        origin: Pos2,
-        width: f32,
-        pal: &Pal,
-    ) -> f32 {
-        let card_h = 540.0 + CHECK_PITCH * 2.0;
+    fn danmaku_tab_filter(&mut self, ui: &mut Ui, origin: Pos2, width: f32, pal: &Pal) -> f32 {
+        let card_h = 980.0 + CHECK_PITCH * 2.0;
         let card = Rect::from_min_size(origin, vec2(width, card_h));
         danmaku_card(ui, card, pal);
         danmaku_heading(ui, card, "过滤与开关", pal);
@@ -733,13 +788,25 @@ impl Launcher {
         let rect = check_slot(card, 0, 2);
         checkbox(ui, rect, "弹幕前显示用户名", &mut draft.show_user_name, pal);
         let rect = check_slot(card, 1, 2);
-        checkbox(ui, rect, "显示用户等级 / 舰长", &mut draft.show_user_level, pal);
+        checkbox(
+            ui,
+            rect,
+            "显示用户等级 / 舰长",
+            &mut draft.show_user_level,
+            pal,
+        );
         let rect = check_slot(card, 0, 3);
         checkbox(ui, rect, "舰长 / 守护标识", &mut draft.show_guard, pal);
         let rect = check_slot(card, 1, 3);
         checkbox(ui, rect, "显示表情图片", &mut behavior.show_images, pal);
         let rect = check_slot(card, 0, 4);
-        checkbox(ui, rect, "彩色 Unicode 表情", &mut draft.show_color_emoji, pal);
+        checkbox(
+            ui,
+            rect,
+            "彩色 Unicode 表情",
+            &mut draft.show_color_emoji,
+            pal,
+        );
         let rect = check_slot(card, 1, 4);
         checkbox(
             ui,
@@ -749,7 +816,13 @@ impl Launcher {
             pal,
         );
         let rect = check_slot(card, 0, 5);
-        checkbox(ui, rect, "字号随画面大小缩放", &mut draft.scale_with_window, pal);
+        checkbox(
+            ui,
+            rect,
+            "字号随画面大小缩放",
+            &mut draft.scale_with_window,
+            pal,
+        );
         let rect = check_slot(card, 1, 5);
         checkbox(
             ui,
@@ -781,7 +854,13 @@ impl Launcher {
             pal,
         );
         let rect = check_slot(card, 1, 8);
-        checkbox(ui, rect, "保留平台弹幕颜色", &mut behavior.show_colored, pal);
+        checkbox(
+            ui,
+            rect,
+            "保留平台弹幕颜色",
+            &mut behavior.show_colored,
+            pal,
+        );
 
         // Numeric level filters: label above the dropdown, like the form grid.
         let numeric_top = card.top() + CHECK_TOP + CHECK_PITCH * 11.0 + 10.0;
@@ -804,11 +883,13 @@ impl Launcher {
             let x = card.left() + CARD_PAD + column as f32 * CHECK_COL_DX;
             let label_rect = Rect::from_min_size(pos2(x, numeric_top), vec2(FIELD_W, 22.0));
             field_label(ui, label_rect, label, None, pal);
-            let control = Rect::from_min_size(
-                pos2(x, numeric_top + 28.0),
-                vec2(FIELD_W, DROPDOWN_H),
-            );
-            let id = if column == 0 { "dm-min-user" } else { "dm-min-medal" };
+            let control =
+                Rect::from_min_size(pos2(x, numeric_top + 28.0), vec2(FIELD_W, DROPDOWN_H));
+            let id = if column == 0 {
+                "dm-min-user"
+            } else {
+                "dm-min-medal"
+            };
             if let Some(value) = combo_numeric(ui, control, id, items, values, current, pal) {
                 if column == 0 {
                     behavior.min_user_level = value as u8;
@@ -826,7 +907,7 @@ impl Launcher {
         field_label(
             ui,
             keyword_label,
-            "屏蔽词（每行一个，包含匹配；re: 正则尚未支持）",
+            "屏蔽词（每行一个；re: 正则，支持分组/字符类/重复）",
             None,
             pal,
         );
@@ -835,18 +916,40 @@ impl Launcher {
             vec2((card.width() - CARD_PAD * 2.0).max(200.0), 92.0),
         );
         multiline(ui, keyword_input, &mut self.blocked_keyword_text, pal);
+        let editor_width = (card.width() - CARD_PAD * 2.0).max(200.0);
+        for (index, label, value) in [
+            (0, "屏蔽用户（昵称包含；uid: 数字 / name: 精确昵称 / re: 正则）", &mut self.blocked_user_text),
+            (1, "高亮词（每行一个；可使用 re: 正则）", &mut self.highlight_keyword_text),
+            (2, "置顶词（每行一个；可使用 re: 正则，仍受顶部弹幕开关约束）", &mut self.pin_keyword_text),
+        ] {
+            let top = keyword_input.bottom() + 12.0 + index as f32 * 128.0;
+            field_label(ui, Rect::from_min_size(pos2(card.left() + CARD_PAD, top), vec2(editor_width, 22.0)), label, None, pal);
+            multiline(ui, Rect::from_min_size(pos2(card.left() + CARD_PAD, top + 24.0), vec2(editor_width, 92.0)), value, pal);
+        }
+        let color_top = keyword_input.bottom() + 12.0 + 3.0 * 128.0;
+        field_label(ui, Rect::from_min_size(pos2(card.left() + CARD_PAD, color_top), vec2(180.0, 24.0)), "高亮 / 置顶颜色", None, pal);
+        let value = self.overlay_draft.behavior.highlight_color;
+        let mut rgb = [((value >> 16) & 255) as u8, ((value >> 8) & 255) as u8, (value & 255) as u8];
+        let mut color_ui = child(ui, Rect::from_min_size(pos2(card.left() + CARD_PAD + 190.0, color_top), vec2(140.0, 26.0)));
+        if color_ui.color_edit_button_srgb(&mut rgb).changed() {
+            self.overlay_draft.behavior.highlight_color = (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]);
+        }
+        // Same rule-syntax guidance as the legacy feature settings dialog.
+        hint(
+            ui,
+            Rect::from_min_size(
+                pos2(card.left() + CARD_PAD, color_top + 34.0),
+                vec2(editor_width, 18.0),
+            ),
+            "用户规则：uid:数字 精确用户；name:完整昵称（忽略大小写）；re:正则；无前缀按昵称包含。无效规则会拒绝保存并提示。",
+            pal,
+        );
         card_h
     }
 
     /// Tab 4: 更多弹幕设置. Label-left / control-right rows, one card with three
     /// sections (original "更多弹幕设置" flat content).
-    fn danmaku_tab_more(
-        &mut self,
-        ui: &mut Ui,
-        origin: Pos2,
-        width: f32,
-        pal: &Pal,
-    ) -> f32 {
+    fn danmaku_tab_more(&mut self, ui: &mut Ui, origin: Pos2, width: f32, pal: &Pal) -> f32 {
         let card_h = 668.0;
         let card = Rect::from_min_size(origin, vec2(width, card_h));
         danmaku_card(ui, card, pal);
@@ -860,7 +963,15 @@ impl Launcher {
         more_group(ui, card, y, "拥挤与准入", pal);
         y += 26.0;
         more_label(ui, card, y, "平滑弹幕准入", label_w, pal);
-        more_check(ui, ctrl_x, y, ctrl_w, "启用", &mut self.overlay_draft.behavior.smooth_admission, pal);
+        more_check(
+            ui,
+            ctrl_x,
+            y,
+            ctrl_w,
+            "启用",
+            &mut self.overlay_draft.behavior.smooth_admission,
+            pal,
+        );
         y += MORE_ROW;
         more_label(ui, card, y, "每秒准入上限", label_w, pal);
         if let Some(value) = combo_numeric(
@@ -902,7 +1013,15 @@ impl Launcher {
         }
         y += MORE_ROW;
         more_label(ui, card, y, "拥挤时缩小普通弹幕", label_w, pal);
-        more_check(ui, ctrl_x, y, ctrl_w, "启用", &mut self.overlay_draft.behavior.shrink_when_crowded, pal);
+        more_check(
+            ui,
+            ctrl_x,
+            y,
+            ctrl_w,
+            "启用",
+            &mut self.overlay_draft.behavior.shrink_when_crowded,
+            pal,
+        );
         y += MORE_ROW;
         more_label(ui, card, y, "拥挤时字号", label_w, pal);
         if let Some(value) = combo_numeric(
@@ -934,7 +1053,15 @@ impl Launcher {
         }
         y += MORE_ROW;
         more_label(ui, card, y, "合并重复时随 ×N 放大", label_w, pal);
-        more_check(ui, ctrl_x, y, ctrl_w, "启用", &mut self.overlay_draft.behavior.enlarge_merged, pal);
+        more_check(
+            ui,
+            ctrl_x,
+            y,
+            ctrl_w,
+            "启用",
+            &mut self.overlay_draft.behavior.enlarge_merged,
+            pal,
+        );
         y += MORE_ROW;
         more_label(ui, card, y, "合并放大上限", label_w, pal);
         if let Some(value) = combo_numeric(
@@ -950,16 +1077,48 @@ impl Launcher {
         }
         y += MORE_ROW;
         more_label(ui, card, y, "送礼提示", label_w, pal);
-        more_check(ui, ctrl_x, y, ctrl_w, "启用", &mut self.overlay_draft.behavior.show_gifts, pal);
+        more_check(
+            ui,
+            ctrl_x,
+            y,
+            ctrl_w,
+            "启用",
+            &mut self.overlay_draft.behavior.show_gifts,
+            pal,
+        );
         y += MORE_ROW;
         more_label(ui, card, y, "进场 / 关注提示", label_w, pal);
-        more_check(ui, ctrl_x, y, ctrl_w, "启用", &mut self.overlay_draft.behavior.show_enters, pal);
+        more_check(
+            ui,
+            ctrl_x,
+            y,
+            ctrl_w,
+            "启用",
+            &mut self.overlay_draft.behavior.show_enters,
+            pal,
+        );
         y += MORE_ROW;
         more_label(ui, card, y, "平台公告", label_w, pal);
-        more_check(ui, ctrl_x, y, ctrl_w, "启用", &mut self.overlay_draft.behavior.show_notice, pal);
+        more_check(
+            ui,
+            ctrl_x,
+            y,
+            ctrl_w,
+            "启用",
+            &mut self.overlay_draft.behavior.show_notice,
+            pal,
+        );
         y += MORE_ROW;
         more_label(ui, card, y, "看过 / 点赞 / 高能榜人数", label_w, pal);
-        more_check(ui, ctrl_x, y, ctrl_w, "启用", &mut self.overlay_draft.behavior.show_live_stats, pal);
+        more_check(
+            ui,
+            ctrl_x,
+            y,
+            ctrl_w,
+            "启用",
+            &mut self.overlay_draft.behavior.show_live_stats,
+            pal,
+        );
         y += MORE_ROW;
 
         more_group(ui, card, y, "画面安全区", pal);
@@ -981,7 +1140,10 @@ impl Launcher {
         y += 84.0 + 8.0;
         hint(
             ui,
-            Rect::from_min_size(pos2(card.left() + CARD_PAD, y), vec2(card.width() - CARD_PAD * 2.0, 18.0)),
+            Rect::from_min_size(
+                pos2(card.left() + CARD_PAD, y),
+                vec2(card.width() - CARD_PAD * 2.0, 18.0),
+            ),
             "拖动避让位置以百分比保存，缩放后自动跟随；格式错误会拒绝保存。",
             pal,
         );
@@ -1034,7 +1196,16 @@ impl Launcher {
             .collect();
         let mut key_index = crate::gui::theme::ui_font_key_index(&settings.ui_font_key);
         let key_rect = Rect::from_min_size(pos2(left_x, control_y), vec2(FIELD_W, DROPDOWN_H));
-        if dropdown(ui, key_rect, "ui-font-key", &mut key_index, &key_labels, pal).changed() {
+        if dropdown(
+            ui,
+            key_rect,
+            "ui-font-key",
+            &mut key_index,
+            &key_labels,
+            pal,
+        )
+        .changed()
+        {
             let key = crate::gui::theme::UI_FONT_KEYS
                 .get(key_index)
                 .map(|(value, _)| *value)
@@ -1101,8 +1272,7 @@ impl Launcher {
         let error_row = hotkey_error.as_ref().and_then(hotkey_error_row);
         let mut row_y = hotkey_top + 26.0;
         for (index, action) in HotkeyAction::ALL.iter().copied().enumerate() {
-            let label_rect =
-                Rect::from_min_size(pos2(left_x, row_y), vec2(HOTKEY_LABEL_W, 24.0));
+            let label_rect = Rect::from_min_size(pos2(left_x, row_y), vec2(HOTKEY_LABEL_W, 24.0));
             text_in(
                 ui.painter(),
                 label_rect,
@@ -1118,12 +1288,7 @@ impl Launcher {
             let spec = hotkey_spec_mut(&mut self.overlay_draft.hotkeys, action);
             input(ui, input_rect, spec, "留空 = 不绑定", pal);
             if error_row == Some(index) {
-                rounded_stroke(
-                    ui.painter(),
-                    input_rect,
-                    5.0,
-                    Stroke::new(1.6, pal.danger),
-                );
+                rounded_stroke(ui.painter(), input_rect, 5.0, Stroke::new(1.6, pal.danger));
                 if let Some(error) = hotkey_error.as_ref() {
                     text_in(
                         ui.painter(),
@@ -1291,12 +1456,45 @@ mod tests {
         let error = invalid.parse_all().expect_err("unknown key must fail");
         assert_eq!(hotkey_error_text(&error), "格式无效");
     }
+
+    #[test]
+    fn emote_size_slots_round_trip_every_legacy_mode() {
+        for mode in [
+            EmoteSizeMode::Small,
+            EmoteSizeMode::Platform,
+            EmoteSizeMode::Large,
+        ] {
+            assert_eq!(emote_size_at(emote_size_slot(mode)), mode);
+        }
+    }
+
+    #[test]
+    fn rule_lines_trim_blank_lines_and_keep_rule_syntax() {
+        // CRLF/LF textareas: surrounding whitespace is trimmed, blank lines are
+        // dropped, and uid:/name:/re: bodies survive untouched for the compiler.
+        assert_eq!(
+            rule_lines("  uid:42 \r\n\n name:Alice \r\nre:^[0-9]+$\n"),
+            vec![
+                "uid:42".to_owned(),
+                "name:Alice".to_owned(),
+                "re:^[0-9]+$".to_owned(),
+            ]
+        );
+        assert!(rule_lines("   \n\t\n").is_empty());
+        // One line past the limit is kept so validation can report it instead of
+        // silently truncating the user's rules.
+        let many: String = (0..MAX_RULE_LINES + 5).map(|i| format!("词{i}\n")).collect();
+        assert_eq!(rule_lines(&many).len(), MAX_RULE_LINES + 1);
+    }
 }
 
 fn more_group(ui: &Ui, card: Rect, top: f32, text: &str, pal: &Pal) {
     text_in(
         ui.painter(),
-        Rect::from_min_size(pos2(card.left() + CARD_PAD, top), vec2(card.width() - CARD_PAD * 2.0, 24.0)),
+        Rect::from_min_size(
+            pos2(card.left() + CARD_PAD, top),
+            vec2(card.width() - CARD_PAD * 2.0, 24.0),
+        ),
         text,
         bold(12.0),
         pal.text,
@@ -1315,15 +1513,7 @@ fn more_label(ui: &Ui, card: Rect, top: f32, text: &str, width: f32, pal: &Pal) 
     );
 }
 
-fn more_check(
-    ui: &mut Ui,
-    x: f32,
-    top: f32,
-    width: f32,
-    text: &str,
-    value: &mut bool,
-    pal: &Pal,
-) {
+fn more_check(ui: &mut Ui, x: f32, top: f32, width: f32, text: &str, value: &mut bool, pal: &Pal) {
     let rect = Rect::from_min_size(pos2(x, top), vec2(width, 24.0));
     checkbox(ui, rect, text, value, pal);
 }

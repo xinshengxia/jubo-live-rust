@@ -4,10 +4,10 @@
 
 use crate::{
     auth::CookieVault,
-    core::Platform,
+    core::{Platform, Target},
     platforms::{self, LookupCandidate, LookupSource},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, thread};
 
@@ -597,6 +597,7 @@ pub fn douyin_account_candidate(input: &str) -> Option<LookupCandidate> {
         .strip_prefix("douyin:")
         .or_else(|| text.strip_prefix("抖音号:"))
         .or_else(|| text.strip_prefix("抖音号："))
+        .or_else(|| text.strip_prefix('@'))
         .map(str::trim)?;
     if !valid_douyin_handle(handle) {
         return None;
@@ -619,6 +620,448 @@ pub fn douyin_account_candidate(input: &str) -> Option<LookupCandidate> {
     })
 }
 
+/// One "查找主播" input that already points at an exact room or account instead
+/// of a nickname query. Mirrors the legacy LookupData.Direct / uid / share rules
+/// so pasted links, share copy and numeric uids are not searched as nicknames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LookupInput {
+    /// Official room link or explicit platform:room input; still unverified.
+    Room(LookupCandidate),
+    /// Official account page / uid; the room is resolved by verification.
+    Account(LookupCandidate),
+    /// Douyin short share link that needs the bounded redirect resolver below.
+    Share(String),
+    /// Douyin handle ("抖音号:…" / "@…"): search by handle, never invent a room.
+    DouyinHandle(String),
+}
+
+const DOUYIN_SHARE_HOSTS: [&str; 2] = ["v.douyin.com", "v.iesdouyin.com"];
+/// A desktop browser UA is required by the Douyin short-link endpoints; it is a
+/// public header only and never carries credentials or cookies.
+const SHARE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0";
+
+fn is_douyin_share_host(host: &str) -> bool {
+    DOUYIN_SHARE_HOSTS
+        .iter()
+        .any(|allowed| host.eq_ignore_ascii_case(allowed))
+}
+
+fn is_douyin_official_host(host: &str) -> bool {
+    [
+        "www.douyin.com",
+        "live.douyin.com",
+        "www.iesdouyin.com",
+        "webcast.amemv.com",
+    ]
+    .iter()
+    .any(|allowed| host.eq_ignore_ascii_case(allowed))
+}
+
+fn looks_like_room_text(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 24 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn platform_prefix(input: &str) -> Option<Platform> {
+    let (prefix, room) = input.split_once(':')?;
+    if room.trim().is_empty() {
+        return None;
+    }
+    prefix.trim().parse::<Platform>().ok()
+}
+
+/// Canonical official live-room page for one validated room id.
+pub fn room_input_url(platform: Platform, room: &str) -> String {
+    match platform {
+        Platform::Bili => format!("https://live.bilibili.com/{room}"),
+        Platform::Huya => format!("https://www.huya.com/{room}"),
+        Platform::Douyu => format!("https://www.douyu.com/{room}"),
+        Platform::Douyin => format!("https://live.douyin.com/{room}"),
+    }
+}
+
+/// Official live page for a candidate, covering huya/douyu room aliases that the
+/// numeric-only room_page deliberately refuses to guess.
+pub fn candidate_room_page(candidate: &LookupCandidate) -> Option<String> {
+    Target::new(candidate.platform, candidate.room.clone())
+        .ok()
+        .map(|target| room_input_url(target.platform, &target.room))
+}
+
+fn direct_room_candidate(
+    platform: Platform,
+    room: &str,
+    original: Option<&str>,
+) -> Result<LookupCandidate> {
+    let target = Target::new(platform, room.to_owned())?;
+    let canonical = room_input_url(target.platform, &target.room);
+    let mut sources = vec![LookupSource {
+        url: canonical.clone(),
+        title: "用户输入的官方直播间".into(),
+        excerpt: String::new(),
+        retrieved_at: platforms::retrieval_timestamp(),
+        supports: vec!["房间号".into()],
+    }];
+    if let Some(original) = original.filter(|value| *value != canonical.as_str()) {
+        if let Ok(url) = url::Url::parse(original) {
+            if matches!(url.scheme(), "http" | "https")
+                && url.username().is_empty()
+                && url.password().is_none()
+            {
+                sources.push(LookupSource {
+                    url: url.to_string(),
+                    title: "用户输入的链接".into(),
+                    excerpt: String::new(),
+                    retrieved_at: platforms::retrieval_timestamp(),
+                    supports: vec!["用户提供的链接".into()],
+                });
+            }
+        }
+    }
+    Ok(LookupCandidate {
+        name: format!("房间 {}", target.room),
+        room: target.room.clone(),
+        platform: target.platform,
+        // Verification compares this canonical page; it is the official live
+        // page, not an account homepage, so account_page still returns None.
+        profile_url: Some(canonical),
+        provider: "input".into(),
+        match_reasons: vec!["用户输入的官方直播间链接或房间号；需平台核验".into()],
+        sources,
+        ..Default::default()
+    })
+}
+
+fn direct_account_candidate(
+    platform: Platform,
+    name: String,
+    profile_url: String,
+    account_id: Option<String>,
+    sec_uid: Option<String>,
+    account_handle: Option<String>,
+) -> LookupCandidate {
+    LookupCandidate {
+        name,
+        room: String::new(),
+        platform,
+        profile_url: Some(profile_url.clone()),
+        account_id,
+        sec_uid,
+        account_handle,
+        provider: "input".into(),
+        match_reasons: vec!["用户提供的官方账号线索；直播间归属待核验".into()],
+        sources: vec![LookupSource {
+            url: profile_url,
+            title: "用户提供的官方账号页".into(),
+            excerpt: String::new(),
+            retrieved_at: platforms::retrieval_timestamp(),
+            supports: vec!["账号身份".into()],
+        }],
+        ..Default::default()
+    }
+}
+
+fn bili_uid_input(text: &str) -> Option<String> {
+    let uid = text
+        .strip_prefix("uid:")
+        .or_else(|| text.strip_prefix("UID:"))
+        .map(str::trim)?;
+    looks_like_room_text(uid).then(|| uid.to_owned())
+}
+
+fn bili_uid_candidate(uid: &str) -> Result<LookupCandidate> {
+    ensure!(looks_like_room_text(uid), "B站 UID 必须是1–24位数字");
+    Ok(direct_account_candidate(
+        Platform::Bili,
+        format!("B站账号 {uid}"),
+        format!("https://space.bilibili.com/{uid}"),
+        Some(uid.to_owned()),
+        None,
+        None,
+    ))
+}
+
+fn bili_profile_candidate(text: &str) -> Option<LookupCandidate> {
+    let url = url::Url::parse(text.trim()).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("space.bilibili.com")
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let uid = url.path().trim_matches('/').split('/').next()?;
+    if !looks_like_room_text(uid) {
+        return None;
+    }
+    Some(direct_account_candidate(
+        Platform::Bili,
+        format!("B站账号 {uid}"),
+        format!("https://space.bilibili.com/{uid}"),
+        Some(uid.to_owned()),
+        None,
+        None,
+    ))
+}
+
+/// Extract the first Douyin short share link from pasted share copy. The link is
+/// returned as an https URL only; nothing else from the copy is trusted.
+pub fn douyin_share_link(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    for host in DOUYIN_SHARE_HOSTS {
+        let mut cursor = 0_usize;
+        while let Some(found) = lower[cursor..].find(host) {
+            let start = cursor + found;
+            cursor = start + host.len();
+            // Reject a match that is only the tail of a longer hostname.
+            if text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+            {
+                continue;
+            }
+            let tail = &text[start + host.len()..];
+            let end = tail
+                .find(|ch: char| {
+                    ch.is_whitespace()
+                        || matches!(
+                            ch,
+                            '，' | '。'
+                                | '；'
+                                | '、'
+                                | '）'
+                                | '】'
+                                | '（'
+                                | '【'
+                                | '“'
+                                | '”'
+                                | '"'
+                                | '\''
+                                | '<'
+                                | '>'
+                        )
+                })
+                .unwrap_or(tail.len());
+            let link = &text[start..start + host.len() + end];
+            if link.contains('@') || link.contains("..") {
+                continue;
+            }
+            let Ok(url) = url::Url::parse(&format!("https://{link}")) else {
+                continue;
+            };
+            if url.host_str().is_some_and(is_douyin_share_host)
+                && url.path().len() > 1
+                && url.path().len() <= 256
+                && url.username().is_empty()
+                && url.password().is_none()
+            {
+                return Some(url.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Classify a "查找主播" input before the nickname search. None means the text is
+/// still a normal nickname query.
+pub fn classify_lookup_input(
+    input: &str,
+    platform: Platform,
+    all_platforms: bool,
+) -> Result<Option<LookupInput>> {
+    let text = input.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    ensure!(
+        text.chars().count() <= 512,
+        "查找输入应为1–512字；粘贴分享文案时请只保留链接"
+    );
+
+    // A Douyin short share link can be embedded in share copy and must win over
+    // the generic URL handling below (the short host is not a live-room host).
+    if let Some(link) = douyin_share_link(text) {
+        return Ok(Some(LookupInput::Share(link)));
+    }
+
+    // Douyin account clues: profile URL / sec_uid / 抖音号 / @handle.
+    if all_platforms || platform == Platform::Douyin {
+        if let Some(candidate) = douyin_account_candidate(text) {
+            if candidate.profile_url.is_some() {
+                return Ok(Some(LookupInput::Account(candidate)));
+            }
+            if let Some(handle) = candidate
+                .account_handle
+                .clone()
+                .filter(|value| valid_douyin_handle(value))
+            {
+                return Ok(Some(LookupInput::DouyinHandle(handle)));
+            }
+        }
+    }
+
+    // Bilibili numeric uid or official account page.
+    if all_platforms || platform == Platform::Bili {
+        if let Some(uid) = bili_uid_input(text) {
+            return Ok(Some(LookupInput::Account(bili_uid_candidate(&uid)?)));
+        }
+    }
+    if let Some(candidate) = bili_profile_candidate(text) {
+        if all_platforms || platform == Platform::Bili {
+            return Ok(Some(LookupInput::Account(candidate)));
+        }
+    }
+
+    let looks_like_url = text.contains("://");
+    if looks_like_url || platform_prefix(text).is_some() {
+        return match Target::parse(text) {
+            Ok(target) => Ok(Some(LookupInput::Room(direct_room_candidate(
+                target.platform,
+                &target.room,
+                looks_like_url.then_some(text),
+            )?))),
+            Err(error) => {
+                if looks_like_url {
+                    Err(anyhow!(
+                        "无法识别这个链接：只支持官方直播间链接或账号主页（{error}）"
+                    ))
+                } else {
+                    // "abc:def" is far more likely a nickname than a room prefix.
+                    Ok(None)
+                }
+            }
+        };
+    }
+
+    if looks_like_room_text(text) {
+        if all_platforms {
+            // The legacy launcher refuses to guess a platform for a bare number.
+            return Err(anyhow!("仅有数字时请先选择平台，或粘贴完整直播链接。"));
+        }
+        return Ok(Some(LookupInput::Room(direct_room_candidate(
+            platform, text, None,
+        )?)));
+    }
+
+    Ok(None)
+}
+
+fn share_candidate(url: &url::Url, share: &str) -> Option<LookupCandidate> {
+    if let Ok(target) = Target::parse(url.as_str()) {
+        if target.platform == Platform::Douyin {
+            return direct_room_candidate(Platform::Douyin, &target.room, Some(share)).ok();
+        }
+    }
+    let host = url.host_str()?;
+    if is_douyin_official_host(host) {
+        if let Some(rest) = url.path().strip_prefix("/user/") {
+            let sec = rest.trim_end_matches('/');
+            if valid_sec_uid(sec) {
+                return Some(direct_account_candidate(
+                    Platform::Douyin,
+                    "抖音账号（分享链接）".into(),
+                    format!("https://www.douyin.com/user/{sec}"),
+                    None,
+                    Some(sec.to_owned()),
+                    None,
+                ));
+            }
+        }
+        let room = url
+            .query_pairs()
+            .find(|(key, _)| key.as_ref() == "room_id")
+            .map(|(_, value)| value.to_string())
+            .filter(|value| looks_like_room_text(value));
+        let sec = url
+            .query_pairs()
+            .find(|(key, _)| key.as_ref() == "sec_user_id")
+            .map(|(_, value)| value.to_string())
+            .filter(|value| valid_sec_uid(value));
+        if let (Some(session_room), Some(sec)) = (room.as_ref(), sec.as_ref()) {
+            // The reflow query carries an internal session room, not the public
+            // web room; keep the account stage and let verification resolve the
+            // digital web room from the official profile.
+            let mut candidate = direct_account_candidate(
+                Platform::Douyin,
+                "抖音账号（分享链接）".into(),
+                format!("https://www.douyin.com/user/{sec}"),
+                None,
+                Some(sec.to_owned()),
+                None,
+            );
+            candidate.match_reasons.push(format!(
+                "分享链接携带内部场次 {session_room}；网页房间由平台核验解析"
+            ));
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Resolve a Douyin short share link through at most four cookie-free redirects.
+/// Returns an unverified room/account candidate: the normal platform verification
+/// (and its verified-at gate) still decides whether it can be favourited. Every
+/// redirect hop must stay on a Douyin host.
+pub fn resolve_douyin_share(share_url: &str) -> Result<LookupCandidate> {
+    const MAX_HOPS: usize = 4;
+    let mut current = url::Url::parse(share_url).map_err(|_| anyhow!("分享链接格式无效"))?;
+    ensure!(
+        current.scheme() == "https" && current.host_str().is_some_and(is_douyin_share_host),
+        "只支持抖音短分享链接（v.douyin.com）"
+    );
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(8))
+        .connect_timeout(std::time::Duration::from_secs(4))
+        .user_agent(SHARE_USER_AGENT)
+        .build()
+        .map_err(|_| anyhow!("无法准备分享链接请求"))?;
+    let mut last_error = None;
+    for hop in 0..=MAX_HOPS {
+        if let Some(candidate) = share_candidate(&current, share_url) {
+            return Ok(candidate);
+        }
+        if hop == MAX_HOPS {
+            break;
+        }
+        let response = client
+            .get(current.clone())
+            .send()
+            .map_err(|_| anyhow!("无法连接抖音分享页，请检查网络后重试"))?;
+        let status = response.status();
+        if status.is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| anyhow!("分享链接没有返回跳转地址，可能已过期"))?;
+            let next = current
+                .join(location)
+                .map_err(|_| anyhow!("分享链接跳转地址无效"))?;
+            ensure!(
+                next.scheme() == "https"
+                    && next
+                        .host_str()
+                        .is_some_and(|host| is_douyin_share_host(host) || is_douyin_official_host(host))
+                    && next.username().is_empty()
+                    && next.password().is_none(),
+                "分享链接跳转到了非抖音地址，已停止解析"
+            );
+            current = next;
+            continue;
+        }
+        last_error = Some(match status.as_u16() {
+            401 | 403 | 429 => "分享链接需要网页验证或访问受限，请复制完整直播链接".to_owned(),
+            code => format!("分享链接返回 HTTP {code}"),
+        });
+        break;
+    }
+    Err(anyhow!(
+        last_error.unwrap_or_else(|| "分享链接未取得可识别的直播间或账号".to_owned())
+    ))
+}
+
 /// Actionable hint for a Douyin search failure that the page-based assist can fix.
 /// Only Douyin has that path; other platforms keep their existing recovery text.
 pub fn douyin_web_assist_hint(platform: Platform, error: &str) -> Option<&'static str> {
@@ -638,6 +1081,49 @@ pub fn douyin_web_assist_hint(platform: Platform, error: &str) -> Option<&'stati
         .iter()
         .any(|marker| lower.contains(marker));
     transient.then_some("可稍后刷新；若反复失败，可用“抖音网页辅助”在独立浏览器完成验证后重试。")
+}
+
+/// Browser URLs are parsed once and never passed through a command shell.
+pub fn public_external_url(address: &str) -> Result<String> {
+    let url = url::Url::parse(address)?;
+    ensure!(matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+        && url.username().is_empty() && url.password().is_none()
+        && !address.chars().any(char::is_control), "只允许无内嵌凭据的公开http(s)链接");
+    let host = url.host_str().unwrap_or("");
+    ensure!(host != "localhost" && !host.ends_with(".localhost") && !host.ends_with(".local"), "不能打开本地主机链接");
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        // Address-family helpers are expanded manually so this check does not
+        // depend on the exact std stabilization level of the IPv6 predicates.
+        let public = match ip {
+            std::net::IpAddr::V4(ip) => {
+                !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified()
+            }
+            std::net::IpAddr::V6(ip) => {
+                let head = ip.segments()[0];
+                !ip.is_loopback()
+                    && !ip.is_unspecified()
+                    && (head & 0xfe00) != 0xfc00   // unique local fc00::/7
+                    && (head & 0xffc0) != 0xfe80   // unicast link local fe80::/10
+            }
+        };
+        ensure!(public, "不能打开私网链接");
+    }
+    Ok(url.to_string())
+}
+
+pub fn platform_search_url(platform: Platform, keyword: &str) -> Result<String> {
+    let keyword = keyword.trim();
+    ensure!(!keyword.is_empty() && keyword.chars().count() <= 200, "请输入1–200字搜索词");
+    let (base, key) = match platform {
+        Platform::Bili => ("https://search.bilibili.com/all", "keyword"),
+        Platform::Huya => ("https://www.huya.com/search/", "w"),
+        Platform::Douyu => ("https://www.douyu.com/search", "kw"),
+        Platform::Douyin => ("https://www.douyin.com/search/", ""),
+    };
+    let mut url = url::Url::parse(base)?;
+    if key.is_empty() { url.path_segments_mut().map_err(|_| anyhow::anyhow!("搜索路径无效"))?.pop_if_empty().push(keyword); }
+    else { url.query_pairs_mut().append_pair(key, keyword); }
+    Ok(url.to_string())
 }
 
 /// Queries the given platforms concurrently; per-platform failures stay separate.
@@ -674,6 +1160,36 @@ pub fn query_platforms(
             })
             .collect()
     })
+}
+
+/// A requested page remains isolated from the first-page cache. Each platform
+/// performs one bounded request and failures do not erase successful peers.
+pub fn query_platforms_page(
+    selected: &[Platform], keyword: &str, vault: &CookieVault, page: u32,
+) -> Vec<(Platform, PlatformSearchResult)> {
+    thread::scope(|scope| {
+        let jobs: Vec<_> = selected.iter().map(|platform| {
+            let platform = *platform;
+            scope.spawn(move || (platform,
+                platforms::search_authenticated_page(platform, keyword, vault, page)
+                    .map_err(|error| format!("{error:#}"))))
+        }).collect();
+        jobs.into_iter().enumerate().map(|(index, job)| job.join()
+            .unwrap_or_else(|_| (selected[index], Err("平台查询工作线程异常".into())))).collect()
+    })
+}
+
+/// Append more results without moving an existing candidate's identity. A
+/// bounded accumulated list prevents repeated page clicks growing indefinitely.
+pub fn append_candidates(existing: &mut Vec<LookupCandidate>, rows: Vec<LookupCandidate>) -> usize {
+    let before = existing.len();
+    for row in rows {
+        let duplicate = existing.iter().any(|old| old.platform == row.platform &&
+            if !row.room.is_empty() { old.room == row.room }
+            else { old.room.is_empty() && old.profile_url == row.profile_url && old.name == row.name });
+        if !duplicate && existing.len() < 400 { existing.push(row); }
+    }
+    existing.len() - before
 }
 
 pub fn all(keyword: &str, vault: &CookieVault) -> Result<SearchBundle> {
@@ -1020,6 +1536,37 @@ mod tests {
         assert!(douyin_account_candidate("抖音号:bad handle").is_none());
     }
 
+
+    #[test]
+    fn appending_a_page_dedupes_rooms_and_accounts_without_reordering() {
+        let mut existing = vec![candidate(Platform::Huya, "甲", "196645")];
+        let added = append_candidates(
+            &mut existing,
+            vec![
+                candidate(Platform::Huya, "甲", "196645"),
+                candidate(Platform::Huya, "乙", "2"),
+                candidate(Platform::Bili, "丙", "3"),
+                candidate(Platform::Huya, "甲", "196645"),
+            ],
+        );
+        assert_eq!(added, 2, "duplicates by platform+room are not appended again");
+        assert_eq!(existing[0].name, "甲", "the first page keeps its order");
+        assert_eq!(existing.len(), 3);
+        // Account-stage rows have no room: dedupe by profile URL and name.
+        let mut accounts = vec![candidate(Platform::Douyin, "账号", "")];
+        accounts[0].profile_url = Some("https://www.douyin.com/user/MS4wLjSyntheticAccount_A".into());
+        let duplicate_account = accounts[0].clone();
+        let added = append_candidates(
+            &mut accounts,
+            vec![
+                duplicate_account,
+                candidate(Platform::Douyin, "其他账号", ""),
+            ],
+        );
+        assert_eq!(added, 1);
+        assert_eq!(accounts.len(), 2);
+    }
+
     #[test]
     fn douyin_failures_offer_the_page_assist_only_for_that_platform() {
         let hint = douyin_web_assist_hint(Platform::Douyin, "平台要求登录或网页验证")
@@ -1032,5 +1579,122 @@ mod tests {
         );
         assert!(douyin_web_assist_hint(Platform::Huya, "平台要求登录").is_none());
         assert!(douyin_web_assist_hint(Platform::Douyin, "unexpected shape").is_none());
+    }
+
+    #[test]
+    fn pasted_room_links_and_platform_prefixes_become_unverified_room_candidates() {
+        let room = classify_lookup_input("https://live.bilibili.com/12345?spm=share", Platform::Bili, false)
+            .unwrap()
+            .expect("room link");
+        match room {
+            LookupInput::Room(candidate) => {
+                assert_eq!(candidate.platform, Platform::Bili);
+                assert_eq!(candidate.room, "12345");
+                assert_eq!(candidate.provider, "input");
+                assert_eq!(candidate.verified_at, 0, "input is never pre-verified");
+                assert_eq!(
+                    candidate.profile_url.as_deref(),
+                    Some("https://live.bilibili.com/12345")
+                );
+                assert!(candidate.sources.iter().any(|source| source.url.contains("spm=share")));
+            }
+            other => panic!("unexpected classification: {other:?}"),
+        }
+        let prefixed = classify_lookup_input("huya:196645", Platform::Bili, false)
+            .unwrap()
+            .expect("explicit prefix");
+        assert!(matches!(prefixed, LookupInput::Room(candidate) if candidate.platform == Platform::Huya));
+        // A bare number follows the visible platform picker in single-platform
+        // scope, and is refused as ambiguous in the all-platform scope.
+        let bare = classify_lookup_input("952595", Platform::Douyu, false)
+            .unwrap()
+            .expect("single-platform bare room");
+        assert!(matches!(bare, LookupInput::Room(candidate) if candidate.platform == Platform::Douyu));
+        assert!(classify_lookup_input("952595", Platform::Douyu, true).is_err());
+        // Huya room aliases are valid rooms, not accounts.
+        let alias = classify_lookup_input("https://www.huya.com/clkimmy", Platform::Bili, true)
+            .unwrap()
+            .expect("huya alias room");
+        assert!(matches!(alias, LookupInput::Room(candidate) if candidate.room == "clkimmy"));
+        assert_eq!(
+            candidate_room_page(&candidate(Platform::Huya, "clkimmy", "clkimmy")).as_deref(),
+            Some("https://www.huya.com/clkimmy")
+        );
+        // Ordinary nicknames stay platform searches.
+        assert!(classify_lookup_input("花小龙", Platform::Bili, true).unwrap().is_none());
+        assert!(classify_lookup_input("   ", Platform::Bili, true).unwrap().is_none());
+    }
+
+    #[test]
+    fn uid_and_account_pages_route_to_account_stage_candidates() {
+        let uid = classify_lookup_input("uid:456", Platform::Bili, true)
+            .unwrap()
+            .expect("bili uid");
+        match uid {
+            LookupInput::Account(candidate) => {
+                assert_eq!(candidate.platform, Platform::Bili);
+                assert!(candidate.room.is_empty());
+                assert_eq!(candidate.account_id.as_deref(), Some("456"));
+                assert_eq!(
+                    candidate.profile_url.as_deref(),
+                    Some("https://space.bilibili.com/456")
+                );
+                assert_eq!(candidate_stage(&candidate), "找到账号，房间待解析");
+            }
+            other => panic!("unexpected classification: {other:?}"),
+        }
+        let profile = classify_lookup_input("https://space.bilibili.com/456?from=search", Platform::Bili, false)
+            .unwrap()
+            .expect("bili profile page");
+        assert!(matches!(profile, LookupInput::Account(candidate) if candidate.account_id.as_deref() == Some("456")));
+        // A bili uid pasted while another platform is selected must not be
+        // silently routed; it stays a nickname query for that platform.
+        assert!(classify_lookup_input("uid:456", Platform::Douyu, false).unwrap().is_none());
+        let sec = "MS4wLjSyntheticAccount_A";
+        let douyin = classify_lookup_input(&format!("https://www.douyin.com/user/{sec}"), Platform::Bili, true)
+            .unwrap()
+            .expect("douyin profile page in all-platform scope");
+        assert!(matches!(douyin, LookupInput::Account(candidate) if candidate.platform == Platform::Douyin));
+    }
+
+    #[test]
+    fn douyin_share_copy_is_extracted_and_never_treated_as_a_live_room() {
+        let copy = "7.32 复制打开抖音，看看【合成主播的直播】https://v.douyin.com/iAbCdEf/ 活动";
+        assert_eq!(
+            douyin_share_link(copy).as_deref(),
+            Some("https://v.douyin.com/iAbCdEf/")
+        );
+        assert!(matches!(
+            classify_lookup_input(copy, Platform::Bili, false).unwrap(),
+            Some(LookupInput::Share(_))
+        ));
+        // A longer hostname must not be mistaken for the short-link host.
+        assert!(douyin_share_link("https://evilv.douyin.com/abc/").is_none());
+        assert!(douyin_share_link("https://v.douyin.com/").is_none());
+        assert!(douyin_share_link("普通昵称 https://example.com/x").is_none());
+    }
+
+    #[test]
+    fn douyin_handle_inputs_are_search_keywords_not_invented_rooms() {
+        let handle = classify_lookup_input("抖音号:synthetic_handle", Platform::Bili, true)
+            .unwrap()
+            .expect("douyin handle");
+        assert_eq!(handle, LookupInput::DouyinHandle("synthetic_handle".into()));
+        let at = classify_lookup_input("@synthetic_handle", Platform::Douyin, false)
+            .unwrap()
+            .expect("at handle");
+        assert_eq!(at, LookupInput::DouyinHandle("synthetic_handle".into()));
+        // The same text while another single platform is selected stays a query.
+        assert!(classify_lookup_input("抖音号:synthetic_handle", Platform::Huya, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn unresolved_links_report_an_actionable_input_error() {
+        let error = classify_lookup_input("https://example.com/not-a-room", Platform::Bili, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("只支持官方直播间链接"), "{error}");
+        // A plain nickname containing a colon is still a nickname query.
+        assert!(classify_lookup_input("浪D:live", Platform::Huya, false).unwrap().is_none());
     }
 }

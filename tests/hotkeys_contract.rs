@@ -239,7 +239,7 @@ fn fixed_activation_is_idempotent() {
 }
 
 #[test]
-fn failed_fixed_registration_is_not_retried_within_one_activation() {
+fn fixed_transition_keeps_retry_explicit_within_one_activation() {
     let mut state = FixedHotkeyState::new();
     assert_eq!(state.transition(true).len(), 4);
     state.record(FixedOverlayAction::FontSmaller, true);
@@ -247,14 +247,17 @@ fn failed_fixed_registration_is_not_retried_within_one_activation() {
     state.record(FixedOverlayAction::ToggleDanmaku, false);
     state.record(FixedOverlayAction::ToggleSuperChat, true);
 
-    // The overlay calls set_fixed_active every follow tick; a key whose
-    // registration failed must not trigger a new RegisterHotKey attempt each
-    // tick (the overlay polls exactly that key with GetAsyncKeyState instead).
+    // A failed key must not implicitly request another registration on every
+    // transition() tick. The native wrapper paces explicit retries.
     assert!(state.transition(true).is_empty());
+    assert_eq!(
+        state.retry_unheld(),
+        vec![FixedHotkeyStep::Register(FixedOverlayAction::ToggleDanmaku)]
+    );
     assert!(!state.holds(FixedOverlayAction::ToggleDanmaku));
     assert_eq!(state.held_count(), 3);
 
-    // A foreground round trip (leave and return) is the retry point.
+    // A foreground round trip still releases held keys and requests all keys.
     let unregistering = state.transition(false);
     assert_eq!(
         unregistering,

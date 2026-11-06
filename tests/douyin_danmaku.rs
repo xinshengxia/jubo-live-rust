@@ -6,8 +6,8 @@
 
 use flate2::{Compression, write::GzEncoder};
 use live_hub_rust::danmaku::{
-    DanmakuEvent, DanmakuMode, MAX_EVENTS_PER_FRAME, MAX_EXPANDED_BYTES, MAX_TEXT_CHARS,
-    MAX_WIRE_BYTES,
+    DanmakuEvent, DanmakuMode, LiveEventKind, MAX_EVENTS_PER_FRAME, MAX_EXPANDED_BYTES,
+    MAX_TEXT_CHARS, MAX_WIRE_BYTES,
 };
 use live_hub_rust::danmaku_douyin::*;
 use std::io::Write;
@@ -99,7 +99,8 @@ fn chat_frame(text: &str, nickname: &str) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 const STUB: &str = "704f436b2558b0d7a1c7e758527dd8f1";
-const SIGN_ALPHABET: &str = "Dkdpgh4ZKsQB80/Mfvw36XI1R25+WUAlEi7NLboqYTOPuzmFjJnryx9HVGcaStCe";
+const SIGN_ALPHABET: &str =
+    "Dkdpgh4ZKsQB80/Mfvw36XI1R25+WUAlEi7NLboqYTOPuzmFjJnryx9HVGcaStCe";
 
 #[test]
 fn signing_matches_the_two_public_upstream_vectors() {
@@ -113,11 +114,7 @@ fn signing_matches_the_two_public_upstream_vectors() {
     );
     // The signature alphabet deliberately contains + and /, so the join URL
     // must percent-encode it (covered below).
-    assert!(
-        sign_with_values(STUB, 0, false, 0, 6)
-            .unwrap()
-            .contains('+')
-    );
+    assert!(sign_with_values(STUB, 0, false, 0, 6).unwrap().contains('+'));
 }
 
 #[test]
@@ -126,20 +123,9 @@ fn online_signing_is_short_alphabet_bounded_and_never_cached() {
     let second = sign(STUB).unwrap();
     assert_eq!(first.chars().count(), 16);
     assert_eq!(second.chars().count(), 16);
-    assert!(
-        first
-            .chars()
-            .all(|character| SIGN_ALPHABET.contains(character))
-    );
-    assert!(
-        second
-            .chars()
-            .all(|character| SIGN_ALPHABET.contains(character))
-    );
-    assert_ne!(
-        first, second,
-        "counter/random values must change each signature"
-    );
+    assert!(first.chars().all(|character| SIGN_ALPHABET.contains(character)));
+    assert!(second.chars().all(|character| SIGN_ALPHABET.contains(character)));
+    assert_ne!(first, second, "counter/random values must change each signature");
 }
 
 #[test]
@@ -221,54 +207,17 @@ fn join_url_rejects_unsafe_hosts_and_ids() {
         cursor_random: 0,
         wrds_random: 0,
     };
+    assert!(build_join_url(&JoinRequest { host: "evil.example", ..base }).is_err());
     assert!(
-        build_join_url(&JoinRequest {
-            host: "evil.example",
-            ..base
-        })
-        .is_err()
+        build_join_url(&JoinRequest { host: "webcast.douyin.com.evil.com", ..base }).is_err()
     );
-    assert!(
-        build_join_url(&JoinRequest {
-            host: "webcast.douyin.com.evil.com",
-            ..base
-        })
-        .is_err()
-    );
-    assert!(
-        build_join_url(&JoinRequest {
-            room_id: "room-1",
-            ..base
-        })
-        .is_err()
-    );
-    assert!(
-        build_join_url(&JoinRequest {
-            user_unique_id: "",
-            ..base
-        })
-        .is_err()
-    );
-    assert!(
-        build_join_url(&JoinRequest {
-            signature: "bad signature",
-            ..base
-        })
-        .is_err()
-    );
-    assert!(
-        build_join_url(&JoinRequest {
-            signature: "",
-            ..base
-        })
-        .is_err()
-    );
+    assert!(build_join_url(&JoinRequest { room_id: "room-1", ..base }).is_err());
+    assert!(build_join_url(&JoinRequest { user_unique_id: "", ..base }).is_err());
+    assert!(build_join_url(&JoinRequest { signature: "bad signature", ..base }).is_err());
+    assert!(build_join_url(&JoinRequest { signature: "", ..base }).is_err());
     assert_eq!(WEBCAST_HOSTS.len(), 3);
     for host in WEBCAST_HOSTS {
-        assert!(
-            build_join_url(&JoinRequest { host, ..base }).is_ok(),
-            "{host}"
-        );
+        assert!(build_join_url(&JoinRequest { host, ..base }).is_ok(), "{host}");
     }
 }
 
@@ -281,9 +230,7 @@ fn heartbeat_and_ack_packets_match_the_legacy_wire_layout() {
     assert_eq!(heartbeat_packet(), vec![0x3A, 0x02, 0x68, 0x62]);
     assert_eq!(
         ack_packet(0x1234, "x"),
-        vec![
-            0x10, 0xB4, 0x24, 0x3A, 0x03, 0x61, 0x63, 0x6B, 0x42, 0x01, 0x78
-        ]
+        vec![0x10, 0xB4, 0x24, 0x3A, 0x03, 0x61, 0x63, 0x6B, 0x42, 0x01, 0x78]
     );
     let ack = ack_packet(77, "ext|value");
     let parsed = parse_push_frame(&ack).unwrap();
@@ -368,10 +315,7 @@ fn ack_internal_ext_and_log_id_are_exposed_for_the_ack_packet() {
     let frame = encode_push_frame(987_654_321, "msg", &[], &gzip(&body));
     let inspection = inspect_frame(&frame).unwrap();
     assert_eq!(inspection.log_id, 987_654_321);
-    assert_eq!(
-        inspection.internal_ext.as_deref(),
-        Some("internal_src:dim|seq:1")
-    );
+    assert_eq!(inspection.internal_ext.as_deref(), Some("internal_src:dim|seq:1"));
     assert_eq!(inspection.events.len(), 1);
     let ack = ack_packet(
         inspection.log_id,
@@ -436,15 +380,15 @@ fn decode_skips_unknown_fields_and_non_whitelisted_methods() {
     body.extend(proto_bytes(11, b"ignored"));
     assert!(decode(&push_frame(&body, "msg")).unwrap().is_empty());
 
-    // Douyin has no super-chat equivalent in the legacy reference; gift and
-    // entry messages are deliberately not forwarded until the shared
-    // DanmakuEvent contract grows a gift variant.
+    // Douyin has no super-chat equivalent in the legacy reference, and the
+    // remaining unported rich types (social follow/share, room sequence, emoji
+    // chat) are still dropped by the method whitelist.
     let mut messages = Vec::new();
     for method in [
-        "WebcastGiftMessage",
         "WebcastSuperChatMessage",
-        "WebcastMemberMessage",
-        "WebcastLikeMessage",
+        "WebcastSocialMessage",
+        "WebcastRoomUserSeqMessage",
+        "WebcastEmojiChatMessage",
     ] {
         messages.push(message(method, &proto_varint(1, 42)));
     }
@@ -475,6 +419,176 @@ fn chat_message_tolerates_extra_nested_user_fields() {
         &events[0],
         DanmakuEvent::Message(message) if message.text == "Hi with extras" && message.user == "Synthetic"
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Rich live events: gift / member-enter / like (synthetic protobuf bytes)
+// ---------------------------------------------------------------------------
+//
+// The bytes below are hand-built from the field numbers pinned in the
+// danmaku_douyin.rs module header (two MIT-licensed public Douyin webcast
+// definitions, verified but not live-tested). If a field number ever drifts,
+// these fixtures fail here instead of only on the real platform.
+
+/// `Common.msg_id` (field 2), the shared id used for overlay de-duplication.
+fn common_msg_id(msg_id: u64) -> Vec<u8> {
+    proto_varint(2, msg_id)
+}
+
+/// `User { uint64 id = 1; string nickname = 3; ... }`
+fn user_payload(id: u64, nickname: &str) -> Vec<u8> {
+    let mut user = proto_varint(1, id);
+    user.extend(proto_bytes(3, nickname.as_bytes()));
+    user
+}
+
+/// `GiftMessage` with a nested `GiftStruct.name` (field 16).
+fn gift_payload(msg_id: u64, nickname: &str, gift: &str, repeat: u64, combo: u64) -> Vec<u8> {
+    let mut gift_struct = proto_bytes(16, gift.as_bytes());
+    gift_struct.extend(proto_varint(12, 9)); // GiftStruct.diamond_count (not read)
+    let mut payload = proto_bytes(1, &common_msg_id(msg_id));
+    payload.extend(proto_varint(2, 4242)); // gift_id
+    payload.extend(proto_varint(5, repeat)); // repeat_count
+    payload.extend(proto_varint(6, combo)); // combo_count
+    payload.extend(proto_bytes(7, &user_payload(7, nickname))); // user
+    payload.extend(proto_varint(9, 1)); // repeat_end
+    payload.extend(proto_bytes(15, &gift_struct)); // gift
+    payload
+}
+
+/// `MemberMessage`.
+fn member_payload(msg_id: u64, nickname: &str) -> Vec<u8> {
+    let mut payload = proto_bytes(1, &common_msg_id(msg_id));
+    payload.extend(proto_bytes(2, &user_payload(11, nickname))); // user
+    payload.extend(proto_varint(3, 88)); // member_count (not read)
+    payload.extend(proto_varint(10, 1)); // action (deliberately not interpreted)
+    payload
+}
+
+/// `LikeMessage`.
+fn like_payload(count: u64, total: u64) -> Vec<u8> {
+    let mut payload = proto_bytes(1, &common_msg_id(9));
+    payload.extend(proto_varint(2, count)); // count
+    payload.extend(proto_varint(3, total)); // total
+    payload.extend(proto_bytes(5, &user_payload(5, "Synthetic"))); // user
+    payload
+}
+
+#[test]
+fn decode_gift_member_like_live_events_from_verified_field_numbers() {
+    let events = decode(&push_frame(
+        &gzip(&response(
+            &[
+                message(
+                    "WebcastGiftMessage",
+                    &gift_payload(77, "合成观众", "合成礼物", 3, 7),
+                ),
+                message("WebcastMemberMessage", &member_payload(78, "合成新观众")),
+                message("WebcastLikeMessage", &like_payload(2, 4321)),
+                message("WebcastChatMessage", &chat_payload("kept", "Synthetic")),
+            ],
+            None,
+        )),
+        "msg",
+    ))
+    .unwrap();
+    assert_eq!(events.len(), 4, "gift, enter, like and chat all decode");
+    assert!(
+        matches!(&events[0], DanmakuEvent::Live(event)
+            if event.kind == LiveEventKind::Gift
+                && event.user == "合成观众"
+                && event.text == "合成礼物"
+                && event.count == 3
+                && event.id == "77"),
+        "gift: {:?}",
+        events[0]
+    );
+    assert!(
+        matches!(&events[1], DanmakuEvent::Live(event)
+            if event.kind == LiveEventKind::Enter
+                && event.user == "合成新观众"
+                && event.text == "进入直播间"
+                && event.count == 1
+                && event.id == "78"),
+        "enter: {:?}",
+        events[1]
+    );
+    assert!(
+        matches!(&events[2], DanmakuEvent::Live(event)
+            if event.kind == LiveEventKind::Status
+                && event.user.is_empty()
+                && event.text == "点赞 4321"
+                && event.id.is_empty()),
+        "like: {:?}",
+        events[2]
+    );
+    assert!(matches!(&events[3], DanmakuEvent::Message(message) if message.text == "kept"));
+}
+
+#[test]
+fn gift_count_prefers_repeat_count_and_falls_back_to_combo_count() {
+    let events = decode(&push_frame(
+        &response(
+            &[
+                message("WebcastGiftMessage", &gift_payload(1, "u", "g", 4, 9)),
+                message("WebcastGiftMessage", &gift_payload(2, "u", "g", 0, 9)),
+                message("WebcastGiftMessage", &gift_payload(3, "u", "g", 0, 0)),
+            ],
+            None,
+        ),
+        "msg",
+    ))
+    .unwrap();
+    let counts: Vec<u32> = events
+        .iter()
+        .filter_map(|event| match event {
+            DanmakuEvent::Live(event) if event.kind == LiveEventKind::Gift => Some(event.count),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(counts, vec![4, 9, 1], "repeat_count wins, combo_count backs it up, never 0");
+}
+
+#[test]
+fn malformed_or_incomplete_rich_payloads_are_skipped_without_dropping_chat() {
+    // A length-delimited field whose declared length runs past the payload end:
+    // the gift parser fails, but the failure is contained per message.
+    let mut truncated_gift = vec![0x0A, 0x7F]; // Common (field 1), len 127
+    truncated_gift.extend(proto_bytes(15, b"x"));
+    let events = decode(&push_frame(
+        &response(
+            &[
+                // No user and no gift name: no row is invented.
+                message("WebcastGiftMessage", &proto_varint(1, 42)),
+                message("WebcastGiftMessage", &truncated_gift),
+                // No user nickname: the member row is dropped.
+                message("WebcastMemberMessage", &proto_varint(1, 1)),
+                // count = total = 0: no empty "点赞 0" row.
+                message("WebcastLikeMessage", &proto_varint(2, 0)),
+                message("WebcastChatMessage", &chat_payload("kept", "Synthetic")),
+            ],
+            None,
+        ),
+        "msg",
+    ))
+    .unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], DanmakuEvent::Message(message) if message.text == "kept"));
+}
+
+#[test]
+fn rich_live_events_are_bounded_by_the_single_frame_event_budget() {
+    let mut messages = Vec::new();
+    for index in 0..=MAX_EVENTS_PER_FRAME {
+        messages.push(message(
+            "WebcastGiftMessage",
+            &gift_payload(index as u64 + 1, "u", "g", 1, 1),
+        ));
+    }
+    assert!(
+        decode(&push_frame(&response(&messages, None), "msg")).is_err(),
+        "per-frame live-event count must stay bounded"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -602,23 +716,13 @@ fn room_response_classification_separates_login_risk_and_transport() {
     assert_eq!(classify_room_response(429, None, ""), Some(RiskControl));
     // Observed 2026-10-29: a non-browser User-Agent got HTTP 200,
     // application/json and a 0-byte body instead of the room page.
+    assert_eq!(classify_room_response(200, Some("application/json"), ""), Some(RiskControl));
     assert_eq!(
-        classify_room_response(200, Some("application/json"), ""),
-        Some(RiskControl)
-    );
-    assert_eq!(
-        classify_room_response(
-            200,
-            Some("application/json; charset=utf-8"),
-            "{\"status_code\":0}"
-        ),
+        classify_room_response(200, Some("application/json; charset=utf-8"), "{\"status_code\":0}"),
         Some(RiskControl)
     );
     // A normal page or a server-side error is not risk control.
-    assert_eq!(
-        classify_room_response(200, Some("text/html"), "<html>room</html>"),
-        None
-    );
+    assert_eq!(classify_room_response(200, Some("text/html"), "<html>room</html>"), None);
     assert_eq!(classify_room_response(500, None, ""), None);
     assert!(LoginRequired.message().contains("登录"));
     assert!(LoginRequired.message().contains("auth import"));
@@ -657,12 +761,7 @@ fn room_page_classification_tells_empty_shell_rate_limit_from_format_change() {
         &format!("<script>var verifyFp='verify_'; // captcha {padding}</script>"),
     );
     assert_eq!(parse_room_page_classified(&big_shell), Err(RiskControl));
-    assert!(
-        parse_room_page("<html>captcha 验证码</html>")
-            .unwrap_err()
-            .to_string()
-            .contains("验证")
-    );
+    assert!(parse_room_page("<html>captcha 验证码</html>").unwrap_err().to_string().contains("验证"));
     // Genuinely changed/unrecognised page.
     assert_eq!(
         parse_room_page_classified("<html><body>totally new layout</body></html>"),
@@ -690,9 +789,6 @@ fn cookie_value_extracts_ttwid() {
         cookie_value("other=1; ttwid=xyz", "ttwid").as_deref(),
         Some("xyz")
     );
-    assert_eq!(
-        cookie_value("TTWID=upper", "ttwid").as_deref(),
-        Some("upper")
-    );
+    assert_eq!(cookie_value("TTWID=upper", "ttwid").as_deref(), Some("upper"));
     assert!(cookie_value("nope=1", "ttwid").is_none());
 }

@@ -30,7 +30,16 @@ impl Launcher {
         let mut tabs_x = 0.0;
         for platform in Platform::ALL {
             let pill_rect = Rect::from_min_size(host.min + vec2(tabs_x, y), vec2(tab_width, 32.0));
-            if pill(ui, pill_rect, platform.label(), self.platform == platform, pal, true).clicked() {
+            if pill(
+                ui,
+                pill_rect,
+                platform.label(),
+                self.platform == platform,
+                pal,
+                true,
+            )
+            .clicked()
+            {
                 self.platform = platform;
                 self.recent_selected = None;
             }
@@ -63,13 +72,25 @@ impl Launcher {
             .history
             .iter()
             .filter(|entry| entry.target.platform == self.platform)
-            .map(|entry| (entry.name.clone(), entry.target.clone(), history_time(entry)))
+            .map(|entry| {
+                (
+                    entry.name.clone(),
+                    entry.target.clone(),
+                    history_time(entry),
+                )
+            })
             .collect();
-        let selected = self
-            .recent_selected
-            .filter(|index| *index < rows.len());
+        let selected = self.recent_selected.filter(|index| *index < rows.len());
         let action_enabled = selected.is_some();
-        if button(ui, mpv_button, "用 mpv 打开选中房间", Btn::Secondary, pal, action_enabled).clicked()
+        if button(
+            ui,
+            mpv_button,
+            "用 mpv 打开选中房间",
+            Btn::Secondary,
+            pal,
+            action_enabled,
+        )
+        .clicked()
             && let Some(index) = selected
             && let Some((_, target, _)) = rows.get(index).cloned()
         {
@@ -110,7 +131,10 @@ impl Launcher {
             pal,
         );
         y += 24.0 + 8.0;
-        let browser = Rect::from_min_size(host.min + vec2(0.0, y), vec2(width, (height - y).max(150.0)));
+        let browser = Rect::from_min_size(
+            host.min + vec2(0.0, y),
+            vec2(width, (height - y).max(150.0)),
+        );
         self.recent_rows(ui, browser, context, pal, &rows);
         // Keyboard: arrows move the selection, Enter opens with mpv, Shift+Enter
         // with PotPlayer (the original form's AcceptButton behaviour).
@@ -145,13 +169,18 @@ impl Launcher {
                     self.fill_recent(&name.clone(), target);
                 }
             }
-            if enter && let Some(index) = self.recent_selected
+            if enter
+                && let Some(index) = self.recent_selected
                 && let Some((_, target, _)) = rows.get(index).cloned()
             {
                 let settings = self.launch_settings();
                 self.start_playback_with(
                     target,
-                    if shift { Player::PotPlayer } else { Player::Mpv },
+                    if shift {
+                        Player::PotPlayer
+                    } else {
+                        Player::Mpv
+                    },
                     settings,
                     context,
                 );
@@ -212,7 +241,11 @@ impl Launcher {
                     ui.painter(),
                     card,
                     ROW_RADIUS,
-                    if is_selected { pal.selection_soft } else { pal.card },
+                    if is_selected {
+                        pal.selection_soft
+                    } else {
+                        pal.card
+                    },
                 );
                 rounded_stroke(
                     ui.painter(),
@@ -236,14 +269,18 @@ impl Launcher {
                     open = Some((index, Player::Mpv));
                 }
                 let inner = 12.0;
-                let avatar_rect = Rect::from_min_size(card.min + vec2(inner, 10.0), Vec2::splat(36.0));
+                let avatar_rect =
+                    Rect::from_min_size(card.min + vec2(inner, 10.0), Vec2::splat(36.0));
                 let texture = self.avatar_texture(ui.ctx(), target.platform, &target.room);
                 avatar(ui.painter(), avatar_rect, texture.as_ref(), name, pal);
                 let text_left = inner + 36.0 + 10.0;
                 // Right side: two action buttons (102x29, 8px gap, 12px inset).
                 let button_right = card.right() - inner;
                 let pot = Rect::from_min_size(
-                    pos2(button_right - ACTION_W, card.top() + (row_height - ACTION_H) / 2.0),
+                    pos2(
+                        button_right - ACTION_W,
+                        card.top() + (row_height - ACTION_H) / 2.0,
+                    ),
                     vec2(ACTION_W, ACTION_H),
                 );
                 let mpv = Rect::from_min_size(
@@ -255,7 +292,10 @@ impl Launcher {
                 let state_width = 100.0_f32.min((text_width / 3.0).max(0.0));
                 text_in(
                     ui.painter(),
-                    Rect::from_min_size(card.min + vec2(text_left, 10.0), vec2(text_width - state_width - 6.0, 23.0)),
+                    Rect::from_min_size(
+                        card.min + vec2(text_left, 10.0),
+                        vec2(text_width - state_width - 6.0, 23.0),
+                    ),
                     name,
                     bold(13.0),
                     pal.text,
@@ -279,7 +319,11 @@ impl Launcher {
                 );
                 if let Some(badge) = self.badge_label(target) {
                     let live = badge.contains("播") && !badge.contains("休");
-                    let color = if live { pal.success } else { pal.text_secondary };
+                    let color = if live {
+                        pal.success
+                    } else {
+                        pal.text_secondary
+                    };
                     let label = if live { "直播中" } else { "已下播" };
                     let dot_x = state_right - state_width;
                     ui.painter().circle_filled(
@@ -328,13 +372,32 @@ impl Launcher {
         }
     }
 
-    fn paint_row_button(ui: &mut Ui, rect: Rect, text: &str, play_icon: bool, pal: &Pal, hovered: bool) {
-        rounded(ui.painter(), rect, 6.0, if hovered { pal.hover } else { pal.card });
+    fn paint_row_button(
+        ui: &mut Ui,
+        rect: Rect,
+        text: &str,
+        play_icon: bool,
+        pal: &Pal,
+        hovered: bool,
+    ) {
+        rounded(
+            ui.painter(),
+            rect,
+            6.0,
+            if hovered { pal.hover } else { pal.card },
+        );
         rounded_stroke(
             ui.painter(),
             rect,
             6.0,
-            Stroke::new(1.0, if hovered { pal.border_hover } else { pal.border }),
+            Stroke::new(
+                1.0,
+                if hovered {
+                    pal.border_hover
+                } else {
+                    pal.border
+                },
+            ),
         );
         if play_icon {
             let icon = Rect::from_center_size(
@@ -354,7 +417,14 @@ impl Launcher {
                 Align2::CENTER_CENTER,
             );
         } else {
-            text_in(ui.painter(), rect, text, font(11.0), pal.text, Align2::CENTER_CENTER);
+            text_in(
+                ui.painter(),
+                rect,
+                text,
+                font(11.0),
+                pal.text,
+                Align2::CENTER_CENTER,
+            );
         }
     }
 }

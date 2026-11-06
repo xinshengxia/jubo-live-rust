@@ -112,7 +112,14 @@ impl CookieVault {
         let mut bytes = Vec::with_capacity(MAGIC.len() + encrypted.len());
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&encrypted);
-        self.atomic_write(platform, &bytes)
+        self.atomic_write(platform, &bytes)?;
+        if platform == Platform::Douyin {
+            // New Douyin credentials invalidate the room-page cache and the
+            // proxy-first preference from the previous session, so a status/title
+            // lookup can never reuse a page parsed under the old credential.
+            crate::platforms::note_douyin_verification_success();
+        }
+        Ok(())
     }
 
     /// A convenience for the fixed HTTPS live-room origin only. Callers making
@@ -129,15 +136,29 @@ impl CookieVault {
         cookie_header(&data.cookies, &url, now_seconds()?)
     }
 
+    /// A short-lived handoff for an explicitly selected external resolver. The
+    /// cookie jar keeps every domain/path/expiry restriction; values never enter
+    /// a command line or an environment variable. The caller must reap its child
+    /// before dropping the file. The original encrypted vault is never changed.
+    pub fn temporary_cookie_file(&self, platform: Platform) -> Result<Option<TemporaryCookieFile>> {
+        let Some(data) = self.read(platform)? else { return Ok(None) };
+        TemporaryCookieFile::from_records(platform, &data.cookies, now_seconds()?)
+    }
+
     pub fn remove(&self, platform: Platform) -> Result<()> {
         reject_link(&self.root)?;
         let path = self.path(platform);
         reject_link(&path)?;
-        match fs::remove_file(path) {
+        let result = match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error).context("Cannot remove imported credentials"),
+        };
+        if platform == Platform::Douyin {
+            // A logout must not leave a verified page or proxy preference behind.
+            crate::platforms::note_douyin_verification_success();
         }
+        result
     }
 
     /// Content fingerprint of the encrypted credential file. The launcher uses it
@@ -284,6 +305,178 @@ impl CookieVault {
         }
         unreachable!("the final replacement attempt returns")
     }
+}
+
+/// Owns a private Netscape jar until the external resolver exits. Debug output
+/// deliberately exposes neither its path nor its plaintext contents.
+pub struct TemporaryCookieFile(tempfile::NamedTempFile);
+
+impl Drop for TemporaryCookieFile {
+    fn drop(&mut self) {
+        // Reap the resolver first. Truncation also removes the plaintext when a
+        // transient Windows scanner handle delays NamedTempFile's unlink.
+        let _ = self.0.as_file().set_len(0);
+        let _ = self.0.as_file().sync_all();
+    }
+}
+
+impl std::fmt::Debug for TemporaryCookieFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TemporaryCookieFile([redacted])")
+    }
+}
+
+impl TemporaryCookieFile {
+    pub fn path(&self) -> &Path { self.0.path() }
+
+    pub(crate) fn from_header(platform: Platform, header: &str) -> Result<Option<Self>> {
+        let now = now_seconds()?;
+        // Raw headers have no scope metadata. Reuse the importer's conservative
+        // host-only HTTPS binding, never widen them to the platform parent.
+        let records = parse_import(platform, header, now)?;
+        Self::from_records(platform, &records, now)
+    }
+
+    fn from_records(platform: Platform, records: &[CookieRecord], now: u64) -> Result<Option<Self>> {
+        let mut bytes = netscape_bytes(platform, records, now)?;
+        let result = (|| {
+            if bytes.is_empty() { return Ok(None) }
+            let mut file = private_cookie_tempfile()?;
+            file.write_all(&bytes).context("Cannot write temporary resolver credentials")?;
+            file.as_file().sync_all().context("Cannot flush temporary resolver credentials")?;
+            Ok(Some(Self(file)))
+        })();
+        bytes.fill(0);
+        result
+    }
+}
+
+fn netscape_bytes(platform: Platform, records: &[CookieRecord], now: u64) -> Result<Vec<u8>> {
+    let mut output = String::from("# Netscape HTTP Cookie File\n");
+    let mut count = 0;
+    for cookie in records {
+        cookie.validate(platform)?;
+        if cookie.expires_at.is_some_and(|expiry| expiry <= now) { continue }
+        count += 1;
+        let domain = format!("{}{}{}", if cookie.http_only { "#HttpOnly_" } else { "" },
+            if cookie.host_only { "" } else { "." }, cookie.domain);
+        output.push_str(&format!("{domain}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            if cookie.host_only { "FALSE" } else { "TRUE" }, cookie.path,
+            if cookie.secure { "TRUE" } else { "FALSE" }, cookie.expires_at.unwrap_or(0),
+            cookie.name, cookie.value));
+    }
+    if count == 0 { return Ok(Vec::new()) }
+    ensure!(output.len() <= MAX_IMPORT_BYTES, "Temporary resolver credentials exceed size limit");
+    Ok(output.into_bytes())
+}
+
+#[cfg(not(windows))]
+fn private_cookie_tempfile() -> Result<tempfile::NamedTempFile> {
+    // The product's credential vault itself requires DPAPI. Do not introduce a
+    // platform-dependent plaintext fallback just for an external tool.
+    bail!("External resolver credentials require Windows protected storage")
+}
+
+#[cfg(windows)]
+fn private_cookie_tempfile() -> Result<tempfile::NamedTempFile> {
+    use std::ffi::c_void;
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use std::ptr;
+    use windows_sys::Win32::Foundation::LocalFree;
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl: *const u16, revision: u32,
+            descriptor: *mut *mut c_void, size: *mut u32) -> i32;
+        fn GetSecurityDescriptorDacl(descriptor: *const c_void, present: *mut i32,
+            dacl: *mut *mut c_void, defaulted: *mut i32) -> i32;
+        fn SetSecurityInfo(handle: *mut c_void, object_type: u32, information: u32,
+            owner: *const c_void, group: *const c_void, dacl: *const c_void, sacl: *const c_void) -> u32;
+    }
+    let file = tempfile::Builder::new().prefix("live-hub-resolver-").suffix(".cookies")
+        .make(|path| fs::OpenOptions::new().read(true).write(true).create_new(true)
+            // GENERIC_READ | GENERIC_WRITE | WRITE_DAC, so the empty file can
+            // receive a protected DACL before the first plaintext byte is written.
+            .access_mode(0xc004_0000).open(path))
+        .context("Cannot prepare temporary resolver credentials")?;
+    let sddl: Vec<u16> = "D:P(A;;FA;;;OW)(A;;FA;;;SY)\0".encode_utf16().collect();
+    let mut descriptor = ptr::null_mut();
+    // The descriptor is allocated by advapi32, read only during SetSecurityInfo,
+    // then released by LocalFree. The original file handle remains owned above.
+    unsafe {
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1,
+            &mut descriptor, ptr::null_mut()) == 0 {
+            return Err(std::io::Error::last_os_error()).context("Cannot restrict resolver credential access");
+        }
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = ptr::null_mut();
+        let read_ok = GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted);
+        let result = if read_ok != 0 && present != 0 && !dacl.is_null() {
+            // SE_FILE_OBJECT; protected DACL grants access to its owner/System
+            // only, regardless of a broader inherited temporary-directory ACL.
+            SetSecurityInfo(file.as_file().as_raw_handle(), 1, 0x8000_0004,
+                ptr::null(), ptr::null(), dacl, ptr::null())
+        } else { 87 };
+        LocalFree(descriptor);
+        ensure!(result == 0, "Cannot restrict resolver credential access (Windows error {result})");
+    }
+    Ok(file)
+}
+
+/// Apply the same protected owner-and-System DACL used for temporary credential
+/// files to an application-owned directory. Browser verification/login profiles
+/// hold live session cookies, so they must not inherit a broad parent ACL.
+#[cfg(not(windows))]
+pub(crate) fn restrict_private_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn restrict_private_directory(path: &Path) -> Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use std::ptr;
+    use windows_sys::Win32::Foundation::LocalFree;
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl: *const u16, revision: u32,
+            descriptor: *mut *mut c_void, size: *mut u32) -> i32;
+        fn GetSecurityDescriptorDacl(descriptor: *const c_void, present: *mut i32,
+            dacl: *mut *mut c_void, defaulted: *mut i32) -> i32;
+        fn SetSecurityInfo(handle: *mut c_void, object_type: u32, information: u32,
+            owner: *const c_void, group: *const c_void, dacl: *const c_void, sacl: *const c_void) -> u32;
+    }
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .access_mode(READ_CONTROL | WRITE_DAC)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .context("Cannot open the application profile directory for ACL hardening")?;
+    // OICI lets files and subdirectories the browser creates inherit the same
+    // owner/System-only access, so the profile remains usable by this user while
+    // other local accounts cannot read the session cookies.
+    let sddl: Vec<u16> = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)\0".encode_utf16().collect();
+    let mut descriptor = ptr::null_mut();
+    unsafe {
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1,
+            &mut descriptor, ptr::null_mut()) == 0 {
+            return Err(std::io::Error::last_os_error()).context("Cannot build the application profile DACL");
+        }
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = ptr::null_mut();
+        let read_ok = GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted);
+        let result = if read_ok != 0 && present != 0 && !dacl.is_null() {
+            SetSecurityInfo(directory.as_raw_handle() as *mut c_void, 1, 0x8000_0004,
+                ptr::null(), ptr::null(), dacl, ptr::null())
+        } else { 87 };
+        LocalFree(descriptor);
+        ensure!(result == 0, "Cannot restrict application profile access (Windows error {result})");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -816,6 +1009,46 @@ pub(crate) fn unprotect(_bytes: &[u8], _entropy: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_resolver_export_roundtrips_cookie_scope_without_expired_records() {
+        let source = concat!(
+            "# Netscape HTTP Cookie File\n",
+            "#HttpOnly_.bilibili.com\tTRUE\t/\tTRUE\t2000\tSESSION\tSYNTHETIC_DOMAIN\n",
+            "api.live.bilibili.com\tFALSE\t/room\tTRUE\t0\tHOST\tSYNTHETIC_HOST\n",
+        );
+        let mut records = parse_import(Platform::Bili, source, 1000).unwrap();
+        let mut expired = records[0].clone();
+        expired.name = "EXPIRED".into();
+        expired.expires_at = Some(999);
+        records.push(expired);
+        let bytes = netscape_bytes(Platform::Bili, &records, 1000).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("EXPIRED"));
+        assert_eq!(parse_import(Platform::Bili, &text, 1000).unwrap(), records[..2]);
+        let mut foreign = records[0].clone();
+        foreign.domain = "douyin.com".into();
+        assert!(netscape_bytes(Platform::Bili, &[foreign], 1000).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolver_jar_is_private_temporary_and_raw_headers_do_not_gain_domain_scope() {
+        let path;
+        {
+            let file = TemporaryCookieFile::from_header(Platform::Bili, "SESSDATA=SYNTHETIC_ONLY")
+                .unwrap().unwrap();
+            path = file.path().to_path_buf();
+            let content = fs::read_to_string(&path).unwrap();
+            assert!(content.contains("live.bilibili.com\tFALSE\t/\tTRUE\t0\tSESSDATA\tSYNTHETIC_ONLY"));
+            assert!(!format!("{file:?}").contains("SYNTHETIC_ONLY"));
+            let records = parse_import(Platform::Bili, &content, now_seconds().unwrap()).unwrap();
+            assert!(cookie_header(&records,
+                &Url::parse("https://api.live.bilibili.com/room/info").unwrap(), now_seconds().unwrap())
+                .unwrap().is_none());
+        }
+        assert!(!path.exists(), "the resolver handoff must remove its plaintext file on drop");
+    }
 
     #[test]
     fn netscape_scope_preserves_host_path_secure_httponly_and_expiry() {

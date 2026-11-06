@@ -10,6 +10,7 @@ pub mod danmaku_douyin;
 pub mod danmaku_huya;
 pub mod danmaku_rules;
 pub mod diag;
+pub mod douyin_guard;
 pub mod favorites_transfer;
 pub mod flv;
 #[cfg(feature = "gui")]

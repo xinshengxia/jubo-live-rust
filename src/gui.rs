@@ -45,8 +45,8 @@ pub mod file_dialog;
 pub mod observations;
 mod sessions_page;
 pub mod theme;
-pub mod widgets;
 mod ui_shot;
+pub mod widgets;
 mod window_frame;
 mod workbench;
 /// How often saved credentials are re-confirmed while the accounts page is
@@ -216,8 +216,8 @@ pub fn run_ui_shot(data_root: PathBuf, options: UiShotOptions) -> Result<()> {
 /// lookup candidate-card layout (three lines, avatar placeholder, elision).
 fn shot_lookup_candidates() -> Vec<platforms::LookupCandidate> {
     use platforms::LookupCandidate;
-    let row = |platform, name: &str, room: &str, followers: u64, description: &str| {
-        LookupCandidate {
+    let row =
+        |platform, name: &str, room: &str, followers: u64, description: &str| LookupCandidate {
             name: name.to_owned(),
             room: room.to_owned(),
             platform,
@@ -225,8 +225,7 @@ fn shot_lookup_candidates() -> Vec<platforms::LookupCandidate> {
             description: description.to_owned(),
             account_id: (!room.is_empty()).then(|| room.to_owned()),
             ..LookupCandidate::default()
-        }
-    };
+        };
     vec![
         row(
             Platform::Bili,
@@ -242,8 +241,20 @@ fn shot_lookup_candidates() -> Vec<platforms::LookupCandidate> {
             345_678,
             "B站合成候选：超长账号名与简介同时出现时的省略号行为。",
         ),
-        row(Platform::Huya, "花小龙", "196645", 4_567_890, "虎牙合成候选。"),
-        row(Platform::Douyu, "花小龙", "93589", 987_654, "斗鱼合成候选。"),
+        row(
+            Platform::Huya,
+            "花小龙",
+            "196645",
+            4_567_890,
+            "虎牙合成候选。",
+        ),
+        row(
+            Platform::Douyu,
+            "花小龙",
+            "93589",
+            987_654,
+            "斗鱼合成候选。",
+        ),
         row(
             Platform::Douyin,
             "花小龙",
@@ -792,6 +803,18 @@ enum Event {
             std::result::Result<Vec<platforms::LookupCandidate>, String>,
         )>,
     },
+    SearchMore {
+        id: u64,
+        page: u32,
+        requested_pages: BTreeMap<Platform, u32>,
+        responses: Vec<(Platform, crate::search::PlatformSearchResult)>,
+    },
+    /// Result of resolving a pasted Douyin short share link. The candidate is
+    /// still unverified; the normal platform verification gate applies.
+    ShareResolved {
+        id: u64,
+        result: std::result::Result<platforms::LookupCandidate, String>,
+    },
     Verification {
         id: u64,
         selected: platforms::LookupCandidate,
@@ -850,6 +873,7 @@ struct Launcher {
     lookup_clues: bool,
     /// "查找主播" page: show the DeepSeek configuration panel inline.
     lookup_ai_panel: bool,
+    lookup_web_search_open: bool,
     /// Selected AI research source on the "查找主播" page.
     lookup_source: Option<usize>,
     /// Whether the players page's Rust-only advanced cards are expanded.
@@ -880,9 +904,20 @@ struct Launcher {
     store_sender: Sender<StoreAction>,
     search_input: String,
     search_generation: u64,
+    // Candidate selection replaces only verification, not an in-flight search/AI request.
+    verification_generation: u64,
     searching: bool,
     search_all: bool,
     search_caption: String,
+    search_page: u32,
+    search_next_pages: BTreeMap<Platform, u32>,
+    search_has_more: bool,
+    search_page_query: Option<(crate::search::SearchQuery, bool, Platform)>,
+    /// Pending "delete this favourite?" confirmation (default is cancel).
+    favorite_delete_confirm: Option<Favorite>,
+    /// Last removed favourite plus the time it was removed, so the page can
+    /// offer a short undo instead of relying on the user re-adding it by hand.
+    favorite_undo: Option<(Favorite, std::time::Instant)>,
     search_results: Vec<platforms::LookupCandidate>,
     verification_pending: bool,
     mpv_path: String,
@@ -926,6 +961,8 @@ struct Launcher {
     avatar_service: crate::avatars::AvatarService,
     blocked_keyword_text: String,
     blocked_user_text: String,
+    highlight_keyword_text: String,
+    pin_keyword_text: String,
     reserved_areas_text: String,
     ai_model: String,
     ai_max_tokens: u16,
@@ -994,8 +1031,7 @@ impl Launcher {
             &snapshot.settings.ui_font_key,
             snapshot.settings.ui_font_percent.into(),
         );
-        let _font_report =
-            crate::gui::theme::apply_fonts_themed(context, font_options, dark);
+        let _font_report = crate::gui::theme::apply_fonts_themed(context, font_options, dark);
         let (event_sender, events) = mpsc::channel();
         let (store_sender, store_receiver) = mpsc::channel();
         let sessions = SessionManager::new();
@@ -1015,6 +1051,7 @@ impl Launcher {
             session_selected: None,
             lookup_clues: false,
             lookup_ai_panel: false,
+            lookup_web_search_open: false,
             lookup_source: None,
             players_advanced_open: false,
             lookup_filter: None,
@@ -1044,6 +1081,8 @@ impl Launcher {
                 .blocked_keywords
                 .join("\n"),
             blocked_user_text: snapshot.settings.overlay.behavior.blocked_users.join("\n"),
+            highlight_keyword_text: snapshot.settings.overlay.behavior.highlight_keywords.join("\n"),
+            pin_keyword_text: snapshot.settings.overlay.behavior.pin_keywords.join("\n"),
             reserved_areas_text: reserved_areas_text(&snapshot.settings.overlay.reserved_areas),
             playback_draft: snapshot.settings.playback.clone(),
             mpv_args_text: snapshot.settings.playback.mpv_extra_args.join("\n"),
@@ -1102,6 +1141,7 @@ impl Launcher {
             store_sender,
             search_input: String::new(),
             search_generation: 0,
+            verification_generation: 0,
             searching: false,
             search_all: true,
             image_loader: crate::images::ImageLoader::new(),
@@ -1112,6 +1152,12 @@ impl Launcher {
             lookup_avatar_retry_at: BTreeMap::new(),
             avatar_service,
             search_caption: "输入昵称后搜索所选平台。".into(),
+            search_page: 1,
+            search_next_pages: BTreeMap::new(),
+            search_has_more: false,
+            search_page_query: None,
+            favorite_delete_confirm: None,
+            favorite_undo: None,
             search_results: Vec::new(),
             verification_pending: false,
             import_path: String::new(),
@@ -1237,15 +1283,39 @@ impl Launcher {
                     self.ai_cancel = None;
                     match result {
                         Ok(result) => {
-                            if optimize {
+                            // Re-search results now become the visible list so the
+                            // new candidates are selectable and can run the same
+                            // platform verification as native search rows. An
+                            // empty AI answer keeps the previous platform list,
+                            // matching the legacy "last candidates retained" rule.
+                            self.clear_lookup_selection();
+                            let has_candidates = !result.candidates.is_empty();
+                            if optimize || has_candidates {
                                 self.search_results = result.candidates.clone();
                             }
-                            self.set_status(
+                            self.search_has_more = false;
+                            self.search_caption = if has_candidates {
                                 format!(
-                                    "AI研究完成：{}条可追溯来源。新候选须先通过平台核验。",
-                                    result.sources.len()
-                                ),
-                                false,
+                                    "AI{} · {} 个候选，需平台核验",
+                                    if optimize { "优化" } else { "研究" },
+                                    result.candidates.len()
+                                )
+                            } else {
+                                "AI 研究未返回可核验的新候选；原平台结果已保留".to_owned()
+                            };
+                            self.set_status(
+                                if has_candidates {
+                                    format!(
+                                        "AI研究完成：{}条可追溯来源。新候选须先通过平台核验。",
+                                        result.sources.len()
+                                    )
+                                } else {
+                                    format!(
+                                        "AI研究完成：{}条可追溯来源，但未返回可核验的新候选；原平台结果已保留。",
+                                        result.sources.len()
+                                    )
+                                },
+                                !has_candidates && !optimize,
                             );
                             self.ai_result = Some(result);
                         }
@@ -1254,7 +1324,7 @@ impl Launcher {
                     }
                 }
                 Event::AiVerified { id, result } => {
-                    if id != self.search_generation {
+                    if id != self.verification_generation {
                         continue;
                     }
                     self.verification_pending = false;
@@ -1297,10 +1367,16 @@ impl Launcher {
                                 .behavior
                                 .blocked_users
                                 .join("\n")
+                        && self.highlight_keyword_text == self.snapshot.settings.overlay.behavior.highlight_keywords.join("\n")
+                        && self.pin_keyword_text == self.snapshot.settings.overlay.behavior.pin_keywords.join("\n")
                         && self.reserved_areas_text
                             == reserved_areas_text(&self.snapshot.settings.overlay.reserved_areas)
                     {
                         self.overlay_draft = snapshot.settings.overlay.clone();
+                        self.blocked_keyword_text = snapshot.settings.overlay.behavior.blocked_keywords.join("\n");
+                        self.blocked_user_text = snapshot.settings.overlay.behavior.blocked_users.join("\n");
+                        self.highlight_keyword_text = snapshot.settings.overlay.behavior.highlight_keywords.join("\n");
+                        self.pin_keyword_text = snapshot.settings.overlay.behavior.pin_keywords.join("\n");
                         self.reserved_areas_text =
                             reserved_areas_text(&snapshot.settings.overlay.reserved_areas);
                     }
@@ -1319,6 +1395,13 @@ impl Launcher {
                         self.mpv_args_text = snapshot.settings.playback.mpv_extra_args.join("\n");
                         self.potplayer_args_text =
                             snapshot.settings.playback.potplayer_extra_args.join("\n");
+                    }
+                    for platform in Platform::ALL {
+                        if self.snapshot.credentials.imported_for(platform) != snapshot.credentials.imported_for(platform) {
+                            self.invalidate_login_health(platform);
+                            self.search_cache.clear();
+                            self.cancel_search();
+                        }
                     }
                     self.snapshot = snapshot;
                     match message {
@@ -1339,6 +1422,7 @@ impl Launcher {
                     }
                     self.searching = false;
                     self.verification_pending = false;
+                    self.clear_lookup_selection();
                     match result {
                         Ok(mut candidates) => {
                             let now = health_now();
@@ -1368,6 +1452,12 @@ impl Launcher {
                                 candidates.len(),
                                 Some(now),
                             );
+                            self.search_has_more = !candidates.is_empty();
+                            self.search_next_pages = if candidates.is_empty() {
+                                BTreeMap::new()
+                            } else {
+                                BTreeMap::from([(platform, 2)])
+                            };
                             self.search_results = candidates;
                             self.set_status(
                                 if self.search_results.is_empty() {
@@ -1379,6 +1469,8 @@ impl Launcher {
                             );
                         }
                         Err(error) => {
+                            self.search_next_pages = BTreeMap::from([(platform, 1)]);
+                            self.search_has_more = true;
                             self.search_results.clear();
                             self.search_outcomes.clear();
                             self.search_cached_at = None;
@@ -1469,6 +1561,13 @@ impl Launcher {
                     } else {
                         Some(now)
                     };
+                    self.clear_lookup_selection();
+                    self.search_next_pages = outcomes.iter().filter_map(|outcome| {
+                        if !outcome.success { Some((outcome.platform, 1)) }
+                        else if outcome.candidates > 0 { Some((outcome.platform, 2)) }
+                        else { None }
+                    }).collect();
+                    self.search_has_more = !self.search_next_pages.is_empty();
                     self.search_results = results;
                     self.search_outcomes = outcomes;
                     self.search_caption = search_all_caption(&query, &self.search_outcomes, total);
@@ -1499,12 +1598,78 @@ impl Launcher {
                         false,
                     );
                 }
+                Event::SearchMore { id, page, requested_pages, responses } => {
+                    if id != self.search_generation { continue; }
+                    self.searching = false;
+                    self.clear_lookup_selection();
+                    let mut rows = Vec::new();
+                    let mut errors = 0;
+                    for (platform, result) in responses {
+                        let Some(&requested) = requested_pages.get(&platform) else { continue; };
+                        match result {
+                            Ok(mut page_rows) => {
+                                self.search_page = self.search_page.max(requested);
+                                if page_rows.is_empty() || requested >= 20 {
+                                    self.search_next_pages.remove(&platform);
+                                } else {
+                                    self.search_next_pages.insert(platform, requested + 1);
+                                }
+                                rows.append(&mut page_rows);
+                            },
+                            Err(_) => {
+                                // Retry this platform's exact failed page. A successful
+                                // peer must not advance its cursor and skip candidates.
+                                self.search_next_pages.insert(platform, requested);
+                                errors += 1;
+                            }
+                        }
+                    }
+                    let returned = rows.len();
+                    let added = crate::search::append_candidates(&mut self.search_results, rows);
+                    self.search_has_more = !self.search_next_pages.is_empty() && self.search_results.len() < 400;
+                    self.search_caption = format!("已加载至第{}页 · {}个候选", self.search_page, self.search_results.len());
+                    self.set_status(format!("第{page}页新增{added}个候选；{errors}个平台未完成。{}",
+                        if errors > 0 { "受阻平台下次重试原页。" } else if returned == 0 { "平台未返回更多结果。" } else { "新候选仍须平台核验。" }), errors > 0);
+                }
+                Event::ShareResolved { id, result } => {
+                    if id != self.search_generation {
+                        continue;
+                    }
+                    self.searching = false;
+                    match result {
+                        Ok(candidate) => {
+                            // The resolved link is one exact account/room; the
+                            // visible scope follows it so later actions (verify,
+                            // add, play) address the same platform.
+                            self.platform = candidate.platform;
+                            self.search_all = false;
+                            self.clear_lookup_selection();
+                            self.search_results = vec![candidate.clone()];
+                            self.search_outcomes.clear();
+                            self.search_cached_at = None;
+                            self.search_has_more = false;
+                            self.search_caption = format!(
+                                "抖音分享链接 · {} · 需平台核验",
+                                if candidate.room.is_empty() {
+                                    "账号，房间待解析".to_owned()
+                                } else {
+                                    format!("房间 {}", candidate.room)
+                                }
+                            );
+                            self.set_status(
+                                "分享链接已解析为抖音候选；选中完成平台核验后才能收藏。",
+                                false,
+                            );
+                        }
+                        Err(error) => self.set_status(format!("分享链接解析未完成：{error}"), true),
+                    }
+                }
                 Event::Verification {
                     id,
                     selected,
                     result,
                 } => {
-                    if id != self.search_generation {
+                    if id != self.verification_generation {
                         continue;
                     }
                     self.verification_pending = false;
@@ -1553,6 +1718,8 @@ impl Launcher {
                         },
                         LoginUpdate::Progress(message) => self.login_message = message,
                         LoginUpdate::Health(health) => {
+                            self.search_cache.clear();
+                            self.cancel_search();
                             self.login_message =
                                 format!("{}：{}", platform.label(), health.label());
                             self.health_attempts.insert(platform, health.checked_at);
@@ -1666,6 +1833,11 @@ impl Launcher {
     }
 
     fn send_store(&mut self, action: StoreAction) {
+        if let StoreAction::CredentialImport(platform, _) | StoreAction::CredentialRemove(platform) | StoreAction::ClearBrowserProfiles(platform) = &action {
+            self.invalidate_login_health(*platform);
+            self.search_cache.clear();
+            self.cancel_search();
+        }
         match self.store_sender.send(action) {
             Ok(()) => self.storage_pending += 1,
             Err(_) => self.set_status("数据工作线程已退出，请重新打开程序后重试。", true),
@@ -1761,7 +1933,35 @@ impl Launcher {
         );
     }
 
+    fn clear_lookup_selection(&mut self) {
+        self.verification_generation = self.verification_generation.wrapping_add(1);
+        self.verification_pending = false;
+        self.lookup_selected = None;
+        self.lookup_source = None;
+        self.favorite_name.clear();
+    }
+
+    fn select_lookup_candidate(&mut self, index: usize) {
+        if self.lookup_selected != Some(index) {
+            self.verification_generation = self.verification_generation.wrapping_add(1);
+            self.verification_pending = false;
+            self.lookup_source = None;
+        }
+        self.lookup_selected = Some(index);
+    }
+
+    fn selected_lookup_candidate(&self) -> Option<&platforms::LookupCandidate> {
+        self.lookup_selected.and_then(|index| self.search_results.get(index))
+            .filter(|candidate| self.lookup_filter.is_none_or(|platform| platform == candidate.platform))
+    }
+
+    fn lookup_can_add(&self) -> bool {
+        !self.searching && !self.verification_pending && self.storage_pending == 0
+            && self.selected_lookup_candidate().is_some_and(|candidate| candidate.verified_at > 0 && Target::new(candidate.platform, candidate.room.clone()).is_ok())
+    }
+
     fn cancel_search(&mut self) {
+        self.clear_lookup_selection();
         self.search_generation = self.search_generation.wrapping_add(1);
         self.searching = false;
         self.verification_pending = false;
@@ -1772,7 +1972,119 @@ impl Launcher {
         self.ai_busy = false;
     }
 
+    /// Show one directly-classified lookup input (official link/account page) as
+    /// the only candidate. It stays unverified, so the add-favourite gate and the
+    /// platform verification flow behave exactly like a native search row.
+    fn show_lookup_input_candidate(&mut self, candidate: platforms::LookupCandidate) {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        if let Some(cancel) = self.ai_cancel.take() {
+            cancel.cancel();
+        }
+        self.ai_busy = false;
+        self.ai_result = None;
+        self.searching = false;
+        self.verification_pending = false;
+        self.search_pending_cache = None;
+        self.search_results = vec![candidate.clone()];
+        self.search_outcomes.clear();
+        self.search_cached_at = None;
+        self.search_has_more = false;
+        self.search_page = 1;
+        self.search_next_pages.clear();
+        self.search_page_query = None;
+        self.platform = candidate.platform;
+        self.search_all = false;
+        self.search_caption = format!(
+            "{} · {} · 需平台核验",
+            candidate.platform.label(),
+            if candidate.room.is_empty() {
+                "账号线索，房间待解析".to_owned()
+            } else {
+                format!("房间 {}", candidate.room)
+            }
+        );
+        self.set_status(
+            if candidate.room.is_empty() {
+                "已识别官方账号页：选中候选核验直播间归属；核验前不能收藏或播放。"
+            } else {
+                "已识别官方直播间：选中候选完成平台核验后才能收藏或播放。"
+            },
+            false,
+        );
+    }
+
+    /// Resolve a pasted Douyin short share link with bounded, cookie-free
+    /// redirects; the completion event feeds one exact account/room candidate.
+    fn start_share_resolution(&mut self, url: String, context: &egui::Context) {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        if let Some(cancel) = self.ai_cancel.take() {
+            cancel.cancel();
+        }
+        self.ai_busy = false;
+        self.ai_result = None;
+        self.verification_pending = false;
+        self.search_pending_cache = None;
+        self.searching = true;
+        self.search_results.clear();
+        self.search_outcomes.clear();
+        self.search_cached_at = None;
+        self.search_has_more = false;
+        self.search_page = 1;
+        self.search_next_pages.clear();
+        self.search_page_query = None;
+        self.search_caption = "正在解析抖音分享链接…".into();
+        self.set_status(
+            "正在解析抖音分享链接（只跟随抖音官方跳转，不发送 Cookie）…",
+            false,
+        );
+        let id = self.search_generation;
+        let sender = self.event_sender.clone();
+        let context = context.clone();
+        thread::spawn(move || {
+            let result = crate::search::resolve_douyin_share(&url)
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(Event::ShareResolved { id, result });
+            context.request_repaint();
+        });
+    }
+
     fn start_search(&mut self, context: &egui::Context, refresh: bool) {
+        self.cancel_search();
+        self.search_page = 1;
+        self.search_next_pages.clear();
+        self.search_has_more = false;
+        self.search_page_query = None;
+        // Pasted official links, account pages/uids and Douyin share copy are
+        // classified before the nickname search, mirroring the legacy SearchCore
+        // direct/uid/share branches. Every candidate they produce still has to
+        // pass the platform verification gate before it can be favourited.
+        match crate::search::classify_lookup_input(
+            &self.search_input,
+            self.platform,
+            self.search_all,
+        ) {
+            Ok(Some(crate::search::LookupInput::Room(candidate)))
+            | Ok(Some(crate::search::LookupInput::Account(candidate))) => {
+                self.show_lookup_input_candidate(candidate);
+                return;
+            }
+            Ok(Some(crate::search::LookupInput::DouyinHandle(handle))) => {
+                // A Douyin handle is a platform-search keyword, not an invented
+                // room: search it on Douyin even when "全部平台" was selected.
+                self.search_all = false;
+                self.platform = Platform::Douyin;
+                self.search_input = handle;
+            }
+            Ok(Some(crate::search::LookupInput::Share(url))) => {
+                self.start_share_resolution(url, context);
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.set_status(format!("{error:#}"), true);
+                return;
+            }
+        }
         let query = crate::search::SearchQuery::new(
             &self.search_input,
             &self.search_game,
@@ -1783,31 +2095,7 @@ impl Launcher {
             self.set_status("请输入 1–200 字的主播昵称，或补充外号/曾用名。", true);
             return;
         }
-        // Explicit Douyin account clues are recognized locally (no network) and
-        // stay in the account stage: no room or play action is invented.
-        if !self.search_all && self.platform == Platform::Douyin {
-            if let Some(candidate) =
-                crate::search::douyin_account_candidate(self.search_input.trim())
-            {
-                self.search_generation = self.search_generation.wrapping_add(1);
-                if let Some(cancel) = self.ai_cancel.take() {
-                    cancel.cancel();
-                }
-                self.ai_busy = false;
-                self.ai_result = None;
-                self.searching = false;
-                self.verification_pending = false;
-                self.search_results = vec![candidate.clone()];
-                self.search_outcomes.clear();
-                self.search_cached_at = None;
-                self.search_caption = format!("抖音账号线索 · {} · 房间待解析", candidate.name);
-                self.set_status(
-                    "已识别抖音账号线索：账号阶段不能播放或收藏；请补充主页/直播分享链接或房间号后核验。",
-                    false,
-                );
-                return;
-            }
-        }
+        self.search_page_query = Some((query.clone(), self.search_all, self.platform));
         self.search_generation = self.search_generation.wrapping_add(1);
         if let Some(cancel) = self.ai_cancel.take() {
             cancel.cancel();
@@ -1832,6 +2120,14 @@ impl Launcher {
             crate::search::rank_candidates(&mut candidates, &query, self.search_all);
             let at = hit.searched_at;
             self.searching = false;
+            self.search_has_more = !candidates.is_empty();
+            self.search_next_pages = if self.search_all {
+                Platform::ALL.into_iter().map(|platform| (platform, 2)).collect()
+            } else if candidates.is_empty() {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([(platform, 2)])
+            };
             self.search_results = candidates;
             self.search_outcomes.clear();
             self.search_cached_at = Some(at);
@@ -1990,6 +2286,38 @@ impl Launcher {
         }
     }
 
+    fn search_next_page(&mut self, context: &egui::Context) {
+        if self.searching || !self.search_has_more || self.search_next_pages.is_empty() { return; }
+        let Some((query, _, _)) = self.search_page_query.clone() else { return; };
+        self.cancel_search();
+        let id = self.search_generation;
+        let requested_pages = self.search_next_pages.clone();
+        let page = requested_pages.values().copied().max().unwrap_or(1);
+        self.searching = true;
+        self.set_status(format!("正在加载第{page}页…"), false);
+        let root = self.snapshot.root.clone();
+        let sender = self.event_sender.clone();
+        let context = context.clone();
+        thread::spawn(move || {
+            let responses = match CookieVault::open(root.join("credentials")) {
+                Ok(vault) => thread::scope(|scope| {
+                    let jobs: Vec<_> = requested_pages.iter().map(|(&platform, &page)| {
+                        let vault = &vault;
+                        let query = &query;
+                        (platform, scope.spawn(move || platforms::search_authenticated_page(
+                            platform, &query.platform_terms(), vault, page
+                        ).map_err(|error| format!("{error:#}"))))
+                    }).collect();
+                    jobs.into_iter().map(|(platform, job)| (platform, job.join()
+                        .unwrap_or_else(|_| Err("平台查询工作线程异常".into())))).collect()
+                }),
+                Err(error) => requested_pages.keys().map(|&p| (p, Err(error.to_string()))).collect(),
+            };
+            let _ = sender.send(Event::SearchMore { id, page, requested_pages, responses });
+            context.request_repaint();
+        });
+    }
+
     fn start_verification(
         &mut self,
         selected: platforms::LookupCandidate,
@@ -2000,7 +2328,8 @@ impl Launcher {
         }
         self.verification_pending = true;
         self.set_status(format!("正在核验 {} 的账号与直播间…", selected.name), false);
-        let id = self.search_generation;
+        self.verification_generation = self.verification_generation.wrapping_add(1);
+        let id = self.verification_generation;
         let root = self.snapshot.root.clone();
         let sender = self.event_sender.clone();
         let context = context.clone();
@@ -2683,6 +3012,7 @@ mod tests {
         let context = egui::Context::default();
         let mut app = Launcher::from_context(&context, store);
         app.search_generation = 2;
+        app.verification_generation = 2;
         app.ai_busy = true;
         app.verification_pending = true;
         app.room_input = "456".into();
@@ -2709,6 +3039,298 @@ mod tests {
         assert_eq!(app.room_input, "456");
         assert!(app.ai_result.is_none());
     }
+
+    fn synthetic_lookups(app: &mut Launcher, candidates: Vec<platforms::LookupCandidate>) {
+        app.search_results = candidates;
+        app.search_caption = "synthetic".into();
+    }
+
+    #[test]
+    fn ai_research_candidates_become_the_visible_selectable_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("synthetic-ui")).unwrap();
+        let mut app = Launcher::from_context(&egui::Context::default(), store);
+        app.search_generation = 1;
+        app.ai_busy = true;
+        synthetic_lookups(
+            &mut app,
+            vec![platforms::LookupCandidate {
+                platform: Platform::Bili,
+                name: "旧候选".into(),
+                room: "1".into(),
+                ..Default::default()
+            }],
+        );
+        app.lookup_selected = Some(0);
+        app.favorite_name = "旧名字".into();
+        app.event_sender
+            .send(Event::Ai {
+                id: 1,
+                optimize: false,
+                result: Ok(crate::ai::ResearchResult {
+                    summary: "合成摘要".into(),
+                    candidates: vec![platforms::LookupCandidate {
+                        platform: Platform::Douyin,
+                        name: "新候选".into(),
+                        room: "123456".into(),
+                        profile_url: Some("https://live.douyin.com/123456".into()),
+                        provider: "input".into(),
+                        ..Default::default()
+                    }],
+                    sources: vec![crate::ai::ResearchSource {
+                        title: "合成来源".into(),
+                        url: "https://www.douyin.com/123456".into(),
+                    }],
+                    terms: vec!["合成线索".into()],
+                    input_tokens: 10,
+                    output_tokens: 20,
+                }),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(!app.ai_busy);
+        assert!(app.ai_result.is_some());
+        // R04: the new AI candidates must be in the list that the page renders and
+        // that clicking/verifying/adding all read from.
+        assert_eq!(app.search_results.len(), 1);
+        assert_eq!(app.search_results[0].room, "123456");
+        assert_eq!(app.search_results[0].verified_at, 0);
+        assert!(app.search_caption.contains("AI研究"), "{}", app.search_caption);
+        // R05: a replaced list must not keep the previous index/name selection.
+        assert!(app.lookup_selected.is_none());
+        assert!(app.favorite_name.is_empty());
+        assert!(!app.search_has_more);
+        // R05: the favourite gate stays closed until platform verification.
+        assert!(!app.lookup_can_add());
+    }
+
+    #[test]
+    fn an_empty_ai_re_search_keeps_the_previous_platform_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("synthetic-ui")).unwrap();
+        let mut app = Launcher::from_context(&egui::Context::default(), store);
+        app.search_generation = 1;
+        app.ai_busy = true;
+        synthetic_lookups(
+            &mut app,
+            vec![platforms::LookupCandidate {
+                platform: Platform::Bili,
+                name: "保留".into(),
+                room: "7".into(),
+                ..Default::default()
+            }],
+        );
+        app.event_sender
+            .send(Event::Ai {
+                id: 1,
+                optimize: false,
+                result: Ok(crate::ai::ResearchResult {
+                    summary: "没有候选".into(),
+                    candidates: Vec::new(),
+                    sources: vec![crate::ai::ResearchSource {
+                        title: "合成来源".into(),
+                        url: "https://www.douyin.com/7".into(),
+                    }],
+                    terms: Vec::new(),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                }),
+            })
+            .unwrap();
+        app.poll_events();
+        assert_eq!(app.search_results.len(), 1);
+        assert_eq!(app.search_results[0].room, "7");
+        assert!(app.status.contains("保留"), "{}", app.status);
+        assert!(app.status_error, "an empty AI answer is reported as a warning");
+    }
+
+
+    #[test]
+    fn a_second_page_appends_without_clearing_successful_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("synthetic-ui")).unwrap();
+        let mut app = Launcher::from_context(&egui::Context::default(), store);
+        app.search_generation = 1;
+        app.searching = true;
+        app.search_page = 1;
+        app.search_has_more = true;
+        app.lookup_selected = Some(0);
+        app.favorite_name = "旧名字".into();
+        synthetic_lookups(
+            &mut app,
+            vec![platforms::LookupCandidate {
+                platform: Platform::Huya,
+                name: "第一页".into(),
+                room: "196645".into(),
+                ..Default::default()
+            }],
+        );
+        app.event_sender
+            .send(Event::SearchMore {
+                id: 1,
+                page: 2,
+                requested_pages: BTreeMap::from([(Platform::Huya, 2), (Platform::Bili, 2)]),
+                responses: vec![
+                    (
+                        Platform::Huya,
+                        Ok(vec![
+                            platforms::LookupCandidate {
+                                platform: Platform::Huya,
+                                name: "第一页重复".into(),
+                                room: "196645".into(),
+                                ..Default::default()
+                            },
+                            platforms::LookupCandidate {
+                                platform: Platform::Huya,
+                                name: "第二页".into(),
+                                room: "290001".into(),
+                                ..Default::default()
+                            },
+                        ]),
+                    ),
+                    (Platform::Bili, Err("合成平台受阻".into())),
+                ],
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(!app.searching);
+        assert_eq!(app.search_page, 2);
+        assert_eq!(app.search_next_pages.get(&Platform::Bili), Some(&2));
+        assert_eq!(app.search_next_pages.get(&Platform::Huya), Some(&3));
+        // Successful peers stay; the duplicate row is dropped; a failed platform
+        // is reported instead of clearing the page.
+        assert_eq!(app.search_results.len(), 2);
+        assert_eq!(app.search_results[1].room, "290001");
+        assert!(app.status.contains("平台未完成"), "{}", app.status);
+        assert!(!app.lookup_selected.is_some());
+        assert!(app.favorite_name.is_empty());
+        // A fully failed page keeps the same page retryable.
+        app.event_sender
+            .send(Event::SearchMore {
+                id: 1,
+                page: 3,
+                requested_pages: BTreeMap::from([(Platform::Bili, 2)]),
+                responses: vec![(Platform::Bili, Err("合成平台受阻".into()))],
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(app.search_has_more, "an all-failed page must stay retryable");
+        assert_eq!(app.search_results.len(), 2);
+    }
+
+    #[test]
+    fn selecting_a_candidate_does_not_strand_pending_ai_or_pagination() {
+        let (mut app, _directory) = synthetic_context_launcher();
+        app.search_generation = 7;
+        app.ai_busy = true;
+        app.searching = true;
+        app.verification_pending = true;
+        let stale_verification = app.verification_generation;
+        app.select_lookup_candidate(0);
+        assert_eq!(app.search_generation, 7);
+        assert!(app.ai_busy && app.searching);
+        app.event_sender.send(Event::Verification {
+            id: stale_verification,
+            selected: Default::default(),
+            result: Err("stale verification".into()),
+        }).unwrap();
+        app.event_sender.send(Event::Ai {
+            id: 7, optimize: false, result: Err("synthetic cancelled service".into()),
+        }).unwrap();
+        app.event_sender.send(Event::SearchMore {
+            id: 7, page: 2,
+            requested_pages: BTreeMap::from([(Platform::Bili, 2)]),
+            responses: vec![(Platform::Bili, Ok(vec![platforms::LookupCandidate {
+                platform: Platform::Bili, room: "123".into(), ..Default::default()
+            }]))],
+        }).unwrap();
+        app.poll_events();
+        assert!(!app.ai_busy && !app.searching);
+        assert_eq!(app.search_results.len(), 1);
+        assert_eq!(app.search_next_pages.get(&Platform::Bili), Some(&3));
+    }
+
+    #[test]
+    fn mixed_pagination_keeps_failed_cursor_even_when_peers_are_exhausted() {
+        let (mut app, _directory) = synthetic_context_launcher();
+        app.search_generation = 9;
+        app.search_next_pages = BTreeMap::from([(Platform::Bili, 2), (Platform::Huya, 2)]);
+        app.event_sender.send(Event::SearchMore {
+            id: 9, page: 2, requested_pages: app.search_next_pages.clone(),
+            responses: vec![(Platform::Bili, Ok(Vec::new())), (Platform::Huya, Err("retry".into()))],
+        }).unwrap();
+        app.poll_events();
+        assert!(app.search_has_more);
+        assert_eq!(app.search_next_pages, BTreeMap::from([(Platform::Huya, 2)]));
+        app.event_sender.send(Event::SearchMore {
+            id: 9, page: 2, requested_pages: app.search_next_pages.clone(),
+            responses: vec![(Platform::Huya, Ok(vec![platforms::LookupCandidate {
+                platform: Platform::Huya, room: "456".into(), ..Default::default()
+            }]))],
+        }).unwrap();
+        app.poll_events();
+        assert_eq!(app.search_next_pages, BTreeMap::from([(Platform::Huya, 3)]));
+        assert_eq!(app.search_results[0].room, "456");
+    }
+
+    #[test]
+    fn a_resolved_share_link_shows_one_unverified_candidate() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("synthetic-ui")).unwrap();
+        let mut app = Launcher::from_context(&egui::Context::default(), store);
+        app.search_generation = 2;
+        app.searching = true;
+        app.event_sender
+            .send(Event::ShareResolved {
+                id: 2,
+                result: Ok(platforms::LookupCandidate {
+                    platform: Platform::Douyin,
+                    name: "分享候选".into(),
+                    room: "123456".into(),
+                    profile_url: Some("https://live.douyin.com/123456".into()),
+                    provider: "input".into(),
+                    ..Default::default()
+                }),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(!app.searching);
+        assert_eq!(app.platform, Platform::Douyin);
+        assert!(!app.search_all);
+        assert_eq!(app.search_results.len(), 1);
+        assert_eq!(app.search_results[0].verified_at, 0);
+        assert!(app.status.contains("分享链接"), "{}", app.status);
+        assert!(!app.lookup_can_add());
+    }
+
+    #[test]
+    fn favourite_add_requires_a_completed_platform_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("synthetic-ui")).unwrap();
+        let mut app = Launcher::from_context(&egui::Context::default(), store);
+        synthetic_lookups(
+            &mut app,
+            vec![platforms::LookupCandidate {
+                platform: Platform::Bili,
+                name: "合成".into(),
+                room: "123".into(),
+                profile_url: Some("https://live.bilibili.com/123".into()),
+                provider: "input".into(),
+                ..Default::default()
+            }],
+        );
+        app.lookup_selected = Some(0);
+        assert!(!app.lookup_can_add(), "an unverified candidate cannot be saved");
+        app.verification_pending = true;
+        app.search_results[0].verified_at = 1;
+        assert!(!app.lookup_can_add(), "verification must have completed");
+        app.verification_pending = false;
+        assert!(app.lookup_can_add());
+        // A stale index hidden by a platform filter is not a valid selection.
+        app.lookup_filter = Some(Platform::Douyin);
+        assert!(!app.lookup_can_add());
+    }
+
 
     #[test]
     fn an_automatic_health_result_never_overwrites_a_newer_login_flow() {
@@ -3321,14 +3943,27 @@ mod tests {
         app.search_all = false;
         app.platform = Platform::Bili;
         let query = crate::search::SearchQuery::new(&app.search_input, "", "", "");
-        app.search_cache.insert(query.cache_key("bili"), vec![platforms::LookupCandidate {
-            platform: Platform::Bili, room: "123".into(), name: "synthetic".into(), ..Default::default()
-        }], health_now());
+        app.search_cache.insert(
+            query.cache_key("bili"),
+            vec![platforms::LookupCandidate {
+                platform: Platform::Bili,
+                room: "123".into(),
+                name: "synthetic".into(),
+                ..Default::default()
+            }],
+            health_now(),
+        );
         app.verification_pending = true;
         let old_id = app.search_generation;
         app.start_search(&egui::Context::default(), false);
         assert!(!app.searching && !app.verification_pending);
-        app.event_sender.send(Event::Verification { id: old_id, selected: Default::default(), result: Err("stale".into()) }).unwrap();
+        app.event_sender
+            .send(Event::Verification {
+                id: old_id,
+                selected: Default::default(),
+                result: Err("stale".into()),
+            })
+            .unwrap();
         app.poll_events();
         assert!(!app.verification_pending);
         assert_eq!(app.search_results[0].room, "123");
@@ -3582,7 +4217,11 @@ mod tests {
         for removed in ["play", "history", "settings", "about", "search"] {
             assert_eq!(Page::from_key(removed), None, "{removed} must not page");
         }
-        assert_eq!(Page::from_key(" FAVORITES "), None, "keys are exact literals");
+        assert_eq!(
+            Page::from_key(" FAVORITES "),
+            None,
+            "keys are exact literals"
+        );
     }
 
     #[test]
@@ -3643,7 +4282,12 @@ mod tests {
         let last_clicked = std::cell::Cell::new(false);
         let last_open_inside = std::cell::Cell::new(false);
         let trace = std::cell::RefCell::new(Vec::<String>::new());
-        let mut frame = |time: f64, events: Vec<egui::Event>, selected: &mut usize, popup_id: &mut Option<egui::Id>, popup_pos: &mut Option<egui::Pos2>, changed: &mut bool| {
+        let mut frame = |time: f64,
+                         events: Vec<egui::Event>,
+                         selected: &mut usize,
+                         popup_id: &mut Option<egui::Id>,
+                         popup_pos: &mut Option<egui::Pos2>,
+                         changed: &mut bool| {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -3696,12 +4340,33 @@ mod tests {
             }]
         };
         // Frame 0: build the widget so it exists before any pointer input.
-        frame(0.0, Vec::new(), &mut selected, &mut popup_id, &mut popup_pos, &mut response_changed);
+        frame(
+            0.0,
+            Vec::new(),
+            &mut selected,
+            &mut popup_id,
+            &mut popup_pos,
+            &mut response_changed,
+        );
         let id = popup_id.expect("dropdown must register a popup id");
         assert!(!egui::Popup::is_id_open(&context, id));
         // Frames 1-2: press then release on the closed dropdown opens it.
-        frame(0.1, press(rect.center()), &mut selected, &mut popup_id, &mut popup_pos, &mut response_changed);
-        frame(0.2, release(rect.center()), &mut selected, &mut popup_id, &mut popup_pos, &mut response_changed);
+        frame(
+            0.1,
+            press(rect.center()),
+            &mut selected,
+            &mut popup_id,
+            &mut popup_pos,
+            &mut response_changed,
+        );
+        frame(
+            0.2,
+            release(rect.center()),
+            &mut selected,
+            &mut popup_id,
+            &mut popup_pos,
+            &mut response_changed,
+        );
         assert!(
             last_clicked.get(),
             "the press/release sequence must register as a click"
@@ -3713,7 +4378,14 @@ mod tests {
         );
         // Frame 3: no input at all. The popup must still be open (regression:
         // the previous implementation closed itself after one frame).
-        frame(0.3, Vec::new(), &mut selected, &mut popup_id, &mut popup_pos, &mut response_changed);
+        frame(
+            0.3,
+            Vec::new(),
+            &mut selected,
+            &mut popup_id,
+            &mut popup_pos,
+            &mut response_changed,
+        );
         assert!(
             egui::Popup::is_id_open(&context, id),
             "the popup must survive frames without input"
@@ -3726,8 +4398,22 @@ mod tests {
             rect.center().x,
             rect.bottom() + 2.0 + margin + 24.0 + 2.0 + 12.0,
         );
-        frame(0.4, press(row_center), &mut selected, &mut popup_id, &mut popup_pos, &mut response_changed);
-        frame(0.5, release(row_center), &mut selected, &mut popup_id, &mut popup_pos, &mut response_changed);
+        frame(
+            0.4,
+            press(row_center),
+            &mut selected,
+            &mut popup_id,
+            &mut popup_pos,
+            &mut response_changed,
+        );
+        frame(
+            0.5,
+            release(row_center),
+            &mut selected,
+            &mut popup_id,
+            &mut popup_pos,
+            &mut response_changed,
+        );
         assert_eq!(selected, 1, "clicking a row must select that item");
         assert!(response_changed, "the selection change must be reported");
         assert!(
@@ -3735,13 +4421,44 @@ mod tests {
             "selecting a row must close the popup"
         );
         // Frames 6-7: reopen with the button itself.
-        frame(0.6, press(rect.center()), &mut selected, &mut popup_id, &mut popup_pos, &mut response_changed);
-        frame(0.7, release(rect.center()), &mut selected, &mut popup_id, &mut popup_pos, &mut response_changed);
-        assert!(egui::Popup::is_id_open(&context, id), "second click reopens");
+        frame(
+            0.6,
+            press(rect.center()),
+            &mut selected,
+            &mut popup_id,
+            &mut popup_pos,
+            &mut response_changed,
+        );
+        frame(
+            0.7,
+            release(rect.center()),
+            &mut selected,
+            &mut popup_id,
+            &mut popup_pos,
+            &mut response_changed,
+        );
+        assert!(
+            egui::Popup::is_id_open(&context, id),
+            "second click reopens"
+        );
         // Frames 8-9: click far outside closes it without changing the value.
         let outside = egui::pos2(700.0, 550.0);
-        frame(0.8, press(outside), &mut selected, &mut popup_id, &mut popup_pos, &mut response_changed);
-        frame(0.9, release(outside), &mut selected, &mut popup_id, &mut popup_pos, &mut response_changed);
+        frame(
+            0.8,
+            press(outside),
+            &mut selected,
+            &mut popup_id,
+            &mut popup_pos,
+            &mut response_changed,
+        );
+        frame(
+            0.9,
+            release(outside),
+            &mut selected,
+            &mut popup_id,
+            &mut popup_pos,
+            &mut response_changed,
+        );
         assert!(
             !egui::Popup::is_id_open(&context, id),
             "an outside click must close the dropdown"

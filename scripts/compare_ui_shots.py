@@ -37,7 +37,7 @@ try:
 except ImportError as error:  # pragma: no cover - environment guard
     sys.exit(
         "compare_ui_shots.py needs Pillow + numpy; use a python with both "
-        "(provide an interpreter with those dependencies). Import error: %s" % error
+        "(for example D:/conda_envs/py313/python.exe). Import error: %s" % error
     )
 
 DEFAULT_PAGES = ["favorites", "recent", "lookup", "sessions", "players", "danmaku", "accounts", "data"]

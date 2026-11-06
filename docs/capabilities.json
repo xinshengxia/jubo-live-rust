@@ -149,10 +149,26 @@
     "launcher-windows11-rounded-corners",
     "huya-short-room-state-fallback",
     "favorites-home-sidebar-order-and-scroll",
-    "relay-in-response-timeline-jump-rebasing",
-    "relay-player-write-timeout-and-media-reconnect-tuning",
     "huya-default-and-supplement-emoticon-rendering",
-    "douyu-default-emoticon-rendering"
+    "douyu-default-emoticon-rendering",
+    "douyin-business-failure-route-failover",
+    "windows-system-proxy-fallback-readonly",
+    "douyin-silent-verification-refresh-and-single-retry",
+    "douyin-user-verification-window",
+    "public-cdn-media-policy-with-public-dns-check",
+    "relay-protocol-preservation-and-redirect-downgrade-rejection",
+    "relay-cross-host-media-header-policy",
+    "douyin-room-page-single-flight-and-short-reuse",
+    "douyin-quality-key-case-tolerance",
+    "douyin-rich-gift-enter-like-events",
+    "douyin-relay-verification-waiting-state",
+    "csharp-bilibili-brotli-v3-defensive-decode",
+    "douyin-real-tun-resolution-and-relay-media-verified",
+    "douyin-real-captcha-classification-verified",
+    "douyin-rich-enter-like-live-verified",
+    "verification-profile-acl-hardened",
+    "relay-resolve-cancelled-on-player-disconnect",
+    "csharp-bilibili-brotli-v3-live-frames-verified"
   ],
   "pending": [
     "full-rich-media-and-sc-style-parity",
@@ -167,9 +183,14 @@
     "real-paid-super-chat-acceptance",
     "color-emoji-sheet-distribution",
     "douyin-web-assist-fallback",
-    "color-emoji-plain-sheet-cell-alignment"
+    "color-emoji-plain-sheet-cell-alignment",
+    "douyin-real-platform-verification-acceptance",
+    "huya-dynamic-emoticon-package",
+    "douyin-silent-refresh-after-human-verification",
+    "douyin-gift-live-sample",
+    "system-proxy-mode-real-acceptance"
   ],
-  "verification": "Offline regression and release verification scopes are documented in docs/validation.md; real accounts, paid services and live-platform acceptance are not implied. 1.0.2 adds in-response FLV timeline-jump rebasing for the loopback relay (audio and video share one correction), a 15 s player write timeout and a shorter reconnect delay after a productive CDN segment; verified by offline unit and contract tests plus read-only live relay measurements. 1.0.3 adds pre-connection Huya (40 unique codes) and Douyu (250 codes) default dictionaries, exact Huya package CDN approval, mixed-text segmentation regressions, and opt-in production image-loader acceptance for all 290 mapped assets. Unknown/server-only emotes retain text.",
-  "version": "1.0.3",
-  "updated": "2026-11-02"
+  "verification": "See docs/validation.md. 0.3.1 fixes the user-reported dropdown popup, avatar resolution, traffic-dot/chevron/sidebar-glyph polish, and the overlay right-edge viewport sync bug; it wires the 11 configurable global hotkeys and window visibility policy, SC P1 (badge/compact/scale200/face_frame/message_trans), event cards, merged xN scaling, scrollbar drag, re:/uid:/name:/keyword rules, bounded panic/relay/overlay logs, URL grammars, search detail fields, UI font settings, and favorites import/export. Remaining: colour emoji PLAIN sheet cell alignment (inherited asset generation issue, next round); real desktop hotkeys/mouse drag/dropdown clicks/native dialogs, multi-monitor/DPI, real paid SC and real platform logins are user-acceptance only. 1.0.1 adds the Douyin emoji/list dictionary fetch (real anonymous response: 214 entries), VP8L WebP emote decoding through the existing bounded image path, overlay dictionary refresh on cache generation, and renders platform emotes as images in a real live Douyin room. 1.0.3 loads Huya default/supplement emotes before connecting (40 unique codes), with an exact additional asset-host allowance; unknown and unavailable images retain text. Douyu also loads 250 legacy default mappings before connecting. All 40 Huya and 250 Douyu images passed opt-in production ImageLoader download/decode acceptance on 2026-11-02.",
+  "version": "1.0.6",
+  "updated": "2026-11-07"
 }

@@ -14,14 +14,10 @@ fn diagnostic_overlay_switches_are_opt_in_and_offline() {
     use live_hub_rust::overlay;
     assert!(!overlay::diag_force_show_from(|_| None));
     for value in ["0", "", "false", "true", "yes"] {
-        assert!(
-            !overlay::diag_force_show_from(|_| Some(value.to_string())),
-            "{value}"
-        );
+        assert!(!overlay::diag_force_show_from(|_| Some(value.to_string())), "{value}");
     }
     assert!(overlay::diag_force_show_from(|_| Some("1".to_string())));
-    let plan =
-        overlay::parse_fixture(r#"{"events":[{"Status":"合成状态"}]}"#).expect("fixture parses");
+    let plan = overlay::parse_fixture(r#"{"events":[{"Status":"合成状态"}]}"#).expect("fixture parses");
     assert_eq!(plan.events.len(), 1);
     assert!(matches!(plan.events[0], DanmakuEvent::Status(_)));
     assert!(overlay::parse_fixture("not json").is_err());
@@ -37,28 +33,17 @@ fn overlay_window_acceptance_harness() {
     let script = std::env::var_os("LIVE_HUB_ACCEPTANCE_OVERLAY_SCRIPT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("scripts").join("Acceptance-Overlay.ps1"));
-    assert!(
-        script.is_file(),
-        "overlay acceptance script missing: {}",
-        script.display()
-    );
+    assert!(script.is_file(), "overlay acceptance script missing: {}", script.display());
     let evidence = std::env::var_os("LIVE_HUB_ACCEPTANCE_OVERLAY_EVIDENCE")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     let mut command = Command::new("powershell.exe");
-    command
-        .args(["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File"])
+    command.args(["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(&script)
-        .arg("-EvidenceDir")
-        .arg(&evidence);
+        .arg("-EvidenceDir").arg(&evidence);
     if let Some(executable) = std::env::var_os("LIVE_HUB_ACCEPTANCE_OVERLAY_EXE") {
         command.arg("-Exe").arg(executable);
     }
-    let status = command
-        .status()
-        .expect("start the overlay acceptance harness");
-    assert!(
-        status.success(),
-        "overlay acceptance harness failed: {status}"
-    );
+    let status = command.status().expect("start the overlay acceptance harness");
+    assert!(status.success(), "overlay acceptance harness failed: {status}");
 }

@@ -12,10 +12,9 @@
 //! * pinning wins over highlighting, and blocking wins over both.
 //!
 //! The module is pure: the overlay compiles the lists once after a settings
-//! change and calls verdict() per message. Regex support is a deliberate
-//! bounded subset of the .NET syntax (literals, ., *, +, ?, ^, $, character
-//! classes and escapes); groups/alternation/backreferences are treated as
-//! literal text and documented as unsupported.
+//! change and calls verdict() per message. Regex uses a bounded linear-time
+//! engine: classes, Unicode, groups, alternatives and repetitions are supported;
+//! backreferences/look-around are rejected rather than silently mis-matched.
 
 use crate::danmaku::DanmakuMessage;
 
@@ -27,8 +26,6 @@ pub const MAX_RULES: usize = 200;
 pub const MAX_REGEX_CHARS: usize = 256;
 /// Maximum matched text length (chars) fed into the regex engine.
 pub const MAX_REGEX_TEXT_CHARS: usize = 4096;
-/// Hard backtracking step budget per is_match() call.
-pub const MAX_REGEX_STEPS: u32 = 200_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleErrorKind {
@@ -50,8 +47,8 @@ impl std::fmt::Display for RuleError {
         let reason = match self.kind {
             RuleErrorKind::Empty => "规则为空",
             RuleErrorKind::TooLong => "规则过长",
-            RuleErrorKind::InvalidUid => "uid: 后应为数字",
-            RuleErrorKind::UnsupportedRegex => "正则语法不受支持（仅支持 . * + ? ^ $ [] 与转义）",
+            RuleErrorKind::InvalidUid => "uid: 后应为正整数（从 1 开始）",
+            RuleErrorKind::UnsupportedRegex => "正则语法不受支持（不支持回溯引用或前后查找）",
             RuleErrorKind::InvalidRegex => "正则语法错误",
         };
         write!(formatter, "{reason}：{}", self.rule)
@@ -60,242 +57,49 @@ impl std::fmt::Display for RuleError {
 
 impl std::error::Error for RuleError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Quantifier {
-    One,
-    Optional,
-    Any,
-    OneOrMore,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum AtomKind {
-    Literal(char),
-    AnyChar,
-    Class { negated: bool, ranges: Vec<(char, char)> },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Atom {
-    kind: AtomKind,
-    quantifier: Quantifier,
-}
-
-impl Atom {
-    fn matches(&self, ch: char) -> bool {
-        match &self.kind {
-            AtomKind::Literal(literal) => *literal == ch,
-            AtomKind::AnyChar => true,
-            AtomKind::Class { negated, ranges } => {
-                let inside = ranges.iter().any(|(start, end)| ch >= *start && ch <= *end);
-                inside != *negated
-            }
-        }
-    }
-}
-
-/// Bounded regular expression used for re: rules.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Case-insensitive regular expressions with a linear-time engine and explicit
+/// allocation/length budgets. Unsupported look-around/backreferences are
+/// rejected rather than silently interpreted as literal characters.
+#[derive(Debug, Clone)]
 pub struct SimpleRegex {
-    atoms: Vec<Atom>,
-    anchored_start: bool,
-    anchored_end: bool,
+    pattern: String,
+    regex: regex::Regex,
+}
+impl PartialEq for SimpleRegex {
+    fn eq(&self, other: &Self) -> bool { self.pattern == other.pattern }
+}
+impl Eq for SimpleRegex {}
+impl SimpleRegex {
+    pub fn compile(pattern: &str) -> Result<Self, RuleErrorKind> {
+        if pattern.is_empty() { return Err(RuleErrorKind::Empty); }
+        if pattern.chars().count() > MAX_REGEX_CHARS { return Err(RuleErrorKind::TooLong); }
+        let regex = regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .size_limit(1 << 20)
+            .dfa_size_limit(1 << 20)
+            .build()
+            .map_err(|error| regex_error_kind(&error))?;
+        Ok(Self { pattern: pattern.to_owned(), regex })
+    }
+    pub fn is_match(&self, text: &str) -> bool {
+        let end = text.char_indices().nth(MAX_REGEX_TEXT_CHARS).map(|(n, _)| n).unwrap_or(text.len());
+        self.regex.is_match(&text[..end])
+    }
 }
 
-impl SimpleRegex {
-    /// Compiles the supported subset. Unsupported constructs are rejected so a
-    /// settings page can show a precise error instead of silently mis-matching.
-    pub fn compile(pattern: &str) -> Result<Self, RuleErrorKind> {
-        if pattern.is_empty() {
-            return Err(RuleErrorKind::Empty);
+/// Classifies a regex build failure. The bounded engine is linear-time, so the
+/// only constructs it cannot express are the backtracking-only .NET features
+/// (look-around and backreferences, which the engine reports explicitly); those
+/// surface as "unsupported" instead of being mistaken for a typo. Anything else
+/// is a genuine syntax error.
+fn regex_error_kind(error: &regex::Error) -> RuleErrorKind {
+    match error {
+        regex::Error::Syntax(message)
+            if message.contains("look-around") || message.contains("backreference") =>
+        {
+            RuleErrorKind::UnsupportedRegex
         }
-        if pattern.chars().count() > MAX_REGEX_CHARS {
-            return Err(RuleErrorKind::TooLong);
-        }
-        let chars: Vec<char> = pattern.to_lowercase().chars().collect();
-        let mut atoms = Vec::new();
-        let mut index = 0;
-        let mut anchored_start = false;
-        let mut anchored_end = false;
-        while index < chars.len() {
-            let ch = chars[index];
-            if ch == '^' && index == 0 {
-                anchored_start = true;
-                index += 1;
-                continue;
-            }
-            if ch == '$' && index + 1 == chars.len() {
-                anchored_end = true;
-                index += 1;
-                continue;
-            }
-            let kind = match ch {
-                '.' => {
-                    index += 1;
-                    AtomKind::AnyChar
-                }
-                '\\' => {
-                    let Some(next) = chars.get(index + 1).copied() else {
-                        return Err(RuleErrorKind::InvalidRegex);
-                    };
-                    if matches!(next, '(' | ')' | '|' | '{' | '}' | '[' | ']') {
-                        return Err(RuleErrorKind::UnsupportedRegex);
-                    }
-                    index += 2;
-                    AtomKind::Literal(next)
-                }
-                '[' => {
-                    index += 1;
-                    let mut negated = false;
-                    if chars.get(index) == Some(&'^') {
-                        negated = true;
-                        index += 1;
-                    }
-                    let mut ranges = Vec::new();
-                    let mut closed = false;
-                    while index < chars.len() {
-                        let current = chars[index];
-                        if current == ']' {
-                            closed = true;
-                            index += 1;
-                            break;
-                        }
-                        let start = if current == '\\' {
-                            let Some(next) = chars.get(index + 1).copied() else {
-                                return Err(RuleErrorKind::InvalidRegex);
-                            };
-                            index += 2;
-                            next
-                        } else {
-                            index += 1;
-                            current
-                        };
-                        if chars.get(index) == Some(&'-')
-                            && chars.get(index + 1).is_some()
-                            && chars.get(index + 1) != Some(&']')
-                        {
-                            let Some(end) = chars.get(index + 1).copied() else {
-                                return Err(RuleErrorKind::InvalidRegex);
-                            };
-                            if end < start {
-                                return Err(RuleErrorKind::InvalidRegex);
-                            }
-                            ranges.push((start, end));
-                            index += 2;
-                        } else {
-                            ranges.push((start, start));
-                        }
-                    }
-                    if !closed || ranges.is_empty() {
-                        return Err(RuleErrorKind::InvalidRegex);
-                    }
-                    AtomKind::Class { negated, ranges }
-                }
-                '(' | ')' | '|' | '{' | '}' | '*' | '+' | '?' => {
-                    return Err(RuleErrorKind::UnsupportedRegex);
-                }
-                other => {
-                    index += 1;
-                    AtomKind::Literal(other)
-                }
-            };
-            let quantifier = match chars.get(index) {
-                Some('?') => {
-                    index += 1;
-                    Quantifier::Optional
-                }
-                Some('*') => {
-                    index += 1;
-                    Quantifier::Any
-                }
-                Some('+') => {
-                    index += 1;
-                    Quantifier::OneOrMore
-                }
-                _ => Quantifier::One,
-            };
-            atoms.push(Atom { kind, quantifier });
-        }
-        if atoms.is_empty() {
-            return Err(RuleErrorKind::InvalidRegex);
-        }
-        Ok(Self {
-            atoms,
-            anchored_start,
-            anchored_end,
-        })
-    }
-
-    /// Case-insensitive match against the (length-capped) message text.
-    pub fn is_match(&self, text: &str) -> bool {
-        let lowered: String = text.chars().take(MAX_REGEX_TEXT_CHARS).flat_map(char::to_lowercase).collect();
-        let chars: Vec<char> = lowered.chars().collect();
-        let mut budget = MAX_REGEX_STEPS;
-        if self.anchored_start {
-            return self.match_from(&chars, 0, 0, &mut budget);
-        }
-        for start in 0..=chars.len() {
-            if self.match_from(&chars, start, 0, &mut budget) {
-                return true;
-            }
-            if budget == 0 {
-                return false;
-            }
-        }
-        false
-    }
-
-    fn match_from(&self, text: &[char], position: usize, atom_index: usize, budget: &mut u32) -> bool {
-        if *budget == 0 {
-            return false;
-        }
-        *budget -= 1;
-        if atom_index == self.atoms.len() {
-            return !self.anchored_end || position == text.len();
-        }
-        let atom = &self.atoms[atom_index];
-        match atom.quantifier {
-            Quantifier::One => {
-                if position < text.len() && atom.matches(text[position]) {
-                    self.match_from(text, position + 1, atom_index + 1, budget)
-                } else {
-                    false
-                }
-            }
-            Quantifier::Optional => {
-                self.match_from(text, position, atom_index + 1, budget)
-                    || (position < text.len()
-                        && atom.matches(text[position])
-                        && self.match_from(text, position + 1, atom_index + 1, budget))
-            }
-            Quantifier::Any => {
-                let mut cursor = position;
-                loop {
-                    if self.match_from(text, cursor, atom_index + 1, budget) {
-                        return true;
-                    }
-                    if *budget == 0 || cursor >= text.len() || !atom.matches(text[cursor]) {
-                        return false;
-                    }
-                    cursor += 1;
-                }
-            }
-            Quantifier::OneOrMore => {
-                if position >= text.len() || !atom.matches(text[position]) {
-                    return false;
-                }
-                let mut cursor = position + 1;
-                loop {
-                    if self.match_from(text, cursor, atom_index + 1, budget) {
-                        return true;
-                    }
-                    if *budget == 0 || cursor >= text.len() || !atom.matches(text[cursor]) {
-                        return false;
-                    }
-                    cursor += 1;
-                }
-            }
-        }
+        _ => RuleErrorKind::InvalidRegex,
     }
 }
 
@@ -311,6 +115,8 @@ pub enum Matcher {
     UserId(u64),
     /// re: bounded regex on the message text.
     Regex(SimpleRegex),
+    /// re: regex evaluated against the user name, not message content.
+    UserRegex(SimpleRegex),
 }
 
 impl Matcher {
@@ -318,9 +124,10 @@ impl Matcher {
         match self {
             Self::TextContains(needle) => contains_ignore_case(&message.text, needle),
             Self::NameContains(needle) => contains_ignore_case(&message.user, needle),
-            Self::NameExact(name) => message.user == *name,
+            Self::NameExact(name) => message.user.to_lowercase() == name.to_lowercase(),
             Self::UserId(id) => message.user_id == *id,
             Self::Regex(regex) => regex.is_match(&message.text),
+            Self::UserRegex(regex) => regex.is_match(&message.user),
         }
     }
 }
@@ -358,14 +165,25 @@ pub fn parse_rule(rule: &str, user_prefixes: bool) -> Result<Matcher, RuleError>
             rule: trimmed.to_owned(),
             kind,
         })?;
-        return Ok(Matcher::Regex(regex));
+        return Ok(if user_prefixes { Matcher::UserRegex(regex) } else { Matcher::Regex(regex) });
     }
     if user_prefixes {
         if let Some(rest) = lower.strip_prefix("uid:") {
-            let uid = rest.trim().parse::<u64>().map_err(|_| RuleError {
+            // The legacy parser used NumberStyles.None: ASCII digits only, no
+            // sign and no surrounding text. uid 0 is not a real user, so it must
+            // not block anonymous messages either.
+            let digits = rest.trim();
+            let valid = !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+            let uid = digits.parse::<u64>().map_err(|_| RuleError {
                 rule: trimmed.to_owned(),
                 kind: RuleErrorKind::InvalidUid,
             })?;
+            if !valid || uid == 0 {
+                return Err(RuleError {
+                    rule: trimmed.to_owned(),
+                    kind: RuleErrorKind::InvalidUid,
+                });
+            }
             return Ok(Matcher::UserId(uid));
         }
         if let Some(rest) = trimmed.get(5..).filter(|_| lower.starts_with("name:")) {
@@ -379,7 +197,7 @@ pub fn parse_rule(rule: &str, user_prefixes: bool) -> Result<Matcher, RuleError>
             return Ok(Matcher::NameExact(name.to_owned()));
         }
     }
-    Ok(Matcher::TextContains(trimmed.to_owned()))
+    Ok(if user_prefixes { Matcher::NameContains(trimmed.to_owned()) } else { Matcher::TextContains(trimmed.to_owned()) })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -396,13 +214,11 @@ pub struct CompiledRules {
 pub fn compile(blocked: &[String], highlight: &[String], pin: &[String]) -> CompiledRules {
     let mut compiled = CompiledRules::default();
     for rule in blocked.iter().take(MAX_RULES) {
-        match parse_rule(rule, true) {
-            Ok(matcher) => match matcher {
-                Matcher::UserId(_) | Matcher::NameExact(_) | Matcher::NameContains(_) => {
-                    compiled.blocked_users.push(matcher)
-                }
-                other => compiled.blocked_keywords.push(other),
-            },
+        let explicit_user = rule.trim().to_ascii_lowercase().starts_with("uid:")
+            || rule.trim().to_ascii_lowercase().starts_with("name:");
+        match parse_rule(rule, explicit_user) {
+            Ok(matcher) if explicit_user => compiled.blocked_users.push(matcher),
+            Ok(matcher) => compiled.blocked_keywords.push(matcher),
             Err(error) => compiled.errors.push(error),
         }
     }
@@ -421,6 +237,18 @@ pub fn compile(blocked: &[String], highlight: &[String], pin: &[String]) -> Comp
     compiled
 }
 
+/// Compile separately scoped lists; ordinary user rules match names, not text.
+pub fn compile_with_users(blocked: &[String], users: &[String], highlight: &[String], pin: &[String]) -> CompiledRules {
+    let mut compiled = compile(blocked, highlight, pin);
+    for rule in users.iter().take(MAX_RULES) {
+        match parse_rule(rule, true) {
+            Ok(matcher) => compiled.blocked_users.push(matcher),
+            Err(error) => compiled.errors.push(error),
+        }
+    }
+    compiled
+}
+
 /// Per-message rule verdict. Blocking wins over pinning, pinning over highlight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuleVerdict {
@@ -431,7 +259,9 @@ pub struct RuleVerdict {
 
 impl CompiledRules {
     pub fn is_blocked(&self, message: &DanmakuMessage) -> bool {
-        self.blocked_users.iter().any(|matcher| matcher.matches(message))
+        self.blocked_users
+            .iter()
+            .any(|matcher| matcher.matches(message))
             || self
                 .blocked_keywords
                 .iter()
@@ -439,7 +269,9 @@ impl CompiledRules {
     }
 
     pub fn is_highlighted(&self, message: &DanmakuMessage) -> bool {
-        self.highlighted.iter().any(|matcher| matcher.matches(message))
+        self.highlighted
+            .iter()
+            .any(|matcher| matcher.matches(message))
     }
 
     pub fn is_pinned(&self, message: &DanmakuMessage) -> bool {
@@ -466,7 +298,7 @@ impl CompiledRules {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::danmaku::{DanmakuMode, DanmakuMessage};
+    use crate::danmaku::{DanmakuMessage, DanmakuMode};
 
     fn message(text: &str, user: &str, user_id: u64) -> DanmakuMessage {
         DanmakuMessage {
@@ -518,18 +350,14 @@ mod tests {
 
     #[test]
     fn unsupported_regex_constructs_are_reported_and_skipped() {
-        let rules = compile(&["re:(a|b)".into(), "re:[abc".into()], &[], &[]);
+        let rules = compile(&["re:(?=a)".into(), "re:[abc".into()], &[], &[]);
         assert_eq!(rules.errors.len(), 2);
         assert!(rules.blocked_keywords.is_empty());
     }
 
     #[test]
     fn highlight_and_pin_lists_work_and_blocking_wins() {
-        let rules = compile(
-            &["屏蔽".into()],
-            &["666".into()],
-            &["置顶".into()],
-        );
+        let rules = compile(&["屏蔽".into()], &["666".into()], &["置顶".into()]);
         let verdict = rules.verdict(&message("666 置顶 屏蔽", "u", 1));
         assert!(verdict.blocked);
         assert!(!verdict.pinned && !verdict.highlighted);
@@ -546,4 +374,60 @@ mod tests {
         let text = "a".repeat(MAX_REGEX_TEXT_CHARS);
         assert!(!regex.is_match(&text));
     }
+    #[test]
+    fn user_lists_and_common_regex_syntax_keep_their_scope() {
+        let rules = compile_with_users(&[], &["uid:42".into(), "name:Alice".into(), "re:^Bob\\d+$".into(), "观众".into()], &[], &[]);
+        assert!(rules.is_blocked(&message("hello", "x", 42)));
+        assert!(rules.is_blocked(&message("hello", "alice", 1)));
+        assert!(rules.is_blocked(&message("hello", "Bob123", 1)));
+        assert!(rules.is_blocked(&message("hello", "老观众", 1)));
+        assert!(!rules.is_blocked(&message("Bob123 老观众", "normal", 1)));
+        let digits = SimpleRegex::compile(r"^\d+$").unwrap();
+        assert!(digits.is_match("123"));
+        assert!(!digits.is_match("ddd"));
+        assert!(SimpleRegex::compile(r"^(foo|bar){1,2}\s+\w+$").unwrap().is_match("FOO x"));
+    }
+
+    #[test]
+    fn regex_build_failures_are_classified_for_the_settings_page() {
+        // Backtracking-only .NET constructs are reported as unsupported, typos
+        // as invalid syntax: the settings page must not save either silently.
+        assert_eq!(
+            SimpleRegex::compile("(?=a)").unwrap_err(),
+            RuleErrorKind::UnsupportedRegex
+        );
+        assert_eq!(
+            SimpleRegex::compile(r"(a)\1").unwrap_err(),
+            RuleErrorKind::UnsupportedRegex
+        );
+        assert_eq!(
+            SimpleRegex::compile("[abc").unwrap_err(),
+            RuleErrorKind::InvalidRegex
+        );
+    }
+
+    #[test]
+    fn user_regex_matches_the_user_name_not_the_message_text() {
+        let rules = compile_with_users(&[], &["re:^Bob\\d+$".into()], &[], &[]);
+        // The message text matches the pattern but the user does not.
+        assert!(!rules.is_blocked(&message("Bob123", "alice", 1)));
+        assert!(rules.is_blocked(&message("hello", "bob7", 1)));
+    }
+
+    #[test]
+    fn uid_zero_and_malformed_uid_are_rejected() {
+        let rules = compile_with_users(&[], &["uid:0".into(), "uid:abc".into()], &[], &[]);
+        assert_eq!(rules.errors.len(), 2);
+        assert!(rules.blocked_users.is_empty());
+        assert_eq!(rules.errors[0].kind, RuleErrorKind::InvalidUid);
+    }
+
+    #[test]
+    fn re_prefix_is_case_insensitive_like_the_legacy_client() {
+        let rules = compile(&["RE:^\\d+$".into()], &[], &[]);
+        assert!(rules.errors.is_empty());
+        assert!(rules.is_blocked(&message("123", "u", 1)));
+        assert!(!rules.is_blocked(&message("x123", "u", 1)));
+    }
+
 }

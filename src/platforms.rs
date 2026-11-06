@@ -17,10 +17,14 @@ use serde_json::Value;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashSet},
+    hash::{Hash, Hasher},
     io::Read,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     process::{Command, Stdio},
-    sync::{Arc, mpsc},
+    sync::{
+        Arc, Mutex, mpsc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -39,11 +43,20 @@ const DOUYIN_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Apple
 /// host-only, path, expiry and Secure attributes from the owning vault.
 pub trait CookieSource: Send + Sync {
     fn header_for_url(&self, platform: Platform, url: &str) -> Result<Option<String>>;
+    /// External tools need the original cookie scopes, not a global Cookie
+    /// header. A source without that metadata must fail rather than silently
+    /// downgrade an authenticated resolve to an anonymous external request.
+    fn temporary_cookie_file(&self, _platform: Platform) -> Result<Option<crate::auth::TemporaryCookieFile>> {
+        bail!("此凭据来源不支持保留作用域的外部解析，请使用原生取流或重新登录")
+    }
 }
 
 impl CookieSource for CookieVault {
     fn header_for_url(&self, platform: Platform, url: &str) -> Result<Option<String>> {
         CookieVault::header_for_url(self, platform, url)
+    }
+    fn temporary_cookie_file(&self, platform: Platform) -> Result<Option<crate::auth::TemporaryCookieFile>> {
+        CookieVault::temporary_cookie_file(self, platform)
     }
 }
 
@@ -101,7 +114,17 @@ pub fn search_authenticated(
     keyword: &str,
     vault: &CookieVault,
 ) -> Result<Vec<LookupCandidate>> {
-    with_authenticated_session(platform, vault, || search(platform, keyword))
+    search_authenticated_page(platform, keyword, vault, 1)
+}
+
+/// Explicit one-based pagination. Each page remains scoped to the owning vault.
+pub fn search_authenticated_page(
+    platform: Platform,
+    keyword: &str,
+    vault: &CookieVault,
+    page: u32,
+) -> Result<Vec<LookupCandidate>> {
+    with_authenticated_session(platform, vault, || search_page_with_cookie(platform, keyword, None, page))
 }
 
 pub fn verify_authenticated(
@@ -133,7 +156,7 @@ pub struct LookupSource {
     pub supports: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LookupCandidate {
     pub name: String,
     pub room: String,
@@ -266,12 +289,18 @@ pub fn retrieval_timestamp() -> String {
 /// values the platform clearly returned, never a guessed state.
 pub fn candidate_live_status(platform: Platform, row: &Value) -> Option<String> {
     let number = |keys: &[&str]| -> Option<i64> {
-        keys.iter()
-            .find_map(|key| row[*key].as_i64().or_else(|| row[*key].as_str()?.parse().ok()))
+        keys.iter().find_map(|key| {
+            row[*key]
+                .as_i64()
+                .or_else(|| row[*key].as_str()?.parse().ok())
+        })
     };
     let text = |keys: &[&str]| -> Option<String> {
-        keys.iter()
-            .find_map(|key| row[*key].as_str().map(|value| value.trim().to_ascii_lowercase()))
+        keys.iter().find_map(|key| {
+            row[*key]
+                .as_str()
+                .map(|value| value.trim().to_ascii_lowercase())
+        })
     };
     let status = match platform {
         Platform::Bili => match number(&["live_status"]) {
@@ -419,6 +448,15 @@ pub enum AdapterError {
     Transport,
 }
 
+/// True when the error is the typed "the platform wants a human verification"
+/// result. Only that case may trigger the one-shot Douyin recovery.
+pub fn is_verification_required(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<AdapterError>(),
+        Some(AdapterError::VerificationRequired)
+    )
+}
+
 /// Platform-specific replay wording. Bilibili calls it 轮播, Douyu 录播 and the
 /// other platforms 重播; the message never claims the room went offline.
 pub fn replay_unavailable_message(platform: Platform, reason: &str) -> String {
@@ -510,73 +548,271 @@ fn suffix(host: &str, domain: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
-/// Validate a resolved media address, without contacting it or exposing its query.
-/// CDN families are explicit; unexpected new CDN domains need review.
-pub fn validate_media_url(address: &str) -> Result<Url> {
-    let mut url = Url::parse(address).context("媒体地址格式无效")?;
-    if url.scheme() == "http" {
-        url.set_scheme("https")
-            .map_err(|_| anyhow!("媒体地址协议无效"))?;
+/// One concrete media-URL policy rejection. The relay turns this into redacted
+/// diagnostics (rule id and host only), so the next log can name the exact host
+/// family that needs review without ever storing the signed query string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MediaUrlRejection {
+    pub rule: &'static str,
+    pub message: String,
+    pub host: Option<String>,
+}
+
+impl MediaUrlRejection {
+    fn new(rule: &'static str, message: impl Into<String>, host: Option<String>) -> Self {
+        Self {
+            rule,
+            message: message.into(),
+            host: safe_media_host(host),
+        }
     }
-    ensure!(
-        url.scheme() == "https" && url.username().is_empty() && url.password().is_none(),
-        "仅允许不含账号的 HTTPS 媒体地址"
-    );
-    // 平台 CDN（例如斗鱼 rtmp_url）会给出带非 443 端口的 https 地址；
-    // 主机名仍受下面的 CDN 白名单约束，因此允许显式端口但不允许 0/privileged 之外的任意值。
-    ensure!(url.port().is_none_or(|port| port != 0), "媒体地址端口无效");
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow!("媒体地址缺少主机名"))?;
-    let allowed = [
-        "bilivideo.com",
-        "bilivideo.cn",
-        "biliapi.net",
-        // Bilibili live CDN 302 target observed 2026-10-31:
-        // https://<hash>.v.smtcdns.net/d1--cn-gotcha04.bilivideo.com/...
-        // The path still identifies the bilivideo object; Tencent's smtcdns
-        // family is the only extra redirect family needed for Bili live.
-        "smtcdns.net",
-        "huya.com",
-        "huyacdn.com",
-        "douyucdn.cn",
-        "douyucdn.com",
-        "douyucdn2.cn",
-        "douyucdn3.cn",
-        "douyucdn4.cn",
-        "douyucdn6.cn",
-        "dycdn.cn",
-        // Observed Douyu CDN family in addition to douyucdn (2026-10-29, anonymous resolve).
-        "edgesrv.com",
-        "douyu.com",
-        // Observed Douyin live FLV CDN families (2026-10-29, anonymous resolve):
-        // pull-flv-*.douyincdn.com and pull-flv-*.douyinliving.com (both answer
-        // video/x-flv over HTTPS, so the http→https upgrade stays valid).
-        "douyin.com",
-        "douyincdn.com",
-        "douyinliving.com",
-        "douyinvod.com",
-        "bytefcdnrd.com",
-        "bytefcdn.com",
-        // Douyin live 302 dispatch (observed 2026-10-31 for room 796794251979):
-        // https://rt2016n.jomodns.com/pull-flv-q13.douyincdn.com/...; the path
-        // still identifies the original douyincdn object. ByteDance's jomodns
-        // CDN family is the only extra redirect family needed here.
-        "jomodns.com",
-        "tcdnlive.com",
-        "alicdn.com",
-        "amemv.com",
-        "snssdk.com",
-        "pstatp.com",
-        "bdcdn.net",
-    ];
-    ensure!(
-        allowed.iter().any(|domain| suffix(host, domain)),
-        format!("平台返回了尚未允许的媒体主机：{host}")
-    );
-    ensure!(url.fragment().is_none(), "媒体地址不允许包含片段");
+}
+
+/// Keep only a DNS-ish host label so userinfo, path or a signed query cannot
+/// leak through a rejection record or a log line.
+fn safe_media_host(host: Option<String>) -> Option<String> {
+    host.filter(|host| {
+        !host.is_empty()
+            && host.len() <= 253
+            && host.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':' | b'[' | b']')
+            })
+    })
+    .map(|host| host.to_ascii_lowercase())
+}
+
+/// Pure syntax and literal-address policy for one media target: no DNS and no
+/// network side effects. The relay calls this for the initial address and for
+/// every redirect hop, because it pins and re-checks public DNS answers itself
+/// before each connection.
+pub(crate) fn validate_media_address_syntax(address: &str) -> Result<Url, MediaUrlRejection> {
+    let url = Url::parse(address)
+        .map_err(|_| MediaUrlRejection::new("invalid-media-url", "媒体地址格式无效", None))?;
+    let parsed_host = url.host_str().map(safe_media_host_name);
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(MediaUrlRejection::new(
+            "media-scheme",
+            "媒体地址协议无效",
+            parsed_host,
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(MediaUrlRejection::new(
+            "media-credentials",
+            "仅允许不含账号的 HTTP(S) 媒体地址",
+            parsed_host,
+        ));
+    }
+    if url.port().is_some_and(|port| port == 0) {
+        return Err(MediaUrlRejection::new(
+            "media-port",
+            "媒体地址端口无效",
+            parsed_host,
+        ));
+    }
+    let Some(host) = parsed_host else {
+        return Err(MediaUrlRejection::new(
+            "media-host-missing",
+            "媒体地址缺少主机名",
+            None,
+        ));
+    };
+    if url.fragment().is_some() {
+        return Err(MediaUrlRejection::new(
+            "media-fragment",
+            "媒体地址不允许包含片段",
+            Some(host),
+        ));
+    }
+    match url.host() {
+        Some(url::Host::Ipv4(address)) => {
+            let address = IpAddr::V4(address);
+            if !(is_public(address) || is_proxy_fake_ip(address)) {
+                return Err(MediaUrlRejection::new(
+                    "media-host-literal-private",
+                    format!("媒体地址指向非公网地址：{host}"),
+                    Some(host),
+                ));
+            }
+        }
+        Some(url::Host::Ipv6(address)) => {
+            let address = IpAddr::V6(address);
+            if !(is_public(address) || is_proxy_fake_ip(address)) {
+                return Err(MediaUrlRejection::new(
+                    "media-host-literal-private",
+                    format!("媒体地址指向非公网地址：{host}"),
+                    Some(host),
+                ));
+            }
+        }
+        Some(url::Host::Domain(_)) => {
+            if media_host_is_reserved(&host) {
+                return Err(MediaUrlRejection::new(
+                    "media-host-local",
+                    format!("媒体地址不能指向本机名称：{host}"),
+                    Some(host),
+                ));
+            }
+        }
+        None => {
+            return Err(MediaUrlRejection::new(
+                "media-host-missing",
+                "媒体地址缺少主机名",
+                None,
+            ));
+        }
+    }
     Ok(url)
 }
+
+/// Lower-case DNS-label form used for family matching and for redacted records.
+fn safe_media_host_name(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// True when the host belongs to one of the documented CDN families. The list is
+/// a fast path, not the acceptance boundary: platform CDNs rotate hostnames and
+/// a fixed family list is exactly what made some rooms fail while the legacy
+/// launcher could still play them.
+pub(crate) fn media_host_is_known_family(host: &str) -> bool {
+    let host = safe_media_host_name(host);
+    !host.is_empty() && MEDIA_HOST_FAMILIES.iter().any(|domain| suffix(&host, domain))
+}
+
+fn media_host_is_reserved(host: &str) -> bool {
+    let host = safe_media_host_name(host);
+    host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local")
+}
+
+/// Bounded system lookup for the initial-address public-answer check.
+fn system_media_dns(host: &str) -> Option<Vec<IpAddr>> {
+    let name = host.to_owned();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = (name.as_str(), 0u16)
+            .to_socket_addrs()
+            .map(|answers| answers.map(|answer| answer.ip()).collect::<Vec<IpAddr>>());
+        let _ = sender.send(result);
+    });
+    receiver.recv_timeout(Duration::from_secs(4)).ok()?.ok()
+}
+
+/// Full initial-address policy: syntax plus a public-answer check for hosts that
+/// are not one of the documented CDN families. The resolver is injected so
+/// offline tests and diagnostics decide the answer without touching the network.
+///
+/// An unresolvable host is left to the normal connection error instead of being
+/// turned into a policy rejection (the legacy launcher made the same choice); the
+/// relay still pins and re-validates public answers for every hop before
+/// connecting, so this cannot be used to reach an internal address.
+pub(crate) fn validate_media_url_detailed_with(
+    address: &str,
+    resolve: &dyn Fn(&str) -> Option<Vec<IpAddr>>,
+) -> Result<Url, MediaUrlRejection> {
+    let url = validate_media_address_syntax(address)?;
+    let Some(host) = url.host_str() else {
+        return Ok(url);
+    };
+    let host_lc = safe_media_host_name(host);
+    if matches!(
+        url.host(),
+        Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_))
+    ) || media_host_is_known_family(&host_lc)
+    {
+        return Ok(url);
+    }
+    match resolve(&host_lc) {
+        Some(addresses) if !addresses.is_empty() => {
+            if addresses
+                .iter()
+                .any(|address| !(is_public(*address) || is_proxy_fake_ip(*address)))
+            {
+                return Err(MediaUrlRejection::new(
+                    "media-host-not-public",
+                    format!("媒体主机解析到非公网地址：{host_lc}"),
+                    Some(host_lc),
+                ));
+            }
+            Ok(url)
+        }
+        _ => Ok(url),
+    }
+}
+
+pub(crate) fn validate_media_url_detailed(address: &str) -> Result<Url, MediaUrlRejection> {
+    validate_media_url_detailed_with(address, &system_media_dns)
+}
+
+pub fn validate_media_url(address: &str) -> Result<Url> {
+    validate_media_url_detailed(address).map_err(|rejection| anyhow::Error::msg(rejection.message))
+}
+
+/// Offline/diagnostic entry point with an injected DNS answer set. Production
+/// callers use validate_media_url, which resolves through the system.
+pub fn validate_media_url_with_resolver(
+    address: &str,
+    resolver: &dyn Fn(&str) -> Option<Vec<IpAddr>>,
+) -> Result<Url> {
+    validate_media_url_detailed_with(address, resolver)
+        .map_err(|rejection| anyhow::Error::msg(rejection.message))
+}
+
+/// Documented media CDN families. This is the fast path used to skip a DNS
+/// round-trip for the hostnames the platforms are known to hand out; it is no
+/// longer a rejection boundary. A new public CDN is accepted through the
+/// public-answer check and, for the relay, through its pinned per-hop DNS.
+const MEDIA_HOST_FAMILIES: &[&str] = &[
+    // Bilibili live FLV, including the smtcdns 302 dispatch, plus the
+    // acgvideo/hdslb families that appear on upgraded live-play URLs.
+    "bilivideo.com",
+    "bilivideo.cn",
+    "bilivideo.net",
+    "biliapi.net",
+    "smtcdns.net",
+    "acgvideo.com",
+    "hdslb.com",
+    // Huya: every line is al/tx/hw/hs.flv.huya.com; huyacdn also covers the
+    // VOD-style hostnames the live page occasionally redirects through.
+    "huya.com",
+    "huyacdn.com",
+    // Douyu CDN families seen across resolutions and redirects.
+    "douyucdn.cn",
+    "douyucdn.com",
+    "douyucdn2.cn",
+    "douyucdn3.cn",
+    "douyucdn4.cn",
+    "douyucdn6.cn",
+    "dycdn.cn",
+    "edgesrv.com",
+    "douyu.com",
+    // Douyin / ByteDance live FLV families (2026-10-29 anonymous resolve and the
+    // 2026-10-31 302 dispatch): pull-flv-*.douyincdn.com,
+    // pull-flv-*.douyinliving.com, rt2016n.jomodns.com and the bytefcdn family.
+    // douyinvod/douyinpic/byteimg and the volc/zj/ixigua families are added for
+    // the media-side redirect chains the audit could not identify from the old
+    // log; they stay explicit families rather than opening redirects to any host.
+    "douyin.com",
+    "douyincdn.com",
+    "douyinliving.com",
+    "douyinvod.com",
+    "douyinpic.com",
+    "douyinstatic.com",
+    "bytefcdnrd.com",
+    "bytefcdn.com",
+    "byteimg.com",
+    "jomodns.com",
+    "tcdnlive.com",
+    "zjcdn.com",
+    "volccdn.com",
+    "volcvideo.com",
+    "ixigua.com",
+    "huoshan.com",
+    "alicdn.com",
+    "amemv.com",
+    "snssdk.com",
+    "pstatp.com",
+    "bdcdn.net",
+];
 
 fn is_public(address: IpAddr) -> bool {
     match address {
@@ -625,32 +861,43 @@ fn is_proxy_fake_ip(address: IpAddr) -> bool {
     }
 }
 
-pub(crate) fn endpoint_client(url: &Url) -> Result<Client> {
+/// Platform page/API hosts. Every request helper revalidates against this list,
+/// including each redirect hop of a room page.
+const ENDPOINT_HOSTS: &[&str] = &[
+    "api.bilibili.com",
+    "api.live.bilibili.com",
+    "www.bilibili.com",
+    "passport.bilibili.com",
+    "www.huya.com",
+    "mp.huya.com",
+    "l.huya.com",
+    "search.cdn.huya.com",
+    "www.douyu.com",
+    "passport.douyu.com",
+    "live.douyin.com",
+    "www.douyin.com",
+    "www.iesdouyin.com",
+    "webcast.amemv.com",
+];
+
+/// Validate one platform endpoint URL and return its host for address pinning.
+fn endpoint_host(url: &Url) -> Result<&str> {
     let host = url.host_str().ok_or_else(|| anyhow!("平台接口缺少主机"))?;
-    let allowed = [
-        "api.bilibili.com",
-        "api.live.bilibili.com",
-        "www.bilibili.com",
-        "passport.bilibili.com",
-        "www.huya.com",
-        "mp.huya.com",
-        "l.huya.com",
-        "search.cdn.huya.com",
-        "www.douyu.com",
-        "passport.douyu.com",
-        "live.douyin.com",
-        "www.douyin.com",
-        "www.iesdouyin.com",
-        "webcast.amemv.com",
-    ];
     ensure!(
         url.scheme() == "https"
-            && allowed.contains(&host)
+            && ENDPOINT_HOSTS.contains(&host)
             && url.port().is_none_or(|port| port == 443)
             && url.username().is_empty()
             && url.password().is_none(),
         "平台接口地址未通过校验"
     );
+    Ok(host)
+}
+
+/// Pinned-address client: resolve once, check every answer, then dial exactly
+/// those addresses. no_proxy keeps requests off HTTP proxy environment settings.
+pub(crate) fn endpoint_client(url: &Url) -> Result<Client> {
+    let host = endpoint_host(url)?;
     // Pin the same public addresses that were checked; do not validate one DNS answer
     // and let the HTTP client silently resolve a different one.
     let owned_host = host.to_owned();
@@ -678,6 +925,24 @@ pub(crate) fn endpoint_client(url: &Url) -> Result<Client> {
         .timeout(Duration::from_secs(12))
         .redirect(reqwest::redirect::Policy::none())
         .resolve_to_addrs(host, &addresses)
+        .build()
+        .map_err(|_| AdapterError::Transport.into())
+}
+
+/// System-resolver client for the bounded fallback path of a platform room page.
+/// The host still has to pass the fixed endpoint allowlist, so letting the system
+/// resolver produce addresses (including an IPv6 or TUN-mapped answer) does not
+/// widen the request surface; it only mirrors the legacy launcher's
+/// "IPv4 literal, then hostname" retry when the pinned path cannot connect.
+fn endpoint_client_unpinned(url: &Url) -> Result<Client> {
+    let _host = endpoint_host(url)?;
+    Client::builder()
+        .no_proxy()
+        .user_agent(USER_AGENT)
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| AdapterError::Transport.into())
 }
@@ -736,6 +1001,1009 @@ fn cookie_for_request(url: &Url, diagnostic_cookie: Option<&str>) -> Result<Opti
         }
         None => Ok(checked_cookie(diagnostic_cookie)?.map(str::to_owned)),
     }
+}
+
+/// Douyin room-page rate-control budget, aligned with the legacy launcher.
+/// Douyin answers bursts of room-page requests with an empty RSC "shell" page
+/// (roomStore present, roomInfo.room missing) instead of a network error, so
+/// every room-page request is gated, one shell page is retried once, and
+/// repeated shells put the client into a cooldown instead of hammering the
+/// risk-control window. Relay reconnects and background status checks share it.
+const DOUYIN_PAGE_MAX_IN_FLIGHT: usize = 2;
+const DOUYIN_PAGE_SPACING_MS: u64 = 250;
+const DOUYIN_PAGE_SHELL_RETRY_MS: u64 = 800;
+const DOUYIN_COOLDOWN_BASE_MS: u64 = 6_000;
+const DOUYIN_COOLDOWN_MAX_MS: u64 = 18_000;
+const DOUYIN_PAGE_GATE_WAIT_MS: u64 = 4_000;
+const DOUYIN_PAGE_GATE_POLL_MS: u64 = 50;
+const DOUYIN_PAGE_MAX_REDIRECTS: usize = 5;
+/// One room-page request budget. The page is ~1.1 MiB; 8 s matches the legacy
+/// launcher, while the outer deadline bounds the whole redirect chain.
+const DOUYIN_PAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+const DOUYIN_PAGE_DEADLINE: Duration = Duration::from_secs(24);
+
+#[derive(Default)]
+struct DouyinPageGate {
+    in_flight: usize,
+    last_start_ms: u64,
+    cooldown_until_ms: u64,
+    shell_streak: u32,
+}
+
+static DOUYIN_PAGE_GATE: Mutex<DouyinPageGate> = Mutex::new(DouyinPageGate {
+    in_flight: 0,
+    last_start_ms: 0,
+    cooldown_until_ms: 0,
+    shell_streak: 0,
+});
+
+/// Releases the gate slot on every path, including an adapter panic.
+struct DouyinPageSlot;
+impl DouyinPageSlot {
+    fn acquire() -> Result<Self> {
+        let started = Instant::now();
+        loop {
+            {
+                let mut gate = DOUYIN_PAGE_GATE
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let now = epoch_millis();
+                if gate.in_flight < DOUYIN_PAGE_MAX_IN_FLIGHT
+                    && now.saturating_sub(gate.last_start_ms) >= DOUYIN_PAGE_SPACING_MS
+                {
+                    gate.in_flight += 1;
+                    gate.last_start_ms = now;
+                    return Ok(Self);
+                }
+            }
+            if started.elapsed() >= Duration::from_millis(DOUYIN_PAGE_GATE_WAIT_MS) {
+                crate::diag::log(
+                    "platforms",
+                    crate::diag::Level::Warn,
+                    "douyin room-page gate wait budget exhausted before sending the request",
+                );
+                return Err(AdapterError::RateLimited.into());
+            }
+            thread::sleep(Duration::from_millis(DOUYIN_PAGE_GATE_POLL_MS));
+        }
+    }
+}
+impl Drop for DouyinPageSlot {
+    fn drop(&mut self) {
+        let mut gate = DOUYIN_PAGE_GATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        gate.in_flight = gate.in_flight.saturating_sub(1);
+    }
+}
+
+fn douyin_cooldown_remaining_ms() -> Option<u64> {
+    let gate = DOUYIN_PAGE_GATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let now = epoch_millis();
+    (now < gate.cooldown_until_ms).then(|| gate.cooldown_until_ms - now)
+}
+
+fn douyin_note_page_ok() {
+    let mut gate = DOUYIN_PAGE_GATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    gate.shell_streak = 0;
+    gate.cooldown_until_ms = 0;
+}
+
+fn douyin_note_shell_page() {
+    let cooldown_ms = {
+        let mut gate = DOUYIN_PAGE_GATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        gate.shell_streak = gate.shell_streak.saturating_add(1).min(3);
+        let cooldown_ms =
+            (DOUYIN_COOLDOWN_BASE_MS * u64::from(gate.shell_streak)).min(DOUYIN_COOLDOWN_MAX_MS);
+        gate.cooldown_until_ms = epoch_millis().saturating_add(cooldown_ms);
+        cooldown_ms
+    };
+    crate::diag::log(
+        "platforms",
+        crate::diag::Level::Warn,
+        &format!(
+            "douyin room page returned only empty roomStore shells; cooling down {cooldown_ms} ms before the next room-page request"
+        ),
+    );
+}
+
+/// A fresh `__ac_nonce` alongside the saved cookie for the live-room origin.
+/// The legacy launcher sends it on every room-page request; a warm logged-in
+/// session still needs it, and it is a per-request nonce rather than a credential.
+fn douyin_page_cookie(url: &Url, diagnostic_cookie: Option<&str>) -> Result<Option<String>> {
+    let base = cookie_for_request(url, diagnostic_cookie)?;
+    if url.host_str() != Some("live.douyin.com") {
+        return Ok(base);
+    }
+    let uuid = uuid::Uuid::new_v4().simple().to_string();
+    let nonce = format!("__ac_nonce={}", &uuid[..21]);
+    Ok(Some(match base {
+        Some(saved) => {
+            // The generic helper may already have added a nonce when the scoped
+            // vault had no cookie for this page; replace it so only one is sent.
+            let saved = saved.trim_start();
+            let saved = saved
+                .strip_prefix("__ac_nonce=")
+                .and_then(|rest| rest.split_once(';').map(|(_, tail)| tail.trim_start()))
+                .unwrap_or(saved);
+            if saved.is_empty() {
+                nonce
+            } else {
+                format!("{nonce}; {saved}")
+            }
+        }
+        None => nonce,
+    }))
+}
+
+/// One physical route for a Douyin room-page request. The order mirrors the
+/// legacy launcher: direct pinned IPv4 answers first, then the system resolver,
+/// then the Windows system proxy when the direct routes are rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DouyinPagePath {
+    PinnedIpv4,
+    Hostname,
+    SystemProxy,
+}
+
+impl DouyinPagePath {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PinnedIpv4 => "ipv4",
+            Self::Hostname => "hostname",
+            Self::SystemProxy => "system-proxy",
+        }
+    }
+}
+
+/// The requested route is not available in this environment (for example the
+/// user runs TUN mode without a configured system proxy). Not a network failure.
+#[derive(Debug)]
+struct DouyinPathUnavailable;
+impl std::fmt::Display for DouyinPathUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("该连接路径在此环境不可用")
+    }
+}
+impl std::error::Error for DouyinPathUnavailable {}
+
+/// Read-only view of the Windows Internet Settings proxy. Clash Verge has two
+/// common modes: the system-proxy mode writes these values, the TUN mode does
+/// not (traffic is captured at the network layer and the direct/pinned routes
+/// already see the fake-IP answers). Reading them never changes user settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowsSystemProxy {
+    pub server: String,
+    pub bypass: Vec<String>,
+}
+
+const SYSTEM_PROXY_CACHE_MS: u64 = 30_000;
+static SYSTEM_PROXY_CACHE: Mutex<Option<(u64, Option<WindowsSystemProxy>)>> = Mutex::new(None);
+
+fn cached_windows_system_proxy() -> Option<WindowsSystemProxy> {
+    let now = epoch_millis();
+    {
+        let cache = SYSTEM_PROXY_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((at, value)) = cache.as_ref()
+            && now.saturating_sub(*at) < SYSTEM_PROXY_CACHE_MS
+        {
+            return value.clone();
+        }
+    }
+    let value = read_windows_system_proxy();
+    let mut cache = SYSTEM_PROXY_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *cache = Some((now, value.clone()));
+    value
+}
+
+#[cfg(not(windows))]
+fn read_windows_system_proxy() -> Option<WindowsSystemProxy> {
+    None
+}
+
+#[cfg(windows)]
+const INTERNET_SETTINGS_SUBKEY: &str =
+    "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+
+#[cfg(windows)]
+fn read_registry_dword(subkey: &[u16], name: &str) -> Option<u32> {
+    let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let mut value_type = 0u32;
+    let status = unsafe {
+        windows_sys::Win32::System::Registry::RegGetValueW(
+            windows_sys::Win32::System::Registry::HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            name.as_ptr(),
+            windows_sys::Win32::System::Registry::RRF_RT_REG_DWORD,
+            &mut value_type,
+            (&mut value as *mut u32).cast(),
+            &mut size,
+        )
+    };
+    (status == 0 && size == 4).then_some(value)
+}
+
+#[cfg(windows)]
+fn read_registry_string(subkey: &[u16], name: &str) -> Option<String> {
+    let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    for capacity in [512usize, 4096usize] {
+        let mut buffer = vec![0u16; capacity];
+        let mut size = (capacity * 2) as u32;
+        let mut value_type = 0u32;
+        let status = unsafe {
+            windows_sys::Win32::System::Registry::RegGetValueW(
+                windows_sys::Win32::System::Registry::HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                name.as_ptr(),
+                windows_sys::Win32::System::Registry::RRF_RT_REG_SZ,
+                &mut value_type,
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        if status == 0 {
+            let len = buffer
+                .iter()
+                .position(|value| *value == 0)
+                .unwrap_or(buffer.len());
+            return Some(String::from_utf16_lossy(&buffer[..len]));
+        }
+        // ERROR_MORE_DATA: the value grew between the two calls; retry larger.
+        if status != 234 {
+            return None;
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn read_windows_system_proxy() -> Option<WindowsSystemProxy> {
+    let subkey: Vec<u16> = INTERNET_SETTINGS_SUBKEY
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    if read_registry_dword(&subkey, "ProxyEnable")? == 0 {
+        return None;
+    }
+    let server = read_registry_string(&subkey, "ProxyServer")?;
+    let bypass = read_registry_string(&subkey, "ProxyOverride")
+        .unwrap_or_default()
+        .split(';')
+        .map(str::to_owned)
+        .collect();
+    Some(WindowsSystemProxy { server, bypass })
+}
+
+/// The proxy address the system settings select for one host, if any. A bypass
+/// match or a statically disabled proxy yields None and the route is skipped.
+fn windows_proxy_for(host: &str) -> Option<String> {
+    let settings = cached_windows_system_proxy()?;
+    if windows_proxy_bypassed(&settings.bypass, host) {
+        return None;
+    }
+    proxy_server_for_scheme(&settings.server, true)
+}
+
+/// Case-insensitive Internet Settings proxy-bypass matching ("*", "<local>",
+/// "*.example.com", "10.*"). Clash normally leaves the list at the Windows
+/// default, so this mostly protects custom user overrides.
+pub(crate) fn windows_proxy_bypassed(bypass: &[String], host: &str) -> bool {
+    let host = safe_media_host_name(host);
+    for raw in bypass {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if entry.eq_ignore_ascii_case("<local>") {
+            if !host.contains('.') {
+                return true;
+            }
+            continue;
+        }
+        if entry == "*" {
+            return true;
+        }
+        if wildcard_host_match(&safe_media_host_name(entry), &host) {
+            return true;
+        }
+    }
+    false
+}
+
+fn wildcard_host_match(pattern: &str, host: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let host: Vec<char> = host.chars().collect();
+    let (mut p, mut h) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while h < host.len() {
+        if p < pattern.len() && pattern[p] == host[h] {
+            p += 1;
+            h += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            p += 1;
+            mark = h;
+        } else if let Some(star_index) = star {
+            p = star_index + 1;
+            mark += 1;
+            h = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+/// Parse the Internet Settings ProxyServer value. Formats: "host:port",
+/// "http=host:port;https=host:port" and mixed variants. Invalid entries are
+/// ignored instead of being used as an unvalidated proxy target.
+pub(crate) fn proxy_server_for_scheme(server: &str, https_target: bool) -> Option<String> {
+    let mut plain = None;
+    let mut http = None;
+    let mut https = None;
+    for part in server.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once('=') {
+            Some((name, value)) => match name.trim().to_ascii_lowercase().as_str() {
+                "http" => http = normalize_proxy_address(value),
+                "https" => https = normalize_proxy_address(value),
+                _ => (),
+            },
+            None => plain = normalize_proxy_address(part),
+        }
+    }
+    if https_target {
+        https.or(http).or(plain)
+    } else {
+        http.or(https).or(plain)
+    }
+}
+
+fn normalize_proxy_address(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let with_scheme = if value.contains("://") {
+        value.to_owned()
+    } else {
+        format!("http://{value}")
+    };
+    let url = Url::parse(&with_scheme).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    // An explicit default port (:80 for http) is normalised away by the URL
+    // parser, so only an explicit port 0 is invalid here.
+    if url.host_str().is_none()
+        || url.port() == Some(0)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "/" | "")
+    {
+        return None;
+    }
+    Some(url.to_string())
+}
+
+/// System-proxy client for the bounded Douyin room-page fallback. The proxy
+/// resolves the destination, so no DNS pinning is possible on this route; the
+/// fixed endpoint host allowlist still bounds every request.
+fn endpoint_client_system_proxy(url: &Url) -> Result<Client> {
+    let host = endpoint_host(url)?;
+    let address = windows_proxy_for(host).ok_or_else(|| -> anyhow::Error {
+        DouyinPathUnavailable.into()
+    })?;
+    let proxy = reqwest::Proxy::all(&address).map_err(|_| AdapterError::Transport)?;
+    Client::builder()
+        .user_agent(USER_AGENT)
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::none())
+        .proxy(proxy)
+        .build()
+        .map_err(|_| AdapterError::Transport.into())
+}
+
+/// One bounded room-page HTTP result, independent of reqwest so the connection
+/// path selection can be exercised with synthetic transports in offline tests.
+#[derive(Debug, Clone)]
+pub(crate) struct DouyinPageResponse {
+    pub status: u16,
+    pub location: Option<String>,
+    pub body: String,
+}
+
+pub(crate) trait DouyinPageTransport: Send + Sync {
+    fn get(
+        &self,
+        url: &Url,
+        referer: &str,
+        cookie: Option<&str>,
+        path: DouyinPagePath,
+    ) -> Result<DouyinPageResponse>;
+}
+
+struct HttpDouyinPageTransport;
+impl DouyinPageTransport for HttpDouyinPageTransport {
+    fn get(
+        &self,
+        url: &Url,
+        referer: &str,
+        cookie: Option<&str>,
+        path: DouyinPagePath,
+    ) -> Result<DouyinPageResponse> {
+        let client = match path {
+            DouyinPagePath::PinnedIpv4 => endpoint_client(url)?,
+            DouyinPagePath::Hostname => endpoint_client_unpinned(url)?,
+            DouyinPagePath::SystemProxy => endpoint_client_system_proxy(url)?,
+        };
+        let request_cookie = douyin_page_cookie(url, cookie)?;
+        let mut request = client
+            .get(url.clone())
+            .header("Referer", referer)
+            .header("User-Agent", DOUYIN_USER_AGENT)
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header("Accept-Language", "zh-CN,zh;q=0.9")
+            .timeout(DOUYIN_PAGE_REQUEST_TIMEOUT);
+        if let Some(value) = request_cookie {
+            request = request.header("Cookie", value);
+        }
+        // The room-page gate (max in-flight, start spacing, cooldown budget) is
+        // shared by playback, relay reconnects and background status checks.
+        let _slot = DouyinPageSlot::acquire()?;
+        let response = request.send().map_err(|_| AdapterError::Transport)?;
+        let status = response.status().as_u16();
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        if (300..400).contains(&status) {
+            return Ok(DouyinPageResponse {
+                status,
+                location,
+                body: String::new(),
+            });
+        }
+        // Only a 2xx body is classified; later routes never need error bodies.
+        let body = if (200..300).contains(&status) {
+            read_response(response)?
+        } else {
+            String::new()
+        };
+        Ok(DouyinPageResponse {
+            status,
+            location,
+            body,
+        })
+    }
+}
+
+static HTTP_DOUYIN_PAGE_TRANSPORT: HttpDouyinPageTransport = HttpDouyinPageTransport;
+
+/// Bounded route order for one room-page read. A captcha observed on a direct
+/// route moves the system proxy to the front of the next read, exactly like the
+/// legacy launcher's DouyinNeedsProxy flag.
+fn douyin_path_order(needs_proxy: bool) -> Vec<DouyinPagePath> {
+    let mut paths = Vec::with_capacity(3);
+    if needs_proxy {
+        paths.push(DouyinPagePath::SystemProxy);
+    }
+    paths.push(DouyinPagePath::PinnedIpv4);
+    paths.push(DouyinPagePath::Hostname);
+    if !needs_proxy {
+        paths.push(DouyinPagePath::SystemProxy);
+    }
+    paths
+}
+
+/// Fetch one page over one route, following at most five same-allowlist HTTPS
+/// redirects. Failures are typed so the caller can decide whether another route
+/// may return a usable page.
+fn douyin_page_via_path(
+    transport: &dyn DouyinPageTransport,
+    room: &str,
+    cookie: Option<&str>,
+    path: DouyinPagePath,
+    deadline: Instant,
+) -> Result<String> {
+    let origin = Url::parse(&format!("https://live.douyin.com/{room}"))?;
+    // The room id was validated by Target/avatar_room_component already; keep a
+    // local structural check so a manually built target cannot inject a query,
+    // fragment, credentials or a foreign host into the gated page request.
+    ensure!(
+        origin.scheme() == "https"
+            && origin.host_str() == Some("live.douyin.com")
+            && origin.port().is_none()
+            && origin.username().is_empty()
+            && origin.password().is_none()
+            && origin.query().is_none()
+            && origin.fragment().is_none(),
+        "抖音房间页地址无效"
+    );
+    let referer = "https://live.douyin.com/";
+    let mut current = origin;
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(current.as_str().to_owned());
+    for hop in 0..=DOUYIN_PAGE_MAX_REDIRECTS {
+        ensure!(
+            Instant::now() < deadline,
+            "抖音房间页请求超时，请检查网络后重试"
+        );
+        let response = transport.get(&current, referer, cookie, path)?;
+        let status = response.status;
+        if !(300..400).contains(&status) {
+            if (200..300).contains(&status) {
+                return Ok(response.body);
+            }
+            return Err(match status {
+                429 => AdapterError::RateLimited.into(),
+                401 | 403 => AdapterError::VerificationRequired.into(),
+                _ => AdapterError::Transport.into(),
+            });
+        }
+        ensure!(hop < DOUYIN_PAGE_MAX_REDIRECTS, "抖音房间页重定向次数过多");
+        let location = response
+            .location
+            .as_deref()
+            .ok_or_else(|| anyhow!("抖音房间页重定向缺少位置"))?;
+        let next = current
+            .join(location)
+            .map_err(|_| anyhow!("抖音房间页重定向地址无效"))?;
+        ensure!(
+            next.scheme() == "https"
+                && next.username().is_empty()
+                && next.password().is_none()
+                && next.fragment().is_none()
+                && next.port().is_none_or(|port| port == 443),
+            "抖音房间页重定向地址未通过校验"
+        );
+        // The proxy route cannot pin DNS, so the allowlist check is the only
+        // guard there; endpoint_client re-validates it on the direct routes.
+        endpoint_host(&next)?;
+        if !visited.insert(next.as_str().to_owned()) {
+            bail!("抖音房间页出现重定向循环");
+        }
+        crate::diag::log(
+            "platforms",
+            crate::diag::Level::Info,
+            &format!(
+                "douyin room page redirect hop {}/{} path={} status={} host={}",
+                hop + 1,
+                DOUYIN_PAGE_MAX_REDIRECTS,
+                path.label(),
+                status,
+                next.host_str().unwrap_or("invalid-host")
+            ),
+        );
+        current = next;
+    }
+    unreachable!("bounded douyin room page redirect loop always returns")
+}
+
+/// Scan every RSC roomStore payload bounded to (store payloads, parsed payloads,
+/// room objects). Shell pages carry roomStore/roomInfo but no room object.
+fn douyin_room_presence(page: &str) -> (usize, usize, usize) {
+    let mut store_payloads = 0usize;
+    let mut parsed_payloads = 0usize;
+    let mut rooms = 0usize;
+    for payload in pace_payloads(page) {
+        if !payload.contains("roomStore") {
+            continue;
+        }
+        store_payloads += 1;
+        let json = payload
+            .find(':')
+            .filter(|index| payload[..*index].chars().all(|c| c.is_ascii_alphanumeric()))
+            .map_or(payload.as_str(), |index| &payload[index + 1..]);
+        let Ok(root) = serde_json::from_str::<Value>(json) else {
+            continue;
+        };
+        parsed_payloads += 1;
+        let entries: Vec<&Value> = root
+            .as_array()
+            .map(|values| values.iter().collect())
+            .unwrap_or_else(|| vec![&root]);
+        for entry in entries {
+            if entry
+                .pointer("/state/roomStore/roomInfo")
+                .and_then(|info| info.get("room"))
+                .is_some_and(|room| room.is_object())
+            {
+                rooms += 1;
+            }
+        }
+    }
+    (store_payloads, parsed_payloads, rooms)
+}
+
+/// True when the page carries the RSC roomStore shell but no room object, which
+/// is Douyin's transient rate-control response rather than "room not found".
+fn douyin_page_missing_room(page: &str) -> bool {
+    let (store_payloads, parsed_payloads, rooms) = douyin_room_presence(page);
+    store_payloads > 0 && parsed_payloads > 0 && rooms == 0
+}
+
+/// True when the page carries a real room object (any status); the parser then
+/// produces the definitive live/offline/invalid-status result.
+fn douyin_page_has_room(page: &str) -> bool {
+    douyin_room_presence(page).2 > 0
+}
+
+/// Business classification of one fetched page. Only a real room (or an explicit
+/// offline/unknown-status room, which the parser decides) stops the route loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DouyinPageClass {
+    Room,
+    Shell,
+    Captcha,
+    Unknown,
+}
+
+/// A real Douyin captcha/interstitial page, using the legacy DouyinGuard
+/// rules: the explicit title marker, the byte captcha SDK, or a small page that
+/// mentions captcha. A normal room page also carries captcha script names, so
+/// the size guard is what keeps a format change from being misread as a captcha
+/// and needlessly opening the verification browser.
+pub(crate) fn douyin_page_is_captcha(page: &str) -> bool {
+    page.contains("验证码中间页")
+        || page.contains("sec_sdk_build")
+        || (page.len() < 20_000 && page.contains("captcha"))
+}
+
+fn classify_douyin_page(page: &str) -> DouyinPageClass {
+    if douyin_page_has_room(page) {
+        return DouyinPageClass::Room;
+    }
+    if douyin_page_missing_room(page) {
+        return DouyinPageClass::Shell;
+    }
+    // A normal room page also mentions captcha inside its script payloads, so the
+    // marker is only consulted once no room object was found.
+    if douyin_page_is_captcha(&page) {
+        return DouyinPageClass::Captcha;
+    }
+    DouyinPageClass::Unknown
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DouyinPageFailure {
+    Captcha,
+    Shell,
+    Parse,
+    Network,
+    Unavailable,
+}
+
+fn classify_page_failure(error: &anyhow::Error) -> DouyinPageFailure {
+    if error.downcast_ref::<DouyinPathUnavailable>().is_some() {
+        return DouyinPageFailure::Unavailable;
+    }
+    match error.downcast_ref::<AdapterError>() {
+        Some(AdapterError::VerificationRequired) => DouyinPageFailure::Captcha,
+        Some(AdapterError::RateLimited) => DouyinPageFailure::Shell,
+        Some(AdapterError::Transport) => DouyinPageFailure::Network,
+        Some(_) => DouyinPageFailure::Parse,
+        None => DouyinPageFailure::Parse,
+    }
+}
+
+/// Douyin answers a burst of room-page requests with an empty RSC shell page
+/// (roomStore present, roomInfo.room missing) instead of an error. A captcha on
+/// a direct route moves the system proxy to the front of the next read.
+static DOUYIN_NEEDS_PROXY: AtomicBool = AtomicBool::new(false);
+/// 4 second short reuse of a parsed room page for status/title/avatar lookups.
+/// Playback resolution always reads a fresh page (a media URL must be current).
+const DOUYIN_ROOM_CACHE_TTL_MS: u64 = 4_000;
+const DOUYIN_ROOM_CACHE_CAPACITY: usize = 32;
+#[derive(Debug, Clone)]
+struct DouyinRoomCacheEntry {
+    page: String,
+    cached_at_ms: u64,
+    credential: u64,
+}
+static DOUYIN_ROOM_CACHE: Mutex<Vec<(String, DouyinRoomCacheEntry)>> = Mutex::new(Vec::new());
+static DOUYIN_ROOM_LOCKS: Mutex<Vec<(String, Arc<Mutex<()>>)>> = Mutex::new(Vec::new());
+
+/// One-room single-flight gate: concurrent status/title/avatar reads for the
+/// same room share one request instead of multiplying them.
+fn douyin_room_lock(room: &str) -> Arc<Mutex<()>> {
+    let mut locks = DOUYIN_ROOM_LOCKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some((_, lock)) = locks.iter().find(|(key, _)| key == room) {
+        return Arc::clone(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    if locks.len() >= DOUYIN_ROOM_CACHE_CAPACITY {
+        locks.remove(0);
+    }
+    locks.push((room.to_owned(), Arc::clone(&lock)));
+    lock
+}
+
+/// Stable credential marker for the page cache. The per-request __ac_nonce is
+/// deliberately excluded, so an anonymous session still reuses its 4 s window
+/// while a login/logout/refresh changes the marker.
+fn douyin_credential_fingerprint(cookie: Option<&str>) -> u64 {
+    let Ok(origin) = Url::parse("https://www.douyin.com/") else {
+        return 0;
+    };
+    let header = cookie_for_request(&origin, cookie).unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    header.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn douyin_cached_page(room: &str, credential: u64, now_ms: u64) -> Option<String> {
+    let mut cache = DOUYIN_ROOM_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    cache.retain(|(_, entry)| now_ms.saturating_sub(entry.cached_at_ms) <= DOUYIN_ROOM_CACHE_TTL_MS);
+    cache
+        .iter()
+        .find(|(key, entry)| key == room && entry.credential == credential)
+        .map(|(_, entry)| entry.page.clone())
+}
+
+fn douyin_store_page(room: &str, page: &str, credential: u64, now_ms: u64) {
+    let mut cache = DOUYIN_ROOM_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    cache.retain(|(key, _)| key != room);
+    if cache.len() >= DOUYIN_ROOM_CACHE_CAPACITY {
+        cache.remove(0);
+    }
+    cache.push((
+        room.to_owned(),
+        DouyinRoomCacheEntry {
+            page: page.to_owned(),
+            cached_at_ms: now_ms,
+            credential,
+        },
+    ));
+}
+
+/// Drop every cached room page. Called after a successful verification refresh
+/// and whenever credentials are replaced, so a stale page can never be reused.
+pub(crate) fn invalidate_douyin_page_cache() {
+    DOUYIN_ROOM_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+}
+
+/// A successful verification refresh restores direct access; reset the
+/// proxy-first preference and any cached page from the rejected session.
+pub(crate) fn note_douyin_verification_success() {
+    DOUYIN_NEEDS_PROXY.store(false, Ordering::Release);
+    invalidate_douyin_page_cache();
+}
+
+/// One bounded room-page read across every route, driven by the business result
+/// of each response rather than by transport errors alone. At most three routes
+/// are tried, one shell retry is allowed, and the whole read (including the retry
+/// pause) shares one deadline so a relay reconnect cannot hang the player.
+fn douyin_room_page_fresh_with(
+    transport: &dyn DouyinPageTransport,
+    room: &str,
+    cookie: Option<&str>,
+) -> Result<String> {
+    if let Some(remaining) = douyin_cooldown_remaining_ms() {
+        crate::diag::log(
+            "platforms",
+            crate::diag::Level::Warn,
+            &format!(
+                "douyin room-page request skipped: risk-control cooldown has {remaining} ms left"
+            ),
+        );
+        return Err(AdapterError::RateLimited.into());
+    }
+    let deadline = Instant::now() + DOUYIN_PAGE_DEADLINE;
+    let mut failures: Vec<DouyinPageFailure> = Vec::new();
+    let needs_proxy = DOUYIN_NEEDS_PROXY.load(Ordering::Acquire);
+    if let Some(page) = douyin_read_routes(transport, room, cookie, needs_proxy, deadline, &mut failures)
+    {
+        douyin_note_page_ok();
+        return Ok(page);
+    }
+    // A shell page is transient rate control: one bounded retry after a short
+    // pause, exactly like the legacy launcher. The captcha preference observed on
+    // the first round is reloaded so the retry starts on the system proxy.
+    if failures
+        .iter()
+        .any(|failure| *failure == DouyinPageFailure::Shell)
+        && Instant::now() < deadline
+    {
+        crate::diag::log(
+            "platforms",
+            crate::diag::Level::Warn,
+            "douyin room page returned an empty roomStore shell; retrying once after a short pause",
+        );
+        let jitter_ms = u64::from(
+            room.bytes()
+                .fold(0u32, |sum, byte| {
+                    sum.wrapping_mul(31).wrapping_add(u32::from(byte))
+                })
+                % 200,
+        );
+        thread::sleep(Duration::from_millis(DOUYIN_PAGE_SHELL_RETRY_MS + jitter_ms));
+        let retry_needs_proxy = DOUYIN_NEEDS_PROXY.load(Ordering::Acquire);
+        let mut retry_failures: Vec<DouyinPageFailure> = Vec::new();
+        if let Some(page) = douyin_read_routes(
+            transport,
+            room,
+            cookie,
+            retry_needs_proxy,
+            deadline,
+            &mut retry_failures,
+        ) {
+            douyin_note_page_ok();
+            return Ok(page);
+        }
+        failures.extend(retry_failures);
+    }
+    // A captcha is the actionable case for one silent refresh, and it wins over a
+    // rate-limit observation: otherwise a room that serves a captcha page on one
+    // route and a shell on another would never offer the recovery path and could
+    // stay unplayable behind an endless "rate limited" wait. The silent-refresh
+    // gate (single flight plus cooldown) bounds the cost of this decision.
+    if failures
+        .iter()
+        .any(|failure| *failure == DouyinPageFailure::Captcha)
+    {
+        return Err(AdapterError::VerificationRequired.into());
+    }
+    if failures
+        .iter()
+        .any(|failure| *failure == DouyinPageFailure::Shell)
+    {
+        douyin_note_shell_page();
+        return Err(AdapterError::RateLimited.into());
+    }
+    if failures
+        .iter()
+        .any(|failure| *failure == DouyinPageFailure::Parse)
+    {
+        return Err(AdapterError::InvalidResponse("抖音页面格式变化或未返回房间信息").into());
+    }
+    Err(AdapterError::Transport.into())
+}
+
+/// A captcha on a direct route moves the system proxy to the front of the next
+/// read. Applies to a 200 captcha page and to an HTTP 401/403 verification
+/// response alike, matching the legacy launcher's DouyinNeedsProxy flag.
+fn note_douyin_captcha_on_direct_route(path: DouyinPagePath) {
+    if path != DouyinPagePath::SystemProxy && !DOUYIN_NEEDS_PROXY.swap(true, Ordering::AcqRel) {
+        crate::diag::log(
+            "platforms",
+            crate::diag::Level::Warn,
+            "douyin room page requested verification on a direct route; the system proxy will be tried first next time",
+        );
+    }
+}
+
+fn douyin_read_routes(
+    transport: &dyn DouyinPageTransport,
+    room: &str,
+    cookie: Option<&str>,
+    needs_proxy: bool,
+    deadline: Instant,
+    failures: &mut Vec<DouyinPageFailure>,
+) -> Option<String> {
+    for path in douyin_path_order(needs_proxy) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match douyin_page_via_path(transport, room, cookie, path, deadline) {
+            Ok(page) => match classify_douyin_page(&page) {
+                DouyinPageClass::Room => {
+                    // The legacy DouyinNeedsProxy flag is sticky: once a direct
+                    // route asked for verification, later reads keep trying the
+                    // system proxy first until a verification refresh or a new
+                    // credential write clears it.
+                    return Some(page);
+                }
+                DouyinPageClass::Shell => failures.push(DouyinPageFailure::Shell),
+                DouyinPageClass::Captcha => {
+                    failures.push(DouyinPageFailure::Captcha);
+                    note_douyin_captcha_on_direct_route(path);
+                }
+                DouyinPageClass::Unknown => failures.push(DouyinPageFailure::Parse),
+            },
+            Err(error) => {
+                let failure = classify_page_failure(&error);
+                crate::diag::log(
+                    "platforms",
+                    crate::diag::Level::Warn,
+                    &format!(
+                        "douyin room page route {} failed: {failure:?}",
+                        path.label()
+                    ),
+                );
+                if failure == DouyinPageFailure::Captcha {
+                    note_douyin_captcha_on_direct_route(path);
+                }
+                failures.push(failure);
+            }
+        }
+    }
+    None
+}
+
+/// Playback resolution: never reuse a cached page, because the media URL must be
+/// the one the platform returns right now.
+fn douyin_room_page_fresh(room: &str, cookie: Option<&str>) -> Result<String> {
+    douyin_room_page_fresh_with(&HTTP_DOUYIN_PAGE_TRANSPORT, room, cookie)
+}
+
+/// Status/title/avatar lookups: one per-room single-flight plus a 4 second
+/// short reuse. Playback resolution uses the fresh entry point above.
+fn douyin_room_page_shared_with(
+    transport: &dyn DouyinPageTransport,
+    room: &str,
+    cookie: Option<&str>,
+) -> Result<String> {
+    let credential = douyin_credential_fingerprint(cookie);
+    let now = epoch_millis();
+    if let Some(page) = douyin_cached_page(room, credential, now) {
+        return Ok(page);
+    }
+    let lock = douyin_room_lock(room);
+    let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+    let now = epoch_millis();
+    if let Some(page) = douyin_cached_page(room, credential, now) {
+        return Ok(page);
+    }
+    let page = douyin_room_page_fresh_with(transport, room, cookie)?;
+    douyin_store_page(room, &page, credential, epoch_millis());
+    Ok(page)
+}
+
+pub(crate) fn douyin_room_page_shared(room: &str, cookie: Option<&str>) -> Result<String> {
+    douyin_room_page_shared_with(&HTTP_DOUYIN_PAGE_TRANSPORT, room, cookie)
+}
+
+#[cfg(test)]
+fn reset_douyin_fetch_state_for_test() {
+    if let Ok(mut gate) = DOUYIN_PAGE_GATE.lock() {
+        *gate = DouyinPageGate::default();
+    }
+    DOUYIN_NEEDS_PROXY.store(false, Ordering::Release);
+    invalidate_douyin_page_cache();
+    DOUYIN_ROOM_LOCKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+    SYSTEM_PROXY_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
 }
 
 pub(crate) fn get(url: Url, referer: &str, cookie: Option<&str>) -> Result<String> {
@@ -887,7 +2155,7 @@ pub fn resolve_with_hints(
                     )
                 ) && settings.yt_dlp.is_some() =>
             {
-                resolve_ytdlp(target, settings).map(|stream| (stream, StreamHints::default()))
+                resolve_ytdlp(target, settings, cookie).map(|stream| (stream, StreamHints::default()))
             }
             Err(error) => Err(error),
         },
@@ -1031,10 +2299,7 @@ pub fn huya_title_from_json(root: &Value) -> Option<String> {
     join_title(nick, name)
 }
 
-fn bili_playback_titles(
-    room: &str,
-    cookie: Option<&str>,
-) -> (Option<String>, Option<String>) {
+fn bili_playback_titles(room: &str, cookie: Option<&str>) -> (Option<String>, Option<String>) {
     let info = endpoint(
         "https://api.live.bilibili.com/room/v1/Room/get_info",
         &[("room_id", room.into())],
@@ -1069,8 +2334,7 @@ fn huya_playback_titles(room: &str) -> (Option<String>, Option<String>) {
         "https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid={numeric}"
     ))
     .ok()
-    .and_then(|url| json_get(url, "https://www.huya.com/").ok())
-    else {
+    .and_then(|url| json_get(url, "https://www.huya.com/").ok()) else {
         return (None, None);
     };
     huya_title_parts_from_json(&root)
@@ -1189,11 +2453,27 @@ pub fn parse_bili_play(root: &Value, title: &str) -> Result<ResolvedStream> {
     Err(AdapterError::InvalidResponse("B站没有可用的 H.264 播放地址，可能需要登录").into())
 }
 
-fn resolve_ytdlp(target: &Target, settings: &Settings) -> Result<ResolvedStream> {
-    let binary = settings
-        .yt_dlp
-        .as_ref()
-        .ok_or_else(|| anyhow!("未设置 yt-dlp 路径"))?;
+/// Always reap the resolver before its private cookie jar is dropped, including
+/// stdout errors, wait failures and timeout paths.
+struct ResolverChild(std::process::Child);
+impl Drop for ResolverChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn resolver_cookie_file(cookie: Option<&str>) -> Result<Option<crate::auth::TemporaryCookieFile>> {
+    let source = REQUEST_SESSIONS.with(|sessions| sessions.borrow().last().cloned());
+    match source {
+        Some((Platform::Bili, source)) => source.temporary_cookie_file(Platform::Bili),
+        Some(_) => bail!("外部B站解析不接受其他平台的登录态"),
+        None => cookie.map(|header| crate::auth::TemporaryCookieFile::from_header(Platform::Bili, header))
+            .transpose().map(Option::flatten),
+    }
+}
+
+fn ytdlp_command(binary: &std::path::Path, target: &Target, cookie_path: Option<&std::path::Path>) -> Command {
     let room_url = format!("https://live.bilibili.com/{}", target.room);
     let format = match target.quality {
         Quality::Best => "best[ext=flv][vcodec^=avc]/best[ext=flv]/best",
@@ -1204,6 +2484,7 @@ fn resolve_ytdlp(target: &Target, settings: &Settings) -> Result<ResolvedStream>
     command
         .args([
             "--ignore-config",
+            "--no-cache-dir",
             "--no-playlist",
             "--no-warnings",
             "--no-progress",
@@ -1212,19 +2493,30 @@ fn resolve_ytdlp(target: &Target, settings: &Settings) -> Result<ResolvedStream>
             "-f",
             format,
             "--get-url",
-            "--",
-            &room_url,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    if let Some(cookie_path) = cookie_path {
+        command.arg("--cookies").arg(cookie_path);
+    }
+    command.arg("--").arg(&room_url);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    let mut child = command.spawn().context("无法启动指定的 yt-dlp")?;
-    let stdout = child
+    command
+}
+
+fn resolve_ytdlp(target: &Target, settings: &Settings, cookie: Option<&str>) -> Result<ResolvedStream> {
+    let binary = settings.yt_dlp.as_ref().ok_or_else(|| anyhow!("未设置 yt-dlp 路径"))?;
+    // This guard is created before the child so every exit path reaps the child
+    // first and then removes the jar. Only its random filename reaches argv.
+    let cookies = resolver_cookie_file(cookie)?;
+    let mut command = ytdlp_command(binary, target, cookies.as_ref().map(|jar| jar.path()));
+    let mut child = ResolverChild(command.spawn().context("无法启动指定的 yt-dlp")?);
+    let stdout = child.0
         .stdout
         .take()
         .ok_or_else(|| anyhow!("yt-dlp 输出不可用"))?;
@@ -1239,12 +2531,10 @@ fn resolve_ytdlp(target: &Target, settings: &Settings) -> Result<ResolvedStream>
     });
     let deadline = Instant::now() + Duration::from_secs(35);
     let status = loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = child.0.try_wait()? {
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
             bail!("yt-dlp 解析超时，进程已结束");
         }
         thread::sleep(Duration::from_millis(25));
@@ -1273,11 +2563,22 @@ fn resolve_ytdlp(target: &Target, settings: &Settings) -> Result<ResolvedStream>
     )
 }
 
+/// How many Huya lines are probed before giving up: the room page usually lists
+/// several CDN entries (al/tx/hw/hs), and the preferred line is frequently the
+/// broken one. Four covers every line one page normally exposes; the overall
+/// deadline in resolve_huya still bounds the time spent on a fully broken page.
+const HUYA_PROBE_CANDIDATES: usize = 4;
+/// Upper bound for probing candidate lines in one resolve. A healthy preferred
+/// line returns after the first probe; this cap only matters when several CDNs
+/// are unreachable, so one relay reconnect cannot stall on dead lines forever.
+const HUYA_PROBE_DEADLINE: Duration = Duration::from_secs(10);
+
 fn resolve_huya(target: &Target) -> Result<(ResolvedStream, StreamHints)> {
     let url = Url::parse(&format!("https://www.huya.com/{}", target.room))?;
     let page = get(url, "https://www.huya.com/", None)?;
-    let mut result = match parse_huya_page(&page, &target.quality, epoch_millis(), 12_345_678) {
-        Ok(result) => result,
+    let candidates = match parse_huya_candidates(&page, &target.quality, epoch_millis(), 12_345_678)
+    {
+        Ok(candidates) => candidates,
         Err(error) => {
             // A page that explicitly announces a replay is not "offline": report a
             // replay-unavailable stream so the session can wait for the live feed.
@@ -1285,6 +2586,52 @@ fn resolve_huya(target: &Target) -> Result<(ResolvedStream, StreamHints)> {
                 return Err(AdapterError::ReplayUnavailable.into());
             }
             return Err(error);
+        }
+    };
+    // Probe the preferred lines in order and use the first one that answers a
+    // validated media request. This mirrors the legacy launcher's candidate
+    // probing: one broken CDN no longer makes the room unplayable, and every
+    // rejected line leaves a redacted host and reason for diagnostics.
+    let mut failures: Vec<String> = Vec::new();
+    let mut chosen: Option<ResolvedStream> = None;
+    let probe_deadline = Instant::now() + HUYA_PROBE_DEADLINE;
+    for candidate in candidates.iter().take(HUYA_PROBE_CANDIDATES) {
+        if Instant::now() >= probe_deadline {
+            failures.push("探测时间预算已用完".into());
+            break;
+        }
+        match crate::relay::probe_media_stream(candidate) {
+            Ok(()) => {
+                chosen = Some(candidate.clone());
+                break;
+            }
+            Err(error) => {
+                let host = Url::parse(&candidate.url)
+                    .ok()
+                    .and_then(|url| url.host_str().map(str::to_owned))
+                    .unwrap_or_else(|| "未知线路".into());
+                let reason = crate::relay::upstream_failure_label(&error);
+                crate::diag::log(
+                    "platforms",
+                    crate::diag::Level::Warn,
+                    &format!(
+                        "huya candidate {host} did not answer ({reason}); trying the next line"
+                    ),
+                );
+                failures.push(format!("{host} {reason}"));
+            }
+        }
+    }
+    let mut result = match chosen {
+        Some(result) => result,
+        None => {
+            if huya_page_replay(&page) {
+                return Err(AdapterError::ReplayUnavailable.into());
+            }
+            return Err(anyhow!(
+                "虎牙候选线路均未响应（{}）；请稍后重试",
+                failures.join("；")
+            ));
         }
     };
     let (anchor, room_title) = huya_playback_titles(&target.room);
@@ -1302,7 +2649,6 @@ fn resolve_huya(target: &Target) -> Result<(ResolvedStream, StreamHints)> {
         },
     ))
 }
-
 fn extract_object(text: &str, start: usize) -> Option<&str> {
     let bytes = text.as_bytes();
     if bytes.get(start) != Some(&b'{') {
@@ -1343,6 +2689,22 @@ pub fn parse_huya_page(
     timestamp_ms: u64,
     uid: u64,
 ) -> Result<ResolvedStream> {
+    parse_huya_candidates(page, quality, timestamp_ms, uid)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AdapterError::InvalidResponse("虎牙没有可用的 FLV 地址或签名参数").into())
+}
+
+/// Every signed FLV candidate from one Huya room page, preferred line first.
+/// The live page lists the same stream on several CDNs (al/tx/hw/hs); the legacy
+/// launcher probes them in order because a specific CDN can be broken while the
+/// room is healthy, so playback probing happens in `resolve_huya` on this list.
+pub fn parse_huya_candidates(
+    page: &str,
+    quality: &Quality,
+    timestamp_ms: u64,
+    uid: u64,
+) -> Result<Vec<ResolvedStream>> {
     let config = page
         .find("hyPlayerConfig")
         .ok_or(AdapterError::InvalidResponse(
@@ -1388,13 +2750,27 @@ pub fn parse_huya_page(
         .into_iter()
         .flatten()
         .collect();
+    // The legacy launcher observed that hs.flv.huya.com is the stable line while
+    // al/tx lines can 302/403; keep that preference, then probe all candidates.
     entries.sort_by_key(|entry| !str_field(entry, "sFlvUrl").contains("hs."));
+    let mut candidates = Vec::new();
+    let mut last_error = None;
     for entry in entries {
-        if let Ok(url) = huya_signed_url(entry, bitrate, timestamp_ms, uid) {
-            return stream(url, "虎牙直播".into(), "https://www.huya.com/");
+        match huya_signed_url(entry, bitrate, timestamp_ms, uid)
+            .and_then(|url| stream(url, "虎牙直播".into(), "https://www.huya.com/"))
+        {
+            Ok(candidate) => candidates.push(candidate),
+            // Keep the concrete rejection (for example an unlisted CDN family)
+            // instead of hiding it behind a generic "no FLV address".
+            Err(error) => last_error = Some(error),
         }
     }
-    Err(AdapterError::InvalidResponse("虎牙没有可用的 FLV 地址或签名参数").into())
+    if candidates.is_empty() {
+        return Err(last_error.unwrap_or_else(|| {
+            AdapterError::InvalidResponse("虎牙没有可用的 FLV 地址或签名参数").into()
+        }));
+    }
+    Ok(candidates)
 }
 
 pub fn huya_signed_url(entry: &Value, bitrate: u64, timestamp_ms: u64, uid: u64) -> Result<String> {
@@ -1617,21 +2993,38 @@ fn resolve_douyu(target: &Target) -> Result<(ResolvedStream, StreamHints)> {
 }
 
 fn resolve_douyin(target: &Target, cookie: Option<&str>) -> Result<(ResolvedStream, StreamHints)> {
-    let nonce = uuid::Uuid::new_v4().simple().to_string();
-    let nonce_cookie = format!("__ac_nonce={}", &nonce[..21]);
-    let page = get(
-        Url::parse(&format!("https://live.douyin.com/{}", target.room))?,
-        "https://live.douyin.com/",
-        cookie.or(Some(&nonce_cookie)),
-    )?;
+    // Playback resolution goes through the same gated room-page read as direct
+    // room verification (shell retry, request gate, cooldown, route failover),
+    // but it always reads a fresh page: a cached page could carry a stale media
+    // URL, and a fresh media address is the whole point of a new resolve.
+    let page = douyin_room_page_fresh(&target.room, cookie)?;
     parse_douyin_page_with_hints(&page, &target.quality)
 }
 
+/// RSC Flight payloads embedded in a Douyin room/account page.
+///
+/// Douyin serves the same inline payload through more than one script name. The
+/// legacy page uses self.__pace_f, while newer Next.js builds can emit
+/// self.__next_f (and window-qualified variants); the danmaku page parser already
+/// accepts both. Collecting only one marker made the alternate pages look like
+/// "page format changed" and fail even though the room payload was present.
 pub(crate) fn pace_payloads(page: &str) -> Vec<String> {
-    let marker = "self.__pace_f.push([";
+    const MARKERS: [&str; 4] = [
+        "self.__pace_f.push([",
+        "self.__next_f.push([",
+        "window.__pace_f.push([",
+        "window.__next_f.push([",
+    ];
+    let mut values = Vec::new();
+    for marker in MARKERS {
+        collect_pace_payloads(page, marker, &mut values);
+    }
+    values
+}
+
+fn collect_pace_payloads(page: &str, marker: &str, values: &mut Vec<String>) {
     let bytes = page.as_bytes();
     let mut index = 0;
-    let mut values = Vec::new();
     while index < bytes.len() {
         let Some(found) = page[index..].find(marker) else {
             break;
@@ -1685,7 +3078,6 @@ pub(crate) fn pace_payloads(page: &str) -> Vec<String> {
         }
         index = end;
     }
-    values
 }
 
 pub fn parse_douyin_page(page: &str, quality: &Quality) -> Result<ResolvedStream> {
@@ -1758,14 +3150,30 @@ pub fn parse_douyin_page_with_hints(
                 .or_else(|| room_title.clone())
                 .or_else(|| clean_title(&str_field(room, "title")))
                 .unwrap_or_default();
+            // The platform has returned lower/mixed-case quality keys on some page
+            // variants; match them case-insensitively while keeping the same
+            // priority order, then hand the address to the normal media policy.
+            let flv_addresses: Vec<(String, String)> = room
+                .pointer("/stream_url/flv_pull_url")
+                .and_then(Value::as_object)
+                .map(|urls| {
+                    urls.iter()
+                        .filter_map(|(key, value)| {
+                            value.as_str().map(|address| {
+                                (key.to_ascii_uppercase(), address.to_owned())
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut last_error = None;
             for name in order {
-                if let Some(address) = room
-                    .pointer("/stream_url/flv_pull_url")
-                    .and_then(|urls| urls[name].as_str())
+                if let Some((_, address)) = flv_addresses
+                    .iter()
+                    .find(|(key, _)| key == name)
                 {
                     match stream(
-                        address.into(),
+                        address.clone(),
                         stream_title.clone(),
                         "https://live.douyin.com/",
                     ) {
@@ -1794,7 +3202,7 @@ pub fn parse_douyin_page_with_hints(
     if missing_room {
         return Err(AdapterError::RateLimited.into());
     }
-    if page.contains("captcha") || page.contains("verify") || page.contains("验证码") {
+    if douyin_page_is_captcha(&page) {
         return Err(AdapterError::VerificationRequired.into());
     }
     Err(AdapterError::InvalidResponse("抖音页面格式变化或未返回房间信息").into())
@@ -1809,6 +3217,16 @@ pub fn search_with_cookie(
     keyword: &str,
     cookie: Option<&str>,
 ) -> Result<Vec<LookupCandidate>> {
+    search_page_with_cookie(platform, keyword, cookie, 1)
+}
+
+pub fn search_page_with_cookie(
+    platform: Platform,
+    keyword: &str,
+    cookie: Option<&str>,
+    page: u32,
+) -> Result<Vec<LookupCandidate>> {
+    ensure!((1..=100).contains(&page), "搜索页码必须在1至100之间");
     checked_cookie(cookie)?;
     let keyword = keyword.trim();
     ensure!(
@@ -1823,7 +3241,7 @@ pub fn search_with_cookie(
                 &BTreeMap::from([
                     ("search_type".into(), "live_user".into()),
                     ("keyword".into(), keyword.into()),
-                    ("page".into(), "1".into()),
+                    ("page".into(), page.to_string()),
                     ("web_location".into(), "1550101".into()),
                 ]),
                 &mixin,
@@ -1841,17 +3259,19 @@ pub fn search_with_cookie(
                 ("typ", "-5".into()),
                 ("livestate", "0".into()),
                 ("rows", "10".into()),
+                ("page", page.to_string()),
+                ("start", ((page - 1) * 10).to_string()),
             ],
         )?,
         Platform::Douyu => endpoint(
             "https://www.douyu.com/japi/search/api/searchUser",
             &[
                 ("kw", keyword.into()),
-                ("page", "1".into()),
+                ("page", page.to_string()),
                 ("pageSize", "10".into()),
             ],
         )?,
-        Platform::Douyin => douyin_search_url(keyword)?,
+        Platform::Douyin => douyin_search_url_page(keyword, page)?,
     };
     let root = match platform {
         Platform::Douyin => douyin_search_json(url, cookie)?,
@@ -1873,6 +3293,10 @@ pub fn search_with_cookie(
 /// legacy launcher. Extra device/browser fingerprint fields are part of the
 /// request shape; omitting them makes the endpoint return an empty user list.
 fn douyin_search_url(keyword: &str) -> Result<Url> {
+    douyin_search_url_page(keyword, 1)
+}
+
+fn douyin_search_url_page(keyword: &str, page: u32) -> Result<Url> {
     let cores = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(8)
@@ -1890,7 +3314,7 @@ fn douyin_search_url(keyword: &str) -> Result<Url> {
             ("is_filter_search", "0".into()),
             ("from_group_id", String::new()),
             ("disable_rs", "0".into()),
-            ("offset", "0".into()),
+            ("offset", ((page - 1) * 10).to_string()),
             ("count", "10".into()),
             ("need_filter_settings", "1".into()),
             ("list_type", "single".into()),
@@ -2351,7 +3775,7 @@ pub fn parse_douyin_search(root: &Value) -> Result<Vec<LookupCandidate>> {
 /// the caller before it is used. Returns None unless the value is digits and is
 /// not the internal all-zero placeholder.
 fn extract_douyin_web_rid(page: &str) -> Option<String> {
-    for marker in ["\"web_rid\":", "\\\"web_rid\\\":" ] {
+    for marker in ["\"web_rid\":", "\\\"web_rid\\\":"] {
         let mut rest = page;
         while let Some(index) = rest.find(marker) {
             rest = &rest[index + marker.len()..];
@@ -2448,7 +3872,7 @@ fn douyin_profile_page(sec: &str) -> Option<String> {
             page.contains("roomId")
         );
     }
-    if page.contains("captcha") || page.contains("verify") || page.contains("验证码") {
+    if douyin_page_is_captcha(&page) {
         return None;
     }
     Some(page)
@@ -2492,7 +3916,11 @@ fn douyin_profile_page_room(page: &str, sec: &str) -> DouyinProfileRoom {
                 continue;
             };
             let owner = room.get("owner").or_else(|| room.get("anchor"));
-            if owner.and_then(|owner| owner.get("sec_uid")).and_then(Value::as_str) != Some(sec) {
+            if owner
+                .and_then(|owner| owner.get("sec_uid"))
+                .and_then(Value::as_str)
+                != Some(sec)
+            {
                 continue;
             }
             found.session = found
@@ -2644,8 +4072,23 @@ pub fn verify_candidate(
     candidate: &LookupCandidate,
     _cookie: Option<&str>,
 ) -> Result<LookupCandidate> {
+    if candidate.provider == "input" && !candidate.room.is_empty() {
+        let canonical = platform_room_page(candidate.platform, &candidate.room);
+        ensure!(candidate.profile_url.is_none() || candidate.profile_url == canonical,
+            "输入候选的官方直播间地址与房间号不一致");
+        if candidate.platform == Platform::Douyin {
+            // Direct room links use the same gated reader as playback so shell
+            // pages are retried once and a risk-control cooldown is respected.
+            let page = douyin_room_page_fresh(&candidate.room, None)
+                .context("未能读取抖音官方直播间页面")?;
+            return verify_douyin_direct_room(candidate, &page);
+        }
+    }
     if candidate.platform != Platform::Douyin {
         if candidate.room.trim().is_empty() {
+            if candidate.platform == Platform::Bili {
+                return verify_bili_account(candidate);
+            }
             return Err(anyhow!(
                 "该候选只有账号线索（{}），房间待解析；请粘贴官方直播间链接或房间号后重试",
                 candidate.name
@@ -2725,7 +4168,13 @@ pub fn verify_candidate(
     };
     let Some(session) = session else {
         if let Some(web) = offline_web() {
-            return Ok(douyin_offline_candidate(candidate, sec, user, &web, alias_handle.as_deref()));
+            return Ok(douyin_offline_candidate(
+                candidate,
+                sec,
+                user,
+                &web,
+                alias_handle.as_deref(),
+            ));
         }
         return Err(anyhow!(
             "账号资料已核实，但未返回直播场次或数字网页房间号；可使用直播分享链接"
@@ -2747,7 +4196,13 @@ pub fn verify_candidate(
         Ok(root) => root,
         Err(error) => {
             if let Some(web) = offline_web() {
-                return Ok(douyin_offline_candidate(candidate, sec, user, &web, alias_handle.as_deref()));
+                return Ok(douyin_offline_candidate(
+                    candidate,
+                    sec,
+                    user,
+                    &web,
+                    alias_handle.as_deref(),
+                ));
             }
             return Err(error);
         }
@@ -2756,7 +4211,13 @@ pub fn verify_candidate(
         Ok(result) => result,
         Err(error) => {
             if let Some(web) = offline_web() {
-                return Ok(douyin_offline_candidate(candidate, sec, user, &web, alias_handle.as_deref()));
+                return Ok(douyin_offline_candidate(
+                    candidate,
+                    sec,
+                    user,
+                    &web,
+                    alias_handle.as_deref(),
+                ));
             }
             return Err(error);
         }
@@ -2767,6 +4228,52 @@ pub fn verify_candidate(
         result.avatar_url = candidate_avatar(user);
     }
     Ok(result)
+}
+
+/// An account UID and a live-room number are different namespaces. Resolve the
+/// explicit UID before the normal room verifier and then check the room owner;
+/// a similarly named account is never sufficient evidence for binding a room.
+fn verify_bili_account(candidate: &LookupCandidate) -> Result<LookupCandidate> {
+    let uid = candidate.account_id.as_deref()
+        .filter(|uid| !uid.is_empty() && uid.len() <= 24 && uid.bytes().all(|b| b.is_ascii_digit()))
+        .ok_or_else(|| anyhow!("B站候选缺少有效 UID，请提供官方账号主页或 uid:数字"))?;
+    ensure!(uid != "0", "B站 UID 必须大于零");
+    let profile = format!("https://space.bilibili.com/{uid}");
+    ensure!(candidate.profile_url.as_deref().is_none_or(|url| url == profile),
+        "B站账号主页与 UID 不一致，未关联直播间");
+    let root = json_get(
+        endpoint("https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld", &[("mid", uid.into())])?,
+        "https://live.bilibili.com/",
+    )?;
+    let room = bili_account_room(&root)?;
+    let mut resolved = candidate.clone();
+    resolved.room = room;
+    resolved.profile_url = Some(profile);
+    verify_native_room(&resolved)
+}
+
+fn bili_account_room(root: &Value) -> Result<String> {
+    ensure!(int_field(root, "code") == Some(0), "B站账号查询受阻，已保留账号线索");
+    numeric(str_field(&root["data"], "roomid"))
+        .filter(|room| room != "0")
+        .ok_or_else(|| anyhow!("已保留B站账号，平台暂未返回数字直播间"))
+}
+
+/// Verify the room/canonical alias and owner before a room response can promote
+/// a Bilibili account clue. Kept pure for synthetic mismatch regressions.
+fn bili_room_identity(candidate: &LookupCandidate, root: &Value) -> Result<(String, String)> {
+    ensure!(int_field(root, "code") == Some(0), "B站未确认此房间");
+    let data = &root["data"];
+    let canonical = numeric(str_field(data, "room_id")).filter(|room| room != "0")
+        .ok_or_else(|| anyhow!("B站未返回标准房间号"))?;
+    let short = str_field(data, "short_id");
+    ensure!(candidate.room == canonical || candidate.room == short,
+        "B站返回了不同房间，候选未采用");
+    let owner = numeric(str_field(data, "uid")).filter(|uid| uid != "0")
+        .ok_or_else(|| anyhow!("B站未返回可核验的主播 UID"))?;
+    ensure!(candidate.account_id.as_deref().is_none_or(|uid| uid == owner),
+        "B站直播间所属 UID 与候选账号不一致，未关联房间");
+    Ok((canonical, owner))
 }
 
 fn verify_native_room(candidate: &LookupCandidate) -> Result<LookupCandidate> {
@@ -2780,7 +4287,7 @@ fn verify_native_room(candidate: &LookupCandidate) -> Result<LookupCandidate> {
                 )?,
                 "https://live.bilibili.com/",
             )?;
-            ensure!(int_field(&root, "code") == Some(0), "B站未确认此房间");
+            bili_room_identity(candidate, &root)?;
             let anchor = json_get(
                 endpoint(
                     "https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room",
@@ -2827,12 +4334,18 @@ fn verify_native_room(candidate: &LookupCandidate) -> Result<LookupCandidate> {
         "平台没有返回可核验的主播名称，候选未采用"
     );
     ensure!(
-        clean_label(&name).trim().to_lowercase()
+        candidate.provider == "input" || clean_label(&name).trim().to_lowercase()
             == clean_label(&candidate.name).trim().to_lowercase(),
         "平台实际主播名称与候选不同，未自动关联同名或错误账号"
     );
     let mut result = candidate.clone();
     result.name = clean_label(&name);
+    if target.platform == Platform::Bili {
+        let (canonical, owner) = bili_room_identity(candidate, &root)?;
+        result.room = canonical;
+        result.profile_url = Some(format!("https://space.bilibili.com/{owner}"));
+        result.account_id = Some(owner);
+    }
     let row = match target.platform {
         Platform::Bili => &root["data"],
         Platform::Huya => &root["data"],
@@ -2849,7 +4362,7 @@ fn verify_native_room(candidate: &LookupCandidate) -> Result<LookupCandidate> {
     }
     let excerpt = result.description.clone();
     let source = LookupSource {
-        url: platform_room_page(target.platform, &target.room).unwrap_or_default(),
+        url: platform_room_page(target.platform, &result.room).unwrap_or_default(),
         title: "平台官方直播间".into(),
         excerpt,
         retrieved_at: retrieval_timestamp(),
@@ -2862,6 +4375,42 @@ fn verify_native_room(candidate: &LookupCandidate) -> Result<LookupCandidate> {
         candidate_live_status(target.platform, row),
         source,
     ))
+}
+
+fn verify_douyin_direct_room(candidate: &LookupCandidate, page: &str) -> Result<LookupCandidate> {
+    Target::new(Platform::Douyin, candidate.room.clone())?;
+    for payload in pace_payloads(page) {
+        let json = payload.find(':').filter(|index| payload[..*index].chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(payload.as_str(), |index| &payload[index + 1..]);
+        let Ok(root) = serde_json::from_str::<Value>(json) else { continue };
+        let entries: Vec<&Value> = root.as_array().map(|items| items.iter().collect()).unwrap_or_else(|| vec![&root]);
+        for entry in entries {
+            let Some(info) = entry.pointer("/state/roomStore/roomInfo") else { continue };
+            let Some(room) = info.get("room").filter(|r| r.is_object()) else { continue };
+            let owner = room.get("owner").or_else(|| room.get("anchor")).unwrap_or(&Value::Null);
+            let web = numeric(str_field(info, "web_rid")).or_else(|| numeric(str_field(owner, "web_rid")))
+                .or_else(|| numeric(str_field(room, "web_rid")));
+            ensure!(web.as_deref().is_none_or(|web| web == candidate.room), "网页房间号与输入不一致");
+            let name = clean_label(&str_field(owner, "nickname"));
+            ensure!(!name.trim().is_empty(), "官方直播间未返回主播名，未自动确认");
+            let mut result = candidate.clone(); result.name = name;
+            result.title = clean_label(&str_field(room, "title"));
+            result.sec_uid = Some(str_field(owner, "sec_uid")).filter(|v| valid_sec_uid(v));
+            result.avatar_url = candidate_avatar(owner);
+            let status = match int_field(room, "status") { Some(2) => Some("live".into()), Some(4) => Some("offline".into()), _ => None };
+            return Ok(with_verification(result, "platform_verify", "官方直播间已确认房间及主播名称", status,
+                LookupSource { url: format!("https://live.douyin.com/{}", candidate.room), title: "抖音官方直播间".into(),
+                    retrieved_at: retrieval_timestamp(), supports: vec!["房间号".into(), "主播名".into()], ..Default::default() }));
+        }
+    }
+    if douyin_page_is_captcha(&page) {
+        return Err(AdapterError::VerificationRequired.into());
+    }
+    if douyin_page_missing_room(page) {
+        return Err(AdapterError::RateLimited.into());
+    }
+    Err(AdapterError::InvalidResponse("抖音房间资料未返回，可能需要网页验证").into())
 }
 
 pub fn apply_douyin_reflow(
@@ -3009,7 +4558,12 @@ pub fn avatar_thumbnail_url(url: &str) -> String {
     if host != "hdslb.com" && !host.ends_with(".hdslb.com") {
         return url.to_owned();
     }
-    let path = parsed.path().split('@').next().unwrap_or_default().to_owned();
+    let path = parsed
+        .path()
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
     parsed.set_path(&format!("{path}@96w_96h_1c.png"));
     parsed.to_string()
 }
@@ -3128,7 +4682,8 @@ pub fn huya_avatar_from_json(root: &Value) -> Option<String> {
 
 /// Parse the anchor avatar from the Douyu betard room response.
 pub fn douyu_avatar_from_json(root: &Value) -> Option<String> {
-    first_avatar_field(&root["room"], AVATAR_FIELDS).or_else(|| first_avatar_field(root, AVATAR_FIELDS))
+    first_avatar_field(&root["room"], AVATAR_FIELDS)
+        .or_else(|| first_avatar_field(root, AVATAR_FIELDS))
 }
 
 /// Parse the anchor avatar from the Douyin room page payload.
@@ -3246,7 +4801,9 @@ fn bili_avatar_value(room: &str) -> Result<String, AvatarFailure> {
                     }
                 }
             }
-            Err(error) => failure = merge_avatar_failure(failure, avatar_failure_from_error(&error)),
+            Err(error) => {
+                failure = merge_avatar_failure(failure, avatar_failure_from_error(&error))
+            }
         }
     }
 
@@ -3303,16 +4860,9 @@ fn douyu_avatar_value(room: &str) -> Result<String, AvatarFailure> {
 }
 
 fn douyin_avatar_value(room: &str) -> Result<String, AvatarFailure> {
-    let nonce = uuid::Uuid::new_v4().simple().to_string();
-    let nonce_cookie = format!("__ac_nonce={}", &nonce[..21]);
-    let page = get(
-        Url::parse(&format!("https://live.douyin.com/{room}"))
-            .map_err(|_| AvatarFailure::Transport)?,
-        "https://live.douyin.com/",
-        Some(&nonce_cookie),
-    )
-    .map_err(|error| avatar_failure_from_error(&error))?;
-    if page.contains("captcha") || page.contains("verify") || page.contains("验证码") {
+    let page =
+        douyin_room_page_shared(room, None).map_err(|error| avatar_failure_from_error(&error))?;
+    if douyin_page_is_captcha(&page) {
         return Err(AvatarFailure::Blocked);
     }
     douyin_avatar_from_page(&page).ok_or(AvatarFailure::Missing)
@@ -3352,9 +4902,9 @@ fn avatar_room_component(platform: Platform, room: &str) -> Result<(), AvatarFai
     let room = room.trim();
     let valid = !room.is_empty()
         && room.len() <= 64
-        && room.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-        });
+        && room
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
     if !valid {
         return Err(AvatarFailure::Missing);
     }
@@ -3405,6 +4955,44 @@ mod session_tests {
     use super::*;
 
     #[test]
+    fn bili_uid_binding_checks_canonical_room_alias_and_owner_identity() {
+        assert_eq!(bili_account_room(&serde_json::json!({"code":0,"data":{"roomid":123}})).unwrap(), "123");
+        assert!(bili_account_room(&serde_json::json!({"code":0,"data":{"roomid":0}})).is_err());
+        assert!(bili_account_room(&serde_json::json!({"code":-1,"data":{"roomid":123}})).is_err());
+        let mut candidate = LookupCandidate {
+            platform: Platform::Bili, room: "123".into(), account_id: Some("456".into()),
+            ..Default::default()
+        };
+        let root = serde_json::json!({"code":0,"data":{"room_id":12345,"short_id":123,"uid":456}});
+        assert_eq!(bili_room_identity(&candidate, &root).unwrap(), ("12345".into(), "456".into()));
+        candidate.room = "12345".into();
+        assert!(bili_room_identity(&candidate, &root).is_ok());
+        candidate.account_id = Some("457".into());
+        assert!(bili_room_identity(&candidate, &root).is_err());
+        candidate.account_id = None;
+        candidate.room = "124".into();
+        assert!(bili_room_identity(&candidate, &root).is_err());
+        candidate.room = "123".into();
+        assert!(bili_room_identity(&candidate, &serde_json::json!({"code":-1})).is_err());
+        assert!(bili_room_identity(&candidate, &serde_json::json!({"code":0,"data":{"room_id":123,"uid":0}})).is_err());
+    }
+
+    #[test]
+    fn external_resolver_arguments_only_carry_jar_path_and_ignore_ambient_configuration() {
+        let target = Target::new(Platform::Bili, "12345").unwrap();
+        let jar = std::path::Path::new("synthetic-private-jar.cookies");
+        let command = ytdlp_command(std::path::Path::new("synthetic-yt-dlp.exe"), &target, Some(jar));
+        let args: Vec<_> = command.get_args().map(|value| value.to_string_lossy().into_owned()).collect();
+        assert!(args.windows(2).any(|pair| pair == ["--cookies", "synthetic-private-jar.cookies"]));
+        assert!(args.iter().any(|arg| arg == "--ignore-config"));
+        assert!(args.iter().any(|arg| arg == "--no-cache-dir"));
+        assert!(!args.iter().any(|arg| arg == "--add-header" || arg == "--cookies-from-browser"));
+        assert_eq!(args.last().map(String::as_str), Some("https://live.bilibili.com/12345"));
+        let _guard = SessionGuard::enter(Platform::Bili, Arc::new(BrokenCookies));
+        assert!(resolver_cookie_file(Some("synthetic=must-not-fallback")).is_err());
+    }
+
+    #[test]
     fn douyin_web_rid_parser_accepts_plain_and_flight_escaped_payloads() {
         assert_eq!(
             extract_douyin_web_rid("{\"web_rid\":\"989125753255\"}").as_deref(),
@@ -3441,7 +5029,6 @@ mod session_tests {
         assert!(avatar_room_component(Platform::Douyin, "989125753255").is_ok());
     }
 
-
     #[test]
     fn media_allowlist_accepts_douyin_jomodns_redirect_targets() {
         let url = validate_media_url(
@@ -3449,7 +5036,18 @@ mod session_tests {
         )
         .expect("observed Douyin redirect CDN");
         assert_eq!(url.host_str(), Some("rt2016n.jomodns.com"));
-        assert!(validate_media_url("https://rt2016n.attacker.invalid/live.flv").is_err());
+        // Unknown-but-public CDNs are accepted; only a private answer is refused.
+        assert!(validate_media_url_with_resolver(
+            "https://rt2016n.attacker.invalid/live.flv",
+            &|_| Some(vec!["8.8.8.8".parse().unwrap()]),
+        )
+        .is_ok());
+        let private = validate_media_url_detailed_with(
+            "https://rt2016n.attacker.invalid/live.flv",
+            &|_| Some(vec!["127.0.0.1".parse().unwrap()]),
+        )
+        .expect_err("private answer");
+        assert_eq!(private.rule, "media-host-not-public");
     }
 
     #[test]
@@ -3458,8 +5056,20 @@ mod session_tests {
             "https://3edc55ba2a75e6efb8adc1bd58417fc8.v.smtcdns.net/d1--cn-gotcha04.bilivideo.com/live-bvc/synthetic.flv?expire=1",
         )
         .expect("observed Bili redirect CDN");
-        assert_eq!(url.host_str(), Some("3edc55ba2a75e6efb8adc1bd58417fc8.v.smtcdns.net"));
-        assert!(validate_media_url("https://smtcdns.net.attacker.invalid/live.flv").is_err());
+        assert_eq!(
+            url.host_str(),
+            Some("3edc55ba2a75e6efb8adc1bd58417fc8.v.smtcdns.net")
+        );
+        assert!(validate_media_url_with_resolver(
+            "https://smtcdns.net.attacker.invalid/live.flv",
+            &|_| Some(vec!["8.8.8.8".parse().unwrap()]),
+        )
+        .is_ok());
+        assert!(validate_media_url_detailed_with(
+            "https://smtcdns.net.attacker.invalid/live.flv",
+            &|_| Some(vec!["10.0.0.7".parse().unwrap()]),
+        )
+        .is_err());
     }
 
     #[test]
@@ -3474,7 +5084,6 @@ mod session_tests {
         let bad = Url::parse("https://example.com/").unwrap();
         assert!(public_request(&bad, "https://www.douyin.com/").is_err());
     }
-
 
     struct ExactHostCookies {
         host: &'static str,
@@ -3639,5 +5248,554 @@ mod session_tests {
         );
         assert_eq!(rows[0].account_id.as_deref(), Some("1125513249165984"));
         assert_eq!(rows[0].sec_uid.as_deref(), Some("MS4wLjABAAAA_synthetic"));
+    }
+
+    #[test]
+    fn media_allowlist_reports_the_rejected_rule_and_host_without_the_query() {
+        for allowed in [
+            "https://v26-web.douyinvod.com/abcdef/live.flv?expire=1",
+            "https://p3-sign.douyinpic.com/tos-cn-i/synthetic~tplv.jpeg",
+            "https://p3-sign.byteimg.com/tos-cn-i/synthetic~tplv.jpeg",
+            "https://v5-dy-o.zjcdn.com/abcdef/live.flv",
+            "https://al.flv.huya.com/src/synthetic.flv",
+            "https://hw-tct.douyucdn.cn/live/synthetic.flv",
+            "https://cn-gotcha.bilivideo.com/live-bvc/synthetic.flv",
+            "https://d1--cn-gotcha.acgvideo.com/live-bvc/synthetic.flv",
+        ] {
+            assert!(validate_media_url(allowed).is_ok(), "rejected {allowed}");
+        }
+        // A new public CDN is accepted; an unknown host that resolves into the
+        // private range is still refused, and the record never carries the query.
+        assert!(validate_media_url_with_resolver(
+            "https://media.attacker.invalid/live.flv?token=synthetic",
+            &|_| Some(vec!["8.8.8.8".parse().unwrap()]),
+        )
+        .is_ok());
+        assert!(validate_media_url_with_resolver(
+            "https://media.attacker.invalid/live.flv?token=synthetic",
+            &|_| None,
+        )
+        .is_ok(), "unresolvable hosts stay a connection error, not a policy one");
+        let rejection = validate_media_url_detailed_with(
+            "https://media.attacker.invalid/live.flv?token=synthetic",
+            &|_| Some(vec!["192.168.1.9".parse().unwrap()]),
+        )
+        .expect_err("private DNS answer");
+        assert_eq!(rejection.rule, "media-host-not-public");
+        assert_eq!(rejection.host.as_deref(), Some("media.attacker.invalid"));
+        assert!(
+            !rejection.message.contains("synthetic"),
+            "signed query leaked: {}",
+            rejection.message
+        );
+        // No forced scheme upgrade: an http media target keeps its protocol.
+        assert_eq!(
+            validate_media_url("http://cdn.bilivideo.com/live.flv")
+                .unwrap()
+                .scheme(),
+            "http"
+        );
+        let credentials =
+            validate_media_url_detailed("https://user:password@v26-web.douyinvod.com/live.flv")
+                .expect_err("embedded credentials");
+        assert_eq!(credentials.rule, "media-credentials");
+        assert_eq!(credentials.host.as_deref(), Some("v26-web.douyinvod.com"));
+        let fragment = validate_media_url_detailed("https://v26-web.douyinvod.com/live.flv#synthetic")
+            .expect_err("fragment");
+        assert_eq!(fragment.rule, "media-fragment");
+    }
+
+    #[test]
+    fn huya_candidate_list_keeps_every_line_preferred_first() {
+        let anti = "wsTime=synthetic-time&fm=cHJlZml4X3N5bnRoZXRpYw%3D%3D&ctype=huya_live&fs=";
+        let entry = |host: &str, name: &str| {
+            serde_json::json!({
+                "sFlvUrl": host,
+                "sStreamName": name,
+                "sFlvUrlSuffix": "flv",
+                "sFlvAntiCode": anti,
+            })
+        };
+        let configuration = serde_json::json!({"data":[{
+            "gameStreamInfoList":[
+                entry("https://al.flv.huya.com/src", "synthetic-room"),
+                entry("https://hs.flv.huya.com/src", "synthetic-room"),
+                entry("https://tx.flv.huya.com/src", "synthetic-room"),
+            ],
+            "vMultiStreamInfo":[{"iBitRate":1000},{"iBitRate":2000}],
+        }]});
+        let page = format!("var hyPlayerConfig = {{stream:{configuration}, other:1}};");
+        let candidates =
+            parse_huya_candidates(&page, &Quality::Best, 1_700_000_000_000, 12_345_678)
+                .expect("candidates");
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(
+            url::Url::parse(&candidates[0].url).unwrap().host_str(),
+            Some("hs.flv.huya.com")
+        );
+        assert_eq!(
+            url::Url::parse(&candidates[1].url).unwrap().host_str(),
+            Some("al.flv.huya.com")
+        );
+        assert_eq!(
+            url::Url::parse(&candidates[2].url).unwrap().host_str(),
+            Some("tx.flv.huya.com")
+        );
+        // The single-page parser still returns the preferred candidate only.
+        let preferred = parse_huya_page(&page, &Quality::Best, 1_700_000_000_000, 12_345_678)
+            .expect("preferred candidate");
+        assert_eq!(
+            url::Url::parse(&preferred.url).unwrap().host_str(),
+            Some("hs.flv.huya.com")
+        );
+        assert!(preferred.url.contains("ratio=2000"));
+    }
+
+    #[test]
+    fn douyin_flight_payloads_are_found_under_every_inline_script_marker() {
+        let body = format!(
+            "7:{}",
+            serde_json::json!({"state":{"roomStore":{"roomInfo":{"room":{
+                "status": 2,
+                "title": "synthetic",
+                "stream_url": {"flv_pull_url": {
+                    "FULL_HD1": "https://pull-flv-l1.douyincdn.com/synthetic.flv"
+                }}
+            }}}}})
+        );
+        for marker in [
+            "self.__pace_f.push([1,",
+            "self.__next_f.push([1,",
+            "window.__pace_f.push([1,",
+            "window.__next_f.push([1,",
+        ] {
+            let page = format!(
+                "<script>{marker}{}]</script>",
+                serde_json::to_string(&body).unwrap()
+            );
+            let parsed = parse_douyin_page(&page, &Quality::Best)
+                .unwrap_or_else(|error| panic!("marker {marker}: {error}"));
+            assert!(parsed.url.contains("douyincdn.com"), "marker {marker}");
+        }
+    }
+
+    #[test]
+    fn douyin_shell_page_is_distinguished_from_real_and_captcha_pages() {
+        fn page(room: serde_json::Value) -> String {
+            let body = format!(
+                "7:{}",
+                serde_json::json!({"state":{"roomStore":{"roomInfo": room}}})
+            );
+            format!(
+                "self.__pace_f.push([1,{}])",
+                serde_json::to_string(&body).unwrap()
+            )
+        }
+        assert!(douyin_page_missing_room(&page(serde_json::json!({}))));
+        assert!(!douyin_page_missing_room(&page(
+            serde_json::json!({"room":{"status":2,"title":"synthetic"}})
+        )));
+        assert!(!douyin_page_missing_room("<html>captcha</html>"));
+        assert!(!douyin_page_missing_room(""));
+    }
+}
+
+#[cfg(test)]
+mod douyin_fetch_tests {
+    use super::*;
+
+    static DOUYIN_FETCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_douyin_tests() -> std::sync::MutexGuard<'static, ()> {
+        let guard = DOUYIN_FETCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reset_douyin_fetch_state_for_test();
+        guard
+    }
+
+    struct FakeDouyinTransport {
+        calls: std::sync::atomic::AtomicUsize,
+        paths: Mutex<Vec<DouyinPagePath>>,
+        delay: Duration,
+        respond: Box<dyn Fn(DouyinPagePath, usize) -> Result<DouyinPageResponse> + Send + Sync>,
+    }
+
+    impl FakeDouyinTransport {
+        fn new(
+            delay: Duration,
+            respond: impl Fn(DouyinPagePath, usize) -> Result<DouyinPageResponse> + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                paths: Mutex::new(Vec::new()),
+                delay,
+                respond: Box::new(respond),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+        fn paths(&self) -> Vec<DouyinPagePath> {
+            self.paths
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        }
+    }
+
+    impl DouyinPageTransport for FakeDouyinTransport {
+        fn get(
+            &self,
+            _url: &Url,
+            _referer: &str,
+            _cookie: Option<&str>,
+            path: DouyinPagePath,
+        ) -> Result<DouyinPageResponse> {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.paths
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(path);
+            if !self.delay.is_zero() {
+                thread::sleep(self.delay);
+            }
+            (self.respond)(path, index)
+        }
+    }
+
+    fn response(status: u16, body: &str) -> DouyinPageResponse {
+        DouyinPageResponse {
+            status,
+            location: None,
+            body: body.to_owned(),
+        }
+    }
+
+    fn redirect(status: u16, location: &str) -> DouyinPageResponse {
+        DouyinPageResponse {
+            status,
+            location: Some(location.to_owned()),
+            body: String::new(),
+        }
+    }
+
+    fn room_page(status: i64) -> String {
+        let room = serde_json::json!({"room":{"status":status,"title":"synthetic","stream_url":{"flv_pull_url":{"FULL_HD1":"https://pull-flv-l1.douyincdn.com/synthetic.flv"}}}});
+        let payload = format!("7:{}", serde_json::json!({"state":{"roomStore":{"roomInfo":room}}}));
+        format!(
+            "self.__pace_f.push([1,{}])</script>",
+            serde_json::to_string(&payload).unwrap()
+        )
+    }
+
+    fn shell_page() -> String {
+        let payload = format!(
+            "7:{}",
+            serde_json::json!({"state":{"roomStore":{"roomInfo":{}}}})
+        );
+        format!(
+            "self.__pace_f.push([1,{}])</script>",
+            serde_json::to_string(&payload).unwrap()
+        )
+    }
+
+    fn captcha_page() -> String {
+        "<html><title>验证码中间页</title><script src=\"sec_sdk_build/captcha/index.js\"></script></html>"
+            .to_owned()
+    }
+
+    fn adapter_kind(error: &anyhow::Error) -> Option<AdapterError> {
+        error.downcast_ref::<AdapterError>().cloned()
+    }
+
+    #[test]
+    fn douyin_room_page_tries_alternate_route_after_a_200_captcha_page() {
+        let _guard = lock_douyin_tests();
+        let transport = FakeDouyinTransport::new(Duration::ZERO, |path, _| match path {
+            DouyinPagePath::PinnedIpv4 => Ok(response(200, &captcha_page())),
+            _ => Ok(response(200, &room_page(2))),
+        });
+        let page = douyin_room_page_fresh_with(&transport, "123456", None)
+            .expect("second route must supply the real page");
+        assert!(douyin_page_has_room(&page));
+        assert_eq!(
+            transport.paths(),
+            vec![DouyinPagePath::PinnedIpv4, DouyinPagePath::Hostname]
+        );
+        // The captcha on the direct route moves the system proxy to the front of
+        // the next read, mirroring the legacy launcher.
+        assert!(DOUYIN_NEEDS_PROXY.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn douyin_room_page_classifies_exhausted_routes() {
+        let _guard = lock_douyin_tests();
+        let captcha = FakeDouyinTransport::new(Duration::ZERO, |_, _| Ok(response(200, &captcha_page())));
+        let error = douyin_room_page_fresh_with(&captcha, "123", None).unwrap_err();
+        assert!(matches!(adapter_kind(&error), Some(AdapterError::VerificationRequired)));
+        assert_eq!(captcha.calls(), 3, "at most three routes per read");
+
+        reset_douyin_fetch_state_for_test();
+        let shell = FakeDouyinTransport::new(Duration::ZERO, |_, _| Ok(response(200, &shell_page())));
+        let error = douyin_room_page_fresh_with(&shell, "123", None).unwrap_err();
+        assert!(matches!(adapter_kind(&error), Some(AdapterError::RateLimited)));
+        assert_eq!(shell.calls(), 6, "one bounded shell retry over three routes");
+        // The retry armed the risk-control cooldown: the next read must not send.
+        let after = FakeDouyinTransport::new(Duration::ZERO, |_, _| Ok(response(200, &room_page(2))));
+        let error = douyin_room_page_fresh_with(&after, "123", None).unwrap_err();
+        assert!(matches!(adapter_kind(&error), Some(AdapterError::RateLimited)));
+        assert_eq!(after.calls(), 0, "cooldown must suppress the request");
+
+        reset_douyin_fetch_state_for_test();
+        let forbidden = FakeDouyinTransport::new(Duration::ZERO, |_, _| {
+            Err(AdapterError::VerificationRequired.into())
+        });
+        let error = douyin_room_page_fresh_with(&forbidden, "123", None).unwrap_err();
+        assert!(matches!(
+            adapter_kind(&error),
+            Some(AdapterError::VerificationRequired)
+        ));
+        assert!(
+            DOUYIN_NEEDS_PROXY.load(Ordering::Acquire),
+            "an HTTP 401/403 verification response must also prefer the system proxy next time"
+        );
+
+        reset_douyin_fetch_state_for_test();
+        let network = FakeDouyinTransport::new(Duration::ZERO, |_, _| {
+            Err(AdapterError::Transport.into())
+        });
+        let error = douyin_room_page_fresh_with(&network, "123", None).unwrap_err();
+        assert!(matches!(adapter_kind(&error), Some(AdapterError::Transport)));
+        assert_eq!(network.calls(), 3);
+
+        reset_douyin_fetch_state_for_test();
+        let mixed = FakeDouyinTransport::new(Duration::ZERO, |path, _| {
+            if path == DouyinPagePath::PinnedIpv4 {
+                Ok(response(200, &captcha_page()))
+            } else {
+                Ok(response(200, &shell_page()))
+            }
+        });
+        let error = douyin_room_page_fresh_with(&mixed, "123", None).unwrap_err();
+        assert!(
+            matches!(adapter_kind(&error), Some(AdapterError::VerificationRequired)),
+            "a captcha observed on any route must offer the recovery path; the silent-refresh gate bounds the cost"
+        );
+    }
+
+    #[test]
+    fn douyin_room_page_starts_with_the_system_proxy_after_a_captcha() {
+        let _guard = lock_douyin_tests();
+        DOUYIN_NEEDS_PROXY.store(true, Ordering::Release);
+        let transport = FakeDouyinTransport::new(Duration::ZERO, |path, _| {
+            if path == DouyinPagePath::SystemProxy {
+                Ok(response(200, &room_page(2)))
+            } else {
+                Ok(response(200, &captcha_page()))
+            }
+        });
+        douyin_room_page_fresh_with(&transport, "123", None).expect("proxy route");
+        assert_eq!(transport.paths(), vec![DouyinPagePath::SystemProxy]);
+        // The legacy preference is sticky: only a verification refresh or a new
+        // credential write clears it, not a successful indirect page read.
+        assert!(DOUYIN_NEEDS_PROXY.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn douyin_offline_page_is_definitive_and_stops_the_route_loop() {
+        let _guard = lock_douyin_tests();
+        let transport = FakeDouyinTransport::new(Duration::ZERO, |path, _| {
+            if path == DouyinPagePath::PinnedIpv4 {
+                Ok(response(200, &room_page(4)))
+            } else {
+                Ok(response(200, &captcha_page()))
+            }
+        });
+        let page = douyin_room_page_fresh_with(&transport, "123", None).expect("parsed room");
+        assert!(matches!(
+            parse_douyin_page(&page, &Quality::Best)
+                .unwrap_err()
+                .downcast_ref::<AdapterError>(),
+            Some(AdapterError::Offline)
+        ));
+        assert_eq!(transport.paths(), vec![DouyinPagePath::PinnedIpv4]);
+    }
+
+    #[test]
+    fn douyin_room_page_follows_only_allowlisted_https_redirects() {
+        let _guard = lock_douyin_tests();
+        let same_host = FakeDouyinTransport::new(Duration::ZERO, |_, index| {
+            if index == 0 {
+                Ok(redirect(302, "https://live.douyin.com/123456"))
+            } else {
+                Ok(response(200, &room_page(2)))
+            }
+        });
+        assert!(douyin_room_page_fresh_with(&same_host, "123456", None).is_ok());
+        assert_eq!(same_host.calls(), 2);
+
+        reset_douyin_fetch_state_for_test();
+        let foreign = FakeDouyinTransport::new(Duration::ZERO, |_, _| {
+            Ok(redirect(302, "https://example.invalid/room"))
+        });
+        let error = douyin_room_page_fresh_with(&foreign, "123", None).unwrap_err();
+        assert!(
+            matches!(adapter_kind(&error), Some(AdapterError::InvalidResponse(_))),
+            "foreign redirect host must not be followed: {error:?}"
+        );
+
+        reset_douyin_fetch_state_for_test();
+        let http_redirect = FakeDouyinTransport::new(Duration::ZERO, |_, _| {
+            Ok(redirect(302, "http://live.douyin.com/123"))
+        });
+        let error = douyin_room_page_fresh_with(&http_redirect, "123", None).unwrap_err();
+        assert!(matches!(adapter_kind(&error), Some(AdapterError::InvalidResponse(_))));
+
+        reset_douyin_fetch_state_for_test();
+        let looping = FakeDouyinTransport::new(Duration::ZERO, |_, _| {
+            Ok(redirect(302, "https://live.douyin.com/123"))
+        });
+        let error = douyin_room_page_fresh_with(&looping, "123", None).unwrap_err();
+        assert!(matches!(adapter_kind(&error), Some(AdapterError::InvalidResponse(_))));
+    }
+
+    #[test]
+    fn douyin_shared_page_merges_concurrent_requests_and_reuses_until_expiry() {
+        let _guard = lock_douyin_tests();
+        let transport = Arc::new(FakeDouyinTransport::new(
+            Duration::from_millis(120),
+            |_, _| Ok(response(200, &room_page(2))),
+        ));
+        let worker = |transport: Arc<FakeDouyinTransport>| {
+            thread::spawn(move || douyin_room_page_shared_with(transport.as_ref(), "777", None))
+        };
+        let first = worker(Arc::clone(&transport));
+        let second = worker(Arc::clone(&transport));
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        assert_eq!(transport.calls(), 1, "same-room single flight");
+        // Short reuse serves the following status/title/avatar reads.
+        douyin_room_page_shared_with(transport.as_ref(), "777", None).unwrap();
+        assert_eq!(transport.calls(), 1);
+        // Playback resolution never reuses a page: it must read a fresh one.
+        douyin_room_page_fresh_with(transport.as_ref(), "777", None).unwrap();
+        assert_eq!(transport.calls(), 2);
+    }
+
+    #[test]
+    fn douyin_shared_page_cache_expires_and_follows_credential_changes() {
+        let _guard = lock_douyin_tests();
+        let transport = FakeDouyinTransport::new(Duration::ZERO, |_, _| Ok(response(200, &room_page(2))));
+        douyin_room_page_shared_with(&transport, "888", Some("synthetic=a")).unwrap();
+        assert_eq!(transport.calls(), 1);
+        douyin_room_page_shared_with(&transport, "888", Some("synthetic=a")).unwrap();
+        assert_eq!(transport.calls(), 1);
+        // A different credential marker (login, logout or a refreshed vault) must
+        // never reuse the previous session's page.
+        douyin_room_page_shared_with(&transport, "888", Some("synthetic=b")).unwrap();
+        assert_eq!(transport.calls(), 2);
+        invalidate_douyin_page_cache();
+        douyin_room_page_shared_with(&transport, "888", Some("synthetic=b")).unwrap();
+        assert_eq!(transport.calls(), 3);
+    }
+
+    #[test]
+    fn douyin_page_cache_ttl_is_four_seconds() {
+        let _guard = lock_douyin_tests();
+        douyin_store_page("ttl-room", "cached-page", 7, 1_000);
+        assert_eq!(
+            douyin_cached_page("ttl-room", 7, 3_000).as_deref(),
+            Some("cached-page")
+        );
+        assert_eq!(douyin_cached_page("ttl-room", 7, 5_001), None);
+        assert_eq!(douyin_cached_page("ttl-room", 8, 2_000), None);
+    }
+
+    #[test]
+    fn windows_system_proxy_parser_and_bypass_rules() {
+        assert_eq!(
+            proxy_server_for_scheme("127.0.0.1:7890", true).as_deref(),
+            Some("http://127.0.0.1:7890/")
+        );
+        assert_eq!(
+            proxy_server_for_scheme("http=1.2.3.4:80;https=5.6.7.8:8443", true).as_deref(),
+            Some("http://5.6.7.8:8443/")
+        );
+        assert_eq!(
+            proxy_server_for_scheme("http=1.2.3.4:8080;https=5.6.7.8:8443", false).as_deref(),
+            Some("http://1.2.3.4:8080/")
+        );
+        assert_eq!(proxy_server_for_scheme("socks=1.2.3.4:1080", true), None);
+        assert_eq!(proxy_server_for_scheme("127.0.0.1:0", true), None);
+        assert!(windows_proxy_bypassed(&["*".into()], "live.douyin.com"));
+        assert!(!windows_proxy_bypassed(&["<local>".into()], "live.douyin.com"));
+        assert!(windows_proxy_bypassed(&["<local>".into()], "intranet"));
+        assert!(windows_proxy_bypassed(&["*.douyin.com".into()], "live.douyin.com"));
+        assert!(windows_proxy_bypassed(&["10.*".into()], "10.1.2.3"));
+        assert!(!windows_proxy_bypassed(&["*.example.com".into()], "live.douyin.com"));
+    }
+
+    /// Explicit live acceptance for the system-proxy connection route (opt-in):
+    /// real Windows Internet Settings, real proxy, real Douyin page. Ignored by
+    /// default so the offline suite never reads the user's proxy configuration or
+    /// contacts the platform. Run with:
+    ///   LIVE_HUB_ACCEPT_DOUYIN_PROXY_ROOM=<web_rid> cargo test --lib \
+    ///     live_system_proxy_room_page_acceptance -- --ignored
+    #[test]
+    #[ignore = "uses the real Windows system proxy and the real Douyin site"]
+    fn live_system_proxy_room_page_acceptance() {
+        let Ok(room) = std::env::var("LIVE_HUB_ACCEPT_DOUYIN_PROXY_ROOM") else {
+            return;
+        };
+        let url = Url::parse(&format!("https://live.douyin.com/{room}")).expect("room url");
+        let client = endpoint_client_system_proxy(&url).expect("system proxy route available");
+        let cookie = douyin_page_cookie(&url, None).expect("page cookie");
+        let mut request = client
+            .get(url.clone())
+            .header("User-Agent", DOUYIN_USER_AGENT)
+            .header("Referer", "https://live.douyin.com/")
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header("Accept-Language", "zh-CN,zh;q=0.9");
+        if let Some(value) = cookie {
+            request = request.header("Cookie", value);
+        }
+        let response = request.send().expect("proxy request");
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_response(response).expect("page body");
+        assert!(body.len() > 1000, "unexpected page length {}", body.len());
+        assert!(
+            douyin_page_has_room(&body) || douyin_page_is_captcha(&body),
+            "system-proxy page is neither a room page nor the captcha interstitial"
+        );
+    }
+
+    #[test]
+    fn douyin_captcha_detection_only_runs_when_no_room_was_found() {
+        let _guard = lock_douyin_tests();
+        assert_eq!(classify_douyin_page(&room_page(2)), DouyinPageClass::Room);
+        assert_eq!(classify_douyin_page(&shell_page()), DouyinPageClass::Shell);
+        assert_eq!(classify_douyin_page(&captcha_page()), DouyinPageClass::Captcha);
+        assert_eq!(classify_douyin_page("<html>unexpected</html>"), DouyinPageClass::Unknown);
+        // A large format-change page that merely mentions captcha/verify in its
+        // scripts must not be read as a captcha page (that would open a browser).
+        let large_format_change = format!(
+            "<html>{}{}</html>",
+            "x".repeat(30_000),
+            "<script>verifyFp captcha</script>"
+        );
+        assert_eq!(
+            classify_douyin_page(&large_format_change),
+            DouyinPageClass::Unknown
+        );
+        // Regression: a real room page carries captcha SDK strings in its scripts.
+        let room_with_script = format!(
+            "<script>sec_sdk_build/captcha/index.js verifyFp</script>{}",
+            room_page(2)
+        );
+        assert_eq!(classify_douyin_page(&room_with_script), DouyinPageClass::Room);
     }
 }

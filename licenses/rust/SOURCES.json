@@ -74,6 +74,61 @@
       ]
     },
     {
+      "name": "aho-corasick",
+      "version": "1.1.5",
+      "license": "Unlicense OR MIT",
+      "repository": "https://github.com/BurntSushi/aho-corasick",
+      "revision": "5178060ce73d91938f8582d0360e3be031380440",
+      "files": [
+        {
+          "path": "aho-corasick-1.1.5/COPYING",
+          "sourcePath": "COPYING",
+          "sha256": "01c266bced4a434da0051174d6bee16a4c82cf634e2679b6155d40d75012390f"
+        },
+        {
+          "path": "aho-corasick-1.1.5/LICENSE-MIT",
+          "sourcePath": "LICENSE-MIT",
+          "sha256": "0f96a83840e146e43c0ec96a22ec1f392e0680e6c1226e6f3ba87e0740af850f"
+        },
+        {
+          "path": "aho-corasick-1.1.5/UNLICENSE",
+          "sourcePath": "UNLICENSE",
+          "sha256": "7e12e5df4bae12cb21581ba157ced20e1986a0508dd10d0e8a4ab9a4cf94e85c"
+        }
+      ]
+    },
+    {
+      "name": "alloc-no-stdlib",
+      "version": "2.0.4",
+      "license": "BSD-3-Clause",
+      "repository": "https://github.com/dropbox/rust-alloc-no-stdlib",
+      "revision": "6032b6a9b20e03737135c55a0270ccffcc1438ef",
+      "files": [
+        {
+          "path": "alloc-no-stdlib-2.0.4/LICENSE",
+          "sourcePath": "LICENSE",
+          "sha256": "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae"
+        }
+      ]
+    },
+    {
+      "name": "alloc-stdlib",
+      "version": "0.2.4",
+      "license": "BSD-3-Clause",
+      "repository": "https://github.com/dropbox/rust-alloc-no-stdlib",
+      "revision": "ae42d22078b98549e987d2f03d12df7b984fde47",
+      "files": [
+        {
+          "path": "alloc-stdlib-0.2.4/upstream/dropbox-rust-alloc-no-stdlib-ae42d22078b9/LICENSE",
+          "sourcePath": "LICENSE",
+          "upstreamRepository": "dropbox/rust-alloc-no-stdlib",
+          "snapshotRevision": "ae42d22078b98549e987d2f03d12df7b984fde47",
+          "snapshotNote": "alloc-stdlib 0.2.4 omits the repository LICENSE; snapshot taken from the crate's recorded VCS revision (path_in_vcs=alloc-stdlib).",
+          "sha256": "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae"
+        }
+      ]
+    },
+    {
       "name": "anstream",
       "version": "1.0.0",
       "license": "MIT OR Apache-2.0",
@@ -345,6 +400,39 @@
       ]
     },
     {
+      "name": "brotli",
+      "version": "8.0.4",
+      "license": "BSD-3-Clause AND MIT",
+      "repository": "https://github.com/dropbox/rust-brotli",
+      "revision": "9651aa3ebfd23be83ca14d914fba2d7c12b32d2f",
+      "files": [
+        {
+          "path": "brotli-8.0.4/LICENSE.BSD-3-Clause",
+          "sourcePath": "LICENSE.BSD-3-Clause",
+          "sha256": "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae"
+        },
+        {
+          "path": "brotli-8.0.4/LICENSE.MIT",
+          "sourcePath": "LICENSE.MIT",
+          "sha256": "3d180008e36922a4e8daec11c34c7af264fed5962d07924aea928c38e8663c94"
+        }
+      ]
+    },
+    {
+      "name": "brotli-decompressor",
+      "version": "5.0.3",
+      "license": "BSD-3-Clause/MIT",
+      "repository": "https://github.com/dropbox/rust-brotli-decompressor",
+      "revision": "b56177b8eb3d2440536281397e5ffe06eedf1a5c",
+      "files": [
+        {
+          "path": "brotli-decompressor-5.0.3/LICENSE",
+          "sourcePath": "LICENSE",
+          "sha256": "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae"
+        }
+      ]
+    },
+    {
       "name": "bytemuck",
       "version": "1.25.2",
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -567,6 +655,20 @@
           "snapshotRevision": "ed27008ae5d1f10cfbb266de039f0fb35fd05a56",
           "snapshotNote": null,
           "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+        }
+      ]
+    },
+    {
+      "name": "color_quant",
+      "version": "1.1.0",
+      "license": "MIT",
+      "repository": "https://github.com/image-rs/color_quant.git",
+      "revision": "6c302d2d1540496584476d513dd75b815f14e7a1",
+      "files": [
+        {
+          "path": "color_quant-1.1.0/LICENSE",
+          "sourcePath": "LICENSE",
+          "sha256": "592dc80f1a865d20d61a2006a2d29ce34a2bc28cd7e868ab300fdeed6da154ca"
         }
       ]
     },
@@ -1304,6 +1406,25 @@
           "path": "getrandom-0.4.3/LICENSE-MIT",
           "sourcePath": "LICENSE-MIT",
           "sha256": "523a42c25d245dde9c015f882cec7f4555aad883382a6cf19b4b7d9b2cd5419b"
+        }
+      ]
+    },
+    {
+      "name": "gif",
+      "version": "0.14.2",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/image-rs/image-gif",
+      "revision": "a0127e2acbef333398414bb61d097c19c1b09d8a",
+      "files": [
+        {
+          "path": "gif-0.14.2/LICENSE-APACHE",
+          "sourcePath": "LICENSE-APACHE",
+          "sha256": "769f80b5bcb42ed0af4e4d2fd74e1ac9bf843cb80c5a29219d1ef3544428a6bb"
+        },
+        {
+          "path": "gif-0.14.2/LICENSE-MIT",
+          "sourcePath": "LICENSE-MIT",
+          "sha256": "77257f3d2181236b1aee78920238062ae64efe13c5d858b2db126e79c9e1b14f"
         }
       ]
     },
@@ -2485,6 +2606,68 @@
           "path": "raw-window-handle-0.6.2/LICENSE-ZLIB.md",
           "sourcePath": "LICENSE-ZLIB.md",
           "sha256": "ae895c8576e682f310fb70d93d9f99b1dd82872094c54a8f6cdfe2ca5c2d6ecb"
+        }
+      ]
+    },
+    {
+      "name": "regex",
+      "version": "1.13.1",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/rust-lang/regex",
+      "revision": "2b527599eb9eea0dcc288c704584f242f26a5c61",
+      "files": [
+        {
+          "path": "regex-1.13.1/LICENSE-APACHE",
+          "sourcePath": "LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "path": "regex-1.13.1/LICENSE-MIT",
+          "sourcePath": "LICENSE-MIT",
+          "sha256": "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb"
+        }
+      ]
+    },
+    {
+      "name": "regex-automata",
+      "version": "0.4.18",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/rust-lang/regex",
+      "revision": "e6ad938198e68339a593f85d228f2d44cb54718f",
+      "files": [
+        {
+          "path": "regex-automata-0.4.18/LICENSE-APACHE",
+          "sourcePath": "LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "path": "regex-automata-0.4.18/LICENSE-MIT",
+          "sourcePath": "LICENSE-MIT",
+          "sha256": "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb"
+        }
+      ]
+    },
+    {
+      "name": "regex-syntax",
+      "version": "0.8.11",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/rust-lang/regex",
+      "revision": "140167995737fa11dfe11b8af8b9aa143b790b4e",
+      "files": [
+        {
+          "path": "regex-syntax-0.8.11/LICENSE-APACHE",
+          "sourcePath": "LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+        },
+        {
+          "path": "regex-syntax-0.8.11/LICENSE-MIT",
+          "sourcePath": "LICENSE-MIT",
+          "sha256": "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb"
+        },
+        {
+          "path": "regex-syntax-0.8.11/src/unicode_tables/LICENSE-UNICODE",
+          "sourcePath": "src/unicode_tables/LICENSE-UNICODE",
+          "sha256": "74db5baf44a41b1000312c673544b3374e4198af5605c7f9080a402cec42cfa3"
         }
       ]
     },

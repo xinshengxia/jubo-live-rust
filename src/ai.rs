@@ -231,13 +231,13 @@ pub fn request_body(
 ) -> Result<Value> {
     config.validate()?;
     ensure!(
-        !query.trim().is_empty() && query.chars().count() <= 200,
-        "AI查询应为1–200字"
+        !query.trim().is_empty() && query.chars().count() <= 512,
+        "AI查询及补充线索合计应为1–512字"
     );
     let hints:Vec<_>=existing.iter().take(40).map(|c|json!({"platform":c.platform,"name":c.name,"room":c.room,"profile_url":c.profile_url})).collect();
     Ok(
         json!({"model":config.model,"max_tokens":config.max_tokens,"thinking":{"type":"disabled"},"stream":false,
-        "system":"你是直播主播身份研究助手。只根据原生web_search结果提供线索，保留同名账号歧义，不猜测数字房间号。只返回JSON：{summary:string,candidates:[{platform:bili|huya|douyu|douyin,name:string,room:string,source_url:官方直播间或抖音账号主页URL}],terms:[string]}。source_url必须实际出现在搜索结果。候选只是线索，客户端会独立查询平台核验，不自动收藏或播放。",
+        "system":"你是直播主播身份研究助手。只根据原生web_search结果提供线索，保留同名账号歧义，不猜测数字房间号。只返回JSON：{summary:string,candidates:[{platform:bili|huya|douyu|douyin,name:string,room:string,source_url:官方直播间或抖音账号主页URL,reason:有来源支持的匹配意见}],terms:[string]}。source_url必须实际出现在搜索结果。候选只是线索，客户端会独立查询平台核验，不自动收藏或播放。",
         "messages":[{"role":"user","content":[{"type":"text","text":serde_json::to_string(&json!({"query":query,"mode":if optimize{"优化并核对现有候选"}else{"重新搜索真实平台账号"},"existing_candidates":hints}))?}]}],
         "tools":[{"type":"web_search_20250305","name":"web_search","max_uses":5}]}),
     )
@@ -373,24 +373,41 @@ pub fn parse_response(
             if !seen.insert((platform, target.room.clone())) {
                 continue;
             }
-            if optimize {
-                if let Some(native) = existing
+            let source = crate::platforms::LookupSource {
+                url: address.to_string(), title: "AI研究引用（待平台核验）".into(),
+                excerpt: row["reason"].as_str().unwrap_or("").chars().take(1000).collect(),
+                ..Default::default()
+            };
+            let mut candidate = if optimize {
+                // Optimising only re-ranks and annotates candidates the platform
+                // search already returned; an unknown room is not appended here
+                // because the caller keeps its own verified list.
+                let Some(native) = existing
                     .iter()
                     .find(|native| native.platform == platform && native.room == target.room)
-                {
-                    candidates.push(native.clone());
+                    .cloned()
+                else {
+                    continue;
+                };
+                native
+            } else {
+                // A cited official room address becomes a direct-room candidate:
+                // "input" selects the same verification path as a pasted link so
+                // the AI citation is checked against the platform page, and the
+                // canonical page is what verification/selection compares.
+                LookupCandidate {
+                    name,
+                    room: target.room.clone(),
+                    platform,
+                    profile_url: Some(crate::search::room_input_url(platform, &target.room)),
+                    provider: "input".into(),
+                    ..Default::default()
                 }
-                continue;
-            }
-            candidates.push(LookupCandidate {
-                name,
-                room: target.room,
-                platform,
-                profile_url: Some(address.to_string()),
-                ..Default::default()
-            });
-        } else if !optimize
-            && platform == Platform::Douyin
+            };
+            if !source.excerpt.is_empty() { candidate.match_reasons.push(format!("AI匹配意见（需核对）：{}", source.excerpt)); }
+            if !candidate.sources.iter().any(|old| old.url == source.url) { candidate.sources.push(source); }
+            candidates.push(candidate);
+        } else if platform == Platform::Douyin
             && address.host_str() == Some("www.douyin.com")
         {
             if let Some(sec) = address.path().strip_prefix("/user/").filter(|s| {
@@ -399,10 +416,21 @@ pub fn parse_response(
                     && s.bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
             }) {
+                let profile_url = format!("https://www.douyin.com/user/{sec}");
                 candidates.push(LookupCandidate {
                     name,
                     platform,
-                    profile_url: Some(format!("https://www.douyin.com/user/{sec}")),
+                    profile_url: Some(profile_url.clone()),
+                    sec_uid: Some(sec.to_owned()),
+                    provider: "input".into(),
+                    match_reasons: vec!["AI引用的抖音账号主页；直播间归属待平台核验".into()],
+                    sources: vec![crate::platforms::LookupSource {
+                        url: profile_url,
+                        title: "AI研究引用（抖音账号页）".into(),
+                        excerpt: row["reason"].as_str().unwrap_or("").chars().take(1000).collect(),
+                        retrieved_at: crate::platforms::retrieval_timestamp(),
+                        supports: vec!["账号身份".into()],
+                    }],
                     ..Default::default()
                 });
             }

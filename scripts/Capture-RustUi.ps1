@@ -32,12 +32,12 @@
   Reuse <TargetDirectory>/debug/live-hub-rust.exe instead of building first.
 
 .EXAMPLE
-  pwsh -NoProfile -File scripts/Capture-RustUi.ps1 -ToolchainRoot '<toolchain>' -TargetDirectory $env:LIVE_HUB_BUILD_DIR -OutputDirectory 'D:\captures\rust-ui'
+  pwsh -NoProfile -File scripts/Capture-RustUi.ps1 -ToolchainRoot <toolchain> -TargetDirectory <ascii-target>
 #>
 [CmdletBinding()]
 param(
     [string]$ToolchainRoot = $env:LIVE_HUB_RUST_TOOLCHAIN,
-    [string]$TargetDirectory = $env:LIVE_HUB_BUILD_DIR,
+    [string]$TargetDirectory = '',
     [string]$Exe,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [string]$DataDirectory,

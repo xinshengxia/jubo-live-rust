@@ -12,6 +12,31 @@
 //!   (danmaku-7-emoji.cs). No platform or font artwork is bundled: the sheet
 //!   remains an externally generated local asset and the text fallback is used
 //!   when it is absent.
+//!
+//! Emote capability boundary (compared 2026-11-07 against the legacy C#
+//! implementation; no live platform was contacted for this review):
+//!
+//! - **Room-scoped dictionaries**: B站's `GetEmoticons?platform=pc&room_id=…`
+//!   is fetched per connection in `danmaku.rs` with the real room id, matching
+//!   the legacy client (the dictionary is per room because B站 has room-only
+//!   emote packages). Douyin uses the platform-wide `emoji/list` endpoint in
+//!   both implementations; neither codebase contains a room-scoped Douyin emote
+//!   endpoint, so none is assumed here.
+//! - **Dynamic / server-pushed emote packages**: the legacy Huya client asks the
+//!   platform for its `getExpressionEmoticonPackage` WUP package over the
+//!   danmaku long connection (Tars command 2) and logs the separate
+//!   `getExpressionEmoticonNotice` channel; the Rust Huya receiver still uses
+//!   only its bundled 39-entry fallback. That gap lives in `danmaku_huya.rs`
+//!   (outside this module) and needs the Tars layout plus a live capture — it
+//!   must not be guessed into `EmoticonDictionary`.
+//! - **Animation**: neither implementation animates an emote. The legacy
+//!   decoders return frame 0 (the built-in VP8L path is inherently one frame and
+//!   the WIC fallback takes `Frames[0]`), and `images::decode` here also
+//!   decodes one static frame. Bounded container-size validation is shared, so
+//!   this is capability parity, not a regression; animated emotes must not be
+//!   advertised as supported.
+//! - **URL policy**: every remote emote URL still passes `images::approved_url`
+//!   before any request, and no platform image bytes are bundled.
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -335,7 +360,9 @@ impl EmoticonDictionary {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.by_code.iter().map(|(code, url)| (code.as_str(), url.as_str()))
+        self.by_code
+            .iter()
+            .map(|(code, url)| (code.as_str(), url.as_str()))
     }
 
     fn note_unknown(&mut self, code: &str) {
@@ -1201,7 +1228,8 @@ mod emoji_sheet_contract {
         assert_eq!(manifest.cell, 40);
         assert_eq!(manifest.columns, 48);
         assert_eq!(manifest.plain_count, 3114);
-        let expected_total = manifest.plain_count + 714 + manifest.flag_count + manifest.sequence_count;
+        let expected_total =
+            manifest.plain_count + 714 + manifest.flag_count + manifest.sequence_count;
         let needed_rows = expected_total.div_ceil(manifest.columns);
         let width = manifest.columns * manifest.cell;
         let height = needed_rows * manifest.cell;
@@ -1228,9 +1256,15 @@ mod emoji_sheet_contract {
         let plain = manifest.cell_for(0x2764, false).expect("plain heart");
         let variant = manifest.cell_for(0x2764, true).expect("variant heart");
         assert_ne!(plain, variant);
-        assert!(variant.1 > plain.1, "variant block starts after the plain block");
+        assert!(
+            variant.1 > plain.1,
+            "variant block starts after the plain block"
+        );
         // A codepoint outside the VS ranges falls back to its plain cell.
-        assert_eq!(manifest.cell_for(0x1F389, true), manifest.cell_for(0x1F389, false));
+        assert_eq!(
+            manifest.cell_for(0x1F389, true),
+            manifest.cell_for(0x1F389, false)
+        );
     }
 
     #[test]
@@ -1239,10 +1273,7 @@ mod emoji_sheet_contract {
         let bytes = asset_bytes("emoji-sheet.png");
         let image = image::load_from_memory(&bytes).expect("png decodes");
         assert_eq!(image.width(), manifest.columns * manifest.cell);
-        let total = manifest.plain_count
-            + 714
-            + manifest.flag_count
-            + manifest.sequence_count;
+        let total = manifest.plain_count + 714 + manifest.flag_count + manifest.sequence_count;
         let rows = total.div_ceil(manifest.columns);
         assert_eq!(image.height(), rows * manifest.cell);
 

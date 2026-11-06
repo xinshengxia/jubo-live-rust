@@ -40,15 +40,8 @@ fn anonymous_douyin_room_resolve_and_danmaku_handshake() {
     let target = Target::parse(&format!("douyin:{room}")).expect("synthetic target parse");
     let resolved = live_hub_rust::platforms::resolve(&target, &Settings::default())
         .expect("anonymous Douyin room resolve must return a media address");
-    assert!(
-        resolved.url.starts_with("https://"),
-        "unexpected media scheme: {}",
-        resolved.url
-    );
-    assert!(
-        !resolved.title.is_empty(),
-        "resolve should carry the real room title"
-    );
+    assert!(resolved.url.starts_with("https://"), "unexpected media scheme: {}", resolved.url);
+    assert!(!resolved.title.is_empty(), "resolve should carry the real room title");
     eprintln!("resolved title: {}", resolved.title);
 
     let (sender, receiver) = danmaku::bounded_channel(512);
@@ -80,12 +73,6 @@ fn anonymous_douyin_room_resolve_and_danmaku_handshake() {
     cancellation.cancel();
     let result = worker.join().expect("danmaku worker panicked");
     eprintln!("statuses: {statuses:?}; chat messages observed: {messages}");
-    assert!(
-        connected,
-        "anonymous Webcast handshake never reported 已连接: {statuses:?}"
-    );
-    assert!(
-        result.is_ok(),
-        "danmaku worker failed after cancel: {result:?}"
-    );
+    assert!(connected, "anonymous Webcast handshake never reported 已连接: {statuses:?}");
+    assert!(result.is_ok(), "danmaku worker failed after cancel: {result:?}");
 }

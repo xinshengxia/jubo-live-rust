@@ -1,8 +1,9 @@
 use anyhow::Result;
 use live_hub_rust::{
     core::ResolvedStream,
+    diag,
     flv::{self, FlvTag},
-    relay::{RelayConfig, RelayServer},
+    relay::{RelayConfig, RelayServer, ResolveWaiting},
 };
 use std::collections::BTreeMap;
 use std::io::{BufRead, Read, Write};
@@ -345,6 +346,52 @@ fn production_policy_rejects_private_upstream_without_connecting() {
 }
 
 #[test]
+fn literal_private_media_address_is_policy_rejected_with_redacted_statistics_and_log() {
+    // The old code required a fixed CDN family and upgraded http; the new policy
+    // accepts unknown public families (proved by the unit-level DNS tests) but a
+    // literal private address must still be refused before any connection. The
+    // recorded diagnostics name only rule/stage/host — never the signed URL.
+    let directory = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.allow_loopback_fixture = false;
+    cfg.max_reconnects = 0;
+    cfg.idle_timeout = Duration::from_secs(1);
+    cfg.log_dir = Some(directory.path().join("logs"));
+    let signed = "https://127.0.0.1:9/synthetic.flv?token=SIGNED_SYNTHETIC_PLACEHOLDER";
+    let (address, relay, calls) = start(cfg, signed.into());
+    let (header, body) = response(player(address, "synthetic-session"));
+    assert!(header.starts_with("HTTP/1.1 200"), "{header}");
+    assert!(body.is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let control = format!("http://{address}/live.flv?t=synthetic-session");
+    let stats = live_hub_rust::relay::query_statistics(&control).unwrap();
+    assert_eq!(stats.policy_rejections, 1);
+    let reject = stats
+        .last_policy_reject
+        .as_ref()
+        .expect("policy rejection recorded");
+    assert_eq!(reject.rule, "media-host-literal-private");
+    assert_eq!(reject.stage, "initial");
+    assert_eq!(reject.host.as_deref(), Some("127.0.0.1"));
+    relay.join().unwrap().unwrap();
+
+    let path = diag::log_path(&directory.path().join("logs"), "relay");
+    let text = std::fs::read_to_string(&path).expect("relay log");
+    assert!(text.contains("rule=media-host-literal-private"), "{text}");
+    assert!(text.contains("stage=initial"), "{text}");
+    assert!(text.contains("host=127.0.0.1"), "{text}");
+    assert!(
+        !text.contains("SIGNED_SYNTHETIC_PLACEHOLDER"),
+        "signed query leaked: {text}"
+    );
+    assert!(
+        !text.to_ascii_lowercase().contains("https://"),
+        "media URL leaked: {text}"
+    );
+}
+
+#[test]
 fn upstream_redirect_to_loopback_is_never_followed_even_in_fixture_mode() {
     let destination = TcpListener::bind("127.0.0.1:0").unwrap();
     destination.set_nonblocking(true).unwrap();
@@ -378,6 +425,152 @@ fn upstream_redirect_to_loopback_is_never_followed_even_in_fixture_mode() {
         std::io::ErrorKind::WouldBlock
     );
     relay.join().unwrap().unwrap();
+}
+
+#[test]
+fn verification_wait_keeps_the_player_connection_without_consuming_the_retry_budget() {
+    // The resolver first reports Douyin's post-refresh verification wait, then
+    // succeeds. The relay must treat the wait as a known room state: keep the player
+    // connection open, not count a failed media segment (max_reconnects = 0 would
+    // close the session immediately), and resolve again only after the clamped
+    // retry window (the 1 ms request is clamped up to 1 s).
+    let (url, upstream) = upstream(vec![fixture(&[
+        (9, 0, &[0x17, 0, 3]),
+        (9, 1000, &[0x27, 1, 7]),
+    ])]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let resolver = Arc::new(move || -> Result<ResolvedStream> {
+        let index = observed.fetch_add(1, Ordering::SeqCst);
+        if index == 0 {
+            return Err(ResolveWaiting {
+                state: "verification".into(),
+                retry_after: Duration::from_millis(1),
+            }
+            .into());
+        }
+        Ok(ResolvedStream {
+            url: url.clone(),
+            headers: BTreeMap::new(),
+            title: "Synthetic".into(),
+        })
+    });
+    let mut cfg = config();
+    cfg.max_reconnects = 0;
+    cfg.retry_delay = Duration::from_millis(5);
+    let server = RelayServer::bind(cfg, resolver).unwrap();
+    let address = server.local_addr().unwrap();
+    let relay = thread::spawn(move || server.run());
+    let started = Instant::now();
+    let (header, body) = response(player(address, "synthetic-session"));
+    let elapsed = started.elapsed();
+    assert!(header.starts_with("HTTP/1.1 200"), "{header}");
+    assert!(
+        !body.is_empty(),
+        "the verification wait must not close the player stream"
+    );
+    let mut cursor = std::io::Cursor::new(body);
+    assert_eq!(flv::read_header(&mut cursor).unwrap(), HEADER);
+    let tag = flv::read_tag(&mut cursor).unwrap().expect("forwarded tag");
+    assert_eq!(tag.kind(), 9);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the relay must resolve once more after the wait"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "retry_after must be clamped up to one second, waited only {elapsed:?}"
+    );
+    relay.join().unwrap().unwrap();
+    upstream.join().unwrap();
+}
+
+#[test]
+fn player_disconnect_during_a_blocked_resolve_closes_the_connection_without_waiting() {
+    // Douyin's silent verification refresh can block resolver.resolve() for up to
+    // ~25 s and has no cancellation handle. A player that closes during that window
+    // must still release the relay connection promptly: the resolver runs on a
+    // worker, the connection thread keeps polling the player socket, and the
+    // worker's eventual result is discarded instead of streaming to a gone player.
+    let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+    destination.set_nonblocking(true).unwrap();
+    let resolved_url = format!(
+        "http://{}/never-requested",
+        destination.local_addr().unwrap()
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let resolver = Arc::new(move || -> Result<ResolvedStream> {
+        observed.fetch_add(1, Ordering::SeqCst);
+        thread::sleep(Duration::from_secs(3));
+        Ok(ResolvedStream {
+            url: resolved_url.clone(),
+            headers: BTreeMap::new(),
+            title: "Synthetic".into(),
+        })
+    });
+    let mut cfg = config();
+    cfg.max_reconnects = 0;
+    let server = RelayServer::bind(cfg, resolver).unwrap();
+    let address = server.local_addr().unwrap();
+    let relay = thread::spawn(move || server.run());
+    let mut stream = player(address, "synthetic-session");
+    // The streaming response header is emitted before the first resolve call.
+    let mut header = Vec::new();
+    let mut byte = [0];
+    while !header.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).unwrap();
+        header.push(byte[0]);
+    }
+    assert!(
+        String::from_utf8(header).unwrap().starts_with("HTTP/1.1 200"),
+        "relay did not start the streaming response"
+    );
+    thread::sleep(Duration::from_millis(100));
+    let disconnected = Instant::now();
+    stream.shutdown(Shutdown::Write).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut sink = [0u8; 64];
+    loop {
+        match stream.read(&mut sink) {
+            Ok(0) => break,
+            Ok(count) => panic!(
+                "relay wrote {count} byte(s) to a disconnected player before closing"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+            Err(error) => panic!("player read failed: {error}"),
+        }
+    }
+    assert!(
+        disconnected.elapsed() < Duration::from_secs(1),
+        "connection took {:?} to close; it waited for the blocked resolver",
+        disconnected.elapsed()
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the resolver must have been called once on its worker"
+    );
+    // The server keeps running until its idle deadline; it must stop cleanly while
+    // the worker is still sleeping.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !relay.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        relay.is_finished(),
+        "relay server did not stop after the player disconnected"
+    );
+    relay.join().unwrap().unwrap();
+    // The discarded resolver result must never open the upstream connection.
+    assert_eq!(
+        destination.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "a discarded resolve result must not dial the upstream"
+    );
 }
 
 #[test]
@@ -428,9 +621,14 @@ fn relay_forwards_only_approved_headers_and_rejects_credentials_before_connectin
         .recv_timeout(Duration::from_secs(2))
         .unwrap()
         .to_ascii_lowercase();
+    // The fixture URL is plain http and this listener answers it: if the relay
+    // upgraded the initial address to https the capture would see a TLS
+    // ClientHello instead of an HTTP request. User-Agent is always forwarded;
+    // Referer survives on the initial host; Origin is never forwarded to a media
+    // request; no credential header can appear.
     assert!(request.contains("user-agent: synthetic-ua"));
     assert!(request.contains("referer: https://example.invalid/"));
-    assert!(request.contains("origin: https://example.invalid"));
+    assert!(!request.contains("origin:"));
     assert!(!request.contains("cookie:"));
     assert!(!request.contains("authorization:"));
     upstream.join().unwrap();

@@ -1,7 +1,7 @@
 //! Offline contract tests for danmaku_rules (filter / highlight / pin).
 
 use live_hub_rust::danmaku::{DanmakuMessage, DanmakuMode};
-use live_hub_rust::danmaku_rules::{compile, parse_rule, Matcher, RuleErrorKind, SimpleRegex};
+use live_hub_rust::danmaku_rules::{Matcher, RuleErrorKind, SimpleRegex, compile, parse_rule};
 
 fn msg(text: &str, user: &str, user_id: u64) -> DanmakuMessage {
     DanmakuMessage {
@@ -55,15 +55,41 @@ fn highlight_and_pin_verdict_precedence() {
 }
 
 #[test]
-fn regex_rules_use_bounded_subset_and_report_bad_patterns() {
-    let rules = compile(&["re:^a.c*$".into(), "re:[0-9]+".into()], &[], &[]);
+fn regex_rules_use_the_linear_engine_and_report_bad_patterns() {
+    // The `regex` crate replaced the old hand-written subset: groups,
+    // alternation, classes, repetitions and \d-style escapes now behave like
+    // the legacy .NET patterns instead of being rejected or read as literals.
+    let rules = compile(
+        &[
+            "re:^a.c*$".into(),
+            "re:[0-9]+".into(),
+            "re:(foo|bar)!".into(),
+        ],
+        &[],
+        &[],
+    );
+    assert!(rules.errors.is_empty());
     assert!(rules.verdict(&msg("abc", "u", 1)).blocked);
     assert!(rules.verdict(&msg("房间123", "u", 1)).blocked);
+    assert!(rules.verdict(&msg("say foo!", "u", 1)).blocked);
     assert!(!rules.verdict(&msg("xyz", "u", 1)).blocked);
 
-    let broken = compile(&["re:(a|b)".into(), "re:[abc".into(), "re:".into()], &[], &[]);
+    // Malformed syntax and backtracking-only constructs are reported instead of
+    // being silently interpreted as literal text.
+    let broken = compile(
+        &["re:[abc".into(), "re:".into(), "re:(?=a)".into()],
+        &[],
+        &[],
+    );
     assert_eq!(broken.errors.len(), 3);
+    assert_eq!(broken.errors[0].kind, RuleErrorKind::InvalidRegex);
+    assert_eq!(broken.errors[2].kind, RuleErrorKind::UnsupportedRegex);
     assert!(broken.blocked_keywords.is_empty());
+
+    // `\d` is a digit class now; the old subset matched a literal "d".
+    let digits = compile(&["re:^\\d+$".into()], &[], &[]);
+    assert!(digits.verdict(&msg("123", "u", 1)).blocked);
+    assert!(!digits.verdict(&msg("ddd", "u", 1)).blocked);
 }
 
 #[test]

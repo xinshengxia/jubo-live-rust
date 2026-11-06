@@ -13,8 +13,8 @@
 
 use super::*;
 
-pub(super) use super::theme::{Palette, blend, font, font_bold as bold, with_alpha};
 use super::theme::{self, ts};
+pub(super) use super::theme::{Palette, blend, font, font_bold as bold, with_alpha};
 use eframe::egui::{
     Align2, Color32, FontId, Id, Painter, Rect, Response, Sense, Stroke, StrokeKind, TextureHandle,
     Ui, Vec2, pos2, vec2,
@@ -75,7 +75,13 @@ pub(super) fn text_in(
 }
 
 /// Paint a wrapped text block (used for hints that must not clip).
-pub(super) fn wrap_text(painter: &Painter, rect: Rect, text: impl ToString, font: FontId, color: Color32) {
+pub(super) fn wrap_text(
+    painter: &Painter,
+    rect: Rect,
+    text: impl ToString,
+    font: FontId,
+    color: Color32,
+) {
     let painter = painter.with_clip_rect(rect);
     let galley = painter.layout(text.to_string(), font, color, rect.width());
     painter.galley(rect.left_top(), galley, color);
@@ -114,7 +120,13 @@ pub(super) fn hline(painter: &Painter, rect: Rect, y: f32, color: Color32) {
 /// LinearGradientBrush; at 64px high the angle is visually vertical, so a
 /// scanline gradient reproduces it. Only the two top corners are rounded: the
 /// cover continues into the card body below.
-pub(super) fn gradient_cover(painter: &Painter, rect: Rect, radius: f32, top: Color32, bottom: Color32) {
+pub(super) fn gradient_cover(
+    painter: &Painter,
+    rect: Rect,
+    radius: f32,
+    top: Color32,
+    bottom: Color32,
+) {
     let corner = if radius > 0.0 {
         egui::CornerRadius {
             nw: radius as u8,
@@ -176,7 +188,10 @@ pub(super) fn draw_glyph(painter: &Painter, rect: Rect, glyph: Glyph, color: Col
     let stroke = Stroke::new(width.max(1.0), color);
     let line = |a: (f32, f32), b: (f32, f32)| {
         painter.line_segment(
-            [pos2(x + a.0 * size, y + a.1 * size), pos2(x + b.0 * size, y + b.1 * size)],
+            [
+                pos2(x + a.0 * size, y + a.1 * size),
+                pos2(x + b.0 * size, y + b.1 * size),
+            ],
             stroke,
         );
     };
@@ -194,8 +209,8 @@ pub(super) fn draw_glyph(painter: &Painter, rect: Rect, glyph: Glyph, color: Col
         Glyph::Favorites => {
             let mut points = Vec::new();
             for index in 0..10 {
-                let angle = -std::f32::consts::FRAC_PI_2
-                    + index as f32 * std::f32::consts::PI / 5.0;
+                let angle =
+                    -std::f32::consts::FRAC_PI_2 + index as f32 * std::f32::consts::PI / 5.0;
                 let radius = size * if index % 2 == 0 { 0.43 } else { 0.20 };
                 points.push(pos2(
                     x + center + angle.cos() * radius,
@@ -266,8 +281,7 @@ pub(super) fn draw_glyph(painter: &Painter, rect: Rect, glyph: Glyph, color: Col
             painter.circle_stroke(pos2(x + size * 0.50, y + size * 0.28), size * 0.16, stroke);
             let shoulders: Vec<egui::Pos2> = (0..=16)
                 .map(|step| {
-                    let angle =
-                        std::f32::consts::PI + step as f32 * std::f32::consts::PI / 16.0;
+                    let angle = std::f32::consts::PI + step as f32 * std::f32::consts::PI / 16.0;
                     pos2(
                         x + size * 0.50 + angle.cos() * size * 0.36,
                         y + size * 0.95 + angle.sin() * size * 0.36,
@@ -384,25 +398,50 @@ pub(super) enum Btn {
     Tab,
 }
 
-pub(super) fn button(ui: &mut Ui, rect: Rect, text: &str, kind: Btn, pal: &Pal, enabled: bool) -> Response {
-    let id = ui.id().with(("wb-button", rect.left() as i32, rect.top() as i32, text));
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+pub(super) fn button(
+    ui: &mut Ui,
+    rect: Rect,
+    text: &str,
+    kind: Btn,
+    pal: &Pal,
+    enabled: bool,
+) -> Response {
+    let id = ui
+        .id()
+        .with(("wb-button", rect.left() as i32, rect.top() as i32, text));
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let response = ui.interact(rect, id, sense);
     let hovered = enabled && response.hovered();
     let pressed = enabled && response.is_pointer_button_down_on();
     let radius = 8.0;
     let (fill, border, fore) = if !enabled {
         (
-            if kind == Btn::Primary { pal.disabled_fill } else { pal.hover },
+            if kind == Btn::Primary {
+                pal.disabled_fill
+            } else {
+                pal.hover
+            },
             Color32::TRANSPARENT,
             pal.text_disabled,
         )
     } else {
         match kind {
             Btn::Tab => (
-                if hovered { pal.hover } else { Color32::TRANSPARENT },
+                if hovered {
+                    pal.hover
+                } else {
+                    Color32::TRANSPARENT
+                },
                 Color32::TRANSPARENT,
-                if hovered { pal.text } else { pal.text_secondary },
+                if hovered {
+                    pal.text
+                } else {
+                    pal.text_secondary
+                },
             ),
             Btn::Primary => (
                 if pressed {
@@ -416,7 +455,11 @@ pub(super) fn button(ui: &mut Ui, rect: Rect, text: &str, kind: Btn, pal: &Pal, 
                 pal.on_accent,
             ),
             Btn::Subtle => (
-                if hovered { pal.hover } else { Color32::TRANSPARENT },
+                if hovered {
+                    pal.hover
+                } else {
+                    Color32::TRANSPARENT
+                },
                 Color32::TRANSPARENT,
                 pal.accent,
             ),
@@ -428,20 +471,40 @@ pub(super) fn button(ui: &mut Ui, rect: Rect, text: &str, kind: Btn, pal: &Pal, 
                 } else {
                     pal.card
                 },
-                if hovered { pal.border_hover } else { pal.border },
+                if hovered {
+                    pal.border_hover
+                } else {
+                    pal.border
+                },
                 pal.text,
             ),
         }
     };
     rounded(ui.painter(), rect, radius, fill);
     rounded_stroke(ui.painter(), rect, radius, Stroke::new(1.0, border));
-    text_in(ui.painter(), rect, text, font(12.0), fore, Align2::CENTER_CENTER);
+    text_in(
+        ui.painter(),
+        rect,
+        text,
+        font(12.0),
+        fore,
+        Align2::CENTER_CENTER,
+    );
     response
 }
 
 /// Selected/plain pill (original ModernButton with Selected / Tab style).
-pub(super) fn pill(ui: &mut Ui, rect: Rect, text: &str, selected: bool, pal: &Pal, tab: bool) -> Response {
-    let id = ui.id().with(("wb-pill", rect.left() as i32, rect.top() as i32, text));
+pub(super) fn pill(
+    ui: &mut Ui,
+    rect: Rect,
+    text: &str,
+    selected: bool,
+    pal: &Pal,
+    tab: bool,
+) -> Response {
+    let id = ui
+        .id()
+        .with(("wb-pill", rect.left() as i32, rect.top() as i32, text));
     let response = ui.interact(rect, id, Sense::click());
     let hovered = response.hovered();
     let pressed = response.is_pointer_button_down_on();
@@ -455,7 +518,11 @@ pub(super) fn pill(ui: &mut Ui, rect: Rect, text: &str, selected: bool, pal: &Pa
             } else {
                 pal.selection
             },
-            if tab { pal.selection_border } else { Color32::TRANSPARENT },
+            if tab {
+                pal.selection_border
+            } else {
+                Color32::TRANSPARENT
+            },
             pal.selection_text,
         )
     } else if hovered {
@@ -469,20 +536,48 @@ pub(super) fn pill(ui: &mut Ui, rect: Rect, text: &str, selected: bool, pal: &Pa
     };
     rounded(ui.painter(), rect, radius, fill);
     rounded_stroke(ui.painter(), rect, radius, Stroke::new(1.0, border));
-    text_in(ui.painter(), rect, text, font(12.0), fore, Align2::CENTER_CENTER);
+    text_in(
+        ui.painter(),
+        rect,
+        text,
+        font(12.0),
+        fore,
+        Align2::CENTER_CENTER,
+    );
     response
 }
 
 pub(super) fn group_label(ui: &mut Ui, rect: Rect, text: &str, pal: &Pal) {
-    text_in(ui.painter(), rect, text, font(10.0), pal.text_secondary, Align2::LEFT_CENTER);
+    text_in(
+        ui.painter(),
+        rect,
+        text,
+        font(10.0),
+        pal.text_secondary,
+        Align2::LEFT_CENTER,
+    );
 }
 
 pub(super) fn hint(ui: &mut Ui, rect: Rect, text: &str, pal: &Pal) {
-    text_in(ui.painter(), rect, text, font(11.0), pal.text_secondary, Align2::LEFT_CENTER);
+    text_in(
+        ui.painter(),
+        rect,
+        text,
+        font(11.0),
+        pal.text_secondary,
+        Align2::LEFT_CENTER,
+    );
 }
 
 pub(super) fn field_label(ui: &mut Ui, rect: Rect, label: &str, scope: Option<&str>, pal: &Pal) {
-    text_in(ui.painter(), rect, label, font(11.0), pal.text_secondary, Align2::LEFT_CENTER);
+    text_in(
+        ui.painter(),
+        rect,
+        label,
+        font(11.0),
+        pal.text_secondary,
+        Align2::LEFT_CENTER,
+    );
     if let Some(scope) = scope {
         text_in(
             ui.painter(),
@@ -497,8 +592,16 @@ pub(super) fn field_label(ui: &mut Ui, rect: Rect, label: &str, scope: Option<&s
 
 /// Single-line text input in the original ModernInput style: card fill, 5px
 /// radius, border (accent while focused), 8px inner padding.
-pub(super) fn input(ui: &mut Ui, rect: Rect, text: &mut String, hint_text: &str, pal: &Pal) -> Response {
-    let id = ui.id().with(("wb-input", rect.left() as i32, rect.top() as i32));
+pub(super) fn input(
+    ui: &mut Ui,
+    rect: Rect,
+    text: &mut String,
+    hint_text: &str,
+    pal: &Pal,
+) -> Response {
+    let id = ui
+        .id()
+        .with(("wb-input", rect.left() as i32, rect.top() as i32));
     let inner = rect.shrink2(vec2(8.0, 2.0));
     // The surface and border are painted before the text widget so the text
     // (including the placeholder) stays visible.
@@ -522,13 +625,18 @@ pub(super) fn input(ui: &mut Ui, rect: Rect, text: &mut String, hint_text: &str,
         ui.painter(),
         rect,
         5.0,
-        Stroke::new(if focused { 1.6 } else { 1.0 }, if focused { pal.accent } else { pal.border }),
+        Stroke::new(
+            if focused { 1.6 } else { 1.0 },
+            if focused { pal.accent } else { pal.border },
+        ),
     );
     response
 }
 
 pub(super) fn multiline(ui: &mut Ui, rect: Rect, text: &mut String, pal: &Pal) -> Response {
-    let id = ui.id().with(("wb-multiline", rect.left() as i32, rect.top() as i32));
+    let id = ui
+        .id()
+        .with(("wb-multiline", rect.left() as i32, rect.top() as i32));
     let inner = rect.shrink(6.0);
     rounded(ui.painter(), rect, 5.0, pal.card);
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
@@ -546,7 +654,10 @@ pub(super) fn multiline(ui: &mut Ui, rect: Rect, text: &mut String, pal: &Pal) -
         ui.painter(),
         rect,
         5.0,
-        Stroke::new(if focused { 1.6 } else { 1.0 }, if focused { pal.accent } else { pal.border }),
+        Stroke::new(
+            if focused { 1.6 } else { 1.0 },
+            if focused { pal.accent } else { pal.border },
+        ),
     );
     response
 }
@@ -645,12 +756,18 @@ pub(super) fn dropdown(
                     let selected_row = index == *selected;
                     let row = ui.add_sized(
                         vec2((rect.width() - 8.0).max(20.0), 24.0),
-                        egui::Button::new(
-                            egui::RichText::new(*item)
-                                .size(12.0)
-                                .color(if selected_row { pal.selection_text } else { pal.text }),
-                        )
-                        .fill(if selected_row { pal.selection } else { pal.card })
+                        egui::Button::new(egui::RichText::new(*item).size(12.0).color(
+                            if selected_row {
+                                pal.selection_text
+                            } else {
+                                pal.text
+                            },
+                        ))
+                        .fill(if selected_row {
+                            pal.selection
+                        } else {
+                            pal.card
+                        })
                         .stroke(Stroke::NONE)
                         .corner_radius(4),
                     );
@@ -685,8 +802,16 @@ pub(super) fn dropdown(
     response
 }
 
-pub(super) fn checkbox(ui: &mut Ui, rect: Rect, label: &str, value: &mut bool, pal: &Pal) -> Response {
-    let id = ui.id().with(("wb-checkbox", rect.left() as i32, rect.top() as i32, label));
+pub(super) fn checkbox(
+    ui: &mut Ui,
+    rect: Rect,
+    label: &str,
+    value: &mut bool,
+    pal: &Pal,
+) -> Response {
+    let id = ui
+        .id()
+        .with(("wb-checkbox", rect.left() as i32, rect.top() as i32, label));
     let mut response = ui.interact(rect, id, Sense::click());
     if response.clicked() {
         *value = !*value;
@@ -699,7 +824,13 @@ pub(super) fn checkbox(ui: &mut Ui, rect: Rect, label: &str, value: &mut bool, p
     );
     if *value {
         rounded(ui.painter(), box_rect, 3.0, pal.accent);
-        draw_glyph(ui.painter(), box_rect.shrink(3.0), Glyph::Check, Color32::WHITE, 1.8);
+        draw_glyph(
+            ui.painter(),
+            box_rect.shrink(3.0),
+            Glyph::Check,
+            Color32::WHITE,
+            1.8,
+        );
     } else {
         rounded_stroke(ui.painter(), box_rect, 3.0, Stroke::new(1.0, pal.border));
     }
@@ -708,22 +839,46 @@ pub(super) fn checkbox(ui: &mut Ui, rect: Rect, label: &str, value: &mut bool, p
         Rect::from_min_max(pos2(box_rect.right() + 8.0, rect.top()), rect.max),
         label,
         font(12.0),
-        if response.hovered() { pal.text } else { pal.text_secondary },
+        if response.hovered() {
+            pal.text
+        } else {
+            pal.text_secondary
+        },
         Align2::LEFT_CENTER,
     );
     response
 }
 
 pub(super) fn link(ui: &mut Ui, rect: Rect, text: &str, pal: &Pal) -> Response {
-    let id = ui.id().with(("wb-link", rect.left() as i32, rect.top() as i32, text));
+    let id = ui
+        .id()
+        .with(("wb-link", rect.left() as i32, rect.top() as i32, text));
     let response = ui.interact(rect, id, Sense::click());
-    let color = if response.hovered() { pal.accent_hover } else { pal.accent };
-    text_in(ui.painter(), rect, text, font(11.0), color, Align2::CENTER_CENTER);
+    let color = if response.hovered() {
+        pal.accent_hover
+    } else {
+        pal.accent
+    };
+    text_in(
+        ui.painter(),
+        rect,
+        text,
+        font(11.0),
+        color,
+        Align2::CENTER_CENTER,
+    );
     response
 }
 
 pub(super) fn section_header(ui: &mut Ui, rect: Rect, text: &str, pal: &Pal) {
-    text_in(ui.painter(), rect, text, font(14.0), pal.text, Align2::LEFT_CENTER);
+    text_in(
+        ui.painter(),
+        rect,
+        text,
+        font(14.0),
+        pal.text,
+        Align2::LEFT_CENTER,
+    );
 }
 
 pub(super) fn empty_state(ui: &mut Ui, rect: Rect, title: &str, subtitle: &str, pal: &Pal) {
@@ -731,9 +886,26 @@ pub(super) fn empty_state(ui: &mut Ui, rect: Rect, title: &str, subtitle: &str, 
         pos2(rect.center().x - rect.width() / 2.0, rect.center().y - 18.0),
         vec2(rect.width(), 20.0),
     );
-    text_in(ui.painter(), title_rect, title, font(13.0), pal.text_secondary, Align2::CENTER_CENTER);
-    let sub_rect = Rect::from_min_size(title_rect.left_top() + vec2(0.0, 24.0), vec2(rect.width(), 18.0));
-    text_in(ui.painter(), sub_rect, subtitle, font(11.0), pal.text_disabled, Align2::CENTER_CENTER);
+    text_in(
+        ui.painter(),
+        title_rect,
+        title,
+        font(13.0),
+        pal.text_secondary,
+        Align2::CENTER_CENTER,
+    );
+    let sub_rect = Rect::from_min_size(
+        title_rect.left_top() + vec2(0.0, 24.0),
+        vec2(rect.width(), 18.0),
+    );
+    text_in(
+        ui.painter(),
+        sub_rect,
+        subtitle,
+        font(11.0),
+        pal.text_disabled,
+        Align2::CENTER_CENTER,
+    );
 }
 
 /// Round avatar: cached texture when available, otherwise the first glyph.
@@ -759,7 +931,11 @@ pub(super) fn avatar(
                 Align2::CENTER_CENTER,
                 initial,
                 font(rect.width() * 0.45),
-                if pal.dark { pal.text } else { pal.selection_text },
+                if pal.dark {
+                    pal.text
+                } else {
+                    pal.selection_text
+                },
             );
         }
     }
@@ -768,7 +944,8 @@ pub(super) fn avatar(
 pub(super) fn spinner(ui: &mut Ui, center: egui::Pos2, pal: &Pal) {
     ui.painter()
         .circle_stroke(center, 7.0, Stroke::new(1.6, with_alpha(pal.accent, 0.23)));
-    ui.painter().circle_stroke(center, 7.0, Stroke::new(1.6, pal.accent));
+    ui.painter()
+        .circle_stroke(center, 7.0, Stroke::new(1.6, pal.accent));
 }
 
 // ---------------------------------------------------------------------------
@@ -813,7 +990,8 @@ impl Launcher {
         self.schedule_room_badges();
         if self.search_refresh_after_login {
             self.search_refresh_after_login = false;
-            if self.page == Page::Lookup && !self.searching && !self.search_input.trim().is_empty() {
+            if self.page == Page::Lookup && !self.searching && !self.search_input.trim().is_empty()
+            {
                 self.start_search(context, true);
             }
         }
@@ -825,7 +1003,13 @@ impl Launcher {
         }
         if self.health_busy {
             context.request_repaint_after(Duration::from_millis(250));
-        } else if self.snapshot.credentials.imported.values().any(|imported| *imported) {
+        } else if self
+            .snapshot
+            .credentials
+            .imported
+            .values()
+            .any(|imported| *imported)
+        {
             context.request_repaint_after(Duration::from_secs(60));
         }
         let pal = self.palette();
@@ -839,7 +1023,8 @@ impl Launcher {
                 self.chrome(ui, chrome, context, &pal);
                 let sidebar = Rect::from_min_size(body.min, vec2(SIDEBAR_W, body.height()));
                 self.sidebar(ui, sidebar, &pal);
-                let content = Rect::from_min_max(pos2(body.left() + SIDEBAR_W, body.top()), body.max);
+                let content =
+                    Rect::from_min_max(pos2(body.left() + SIDEBAR_W, body.top()), body.max);
                 self.content(ui, content, context, &pal);
                 self.window_edges(ui, full, context);
             });
@@ -870,7 +1055,10 @@ impl Launcher {
         let painter = ui.painter();
         painter.rect_filled(rect, 0.0, pal.side);
         hline(painter, rect, rect.bottom() - 0.5, pal.border);
-        let icon = Rect::from_min_size(pos2(rect.left() + 14.0, rect.top() + 8.0), Vec2::splat(18.0));
+        let icon = Rect::from_min_size(
+            pos2(rect.left() + 14.0, rect.top() + 8.0),
+            Vec2::splat(18.0),
+        );
         brand_mark(ui.painter(), icon, pal);
         text_in(
             painter,
@@ -907,7 +1095,10 @@ impl Launcher {
         if drag.double_clicked() {
             context.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
         }
-        for (index, kind) in [Glyph::Min, Glyph::Max, Glyph::Close].into_iter().enumerate() {
+        for (index, kind) in [Glyph::Min, Glyph::Max, Glyph::Close]
+            .into_iter()
+            .enumerate()
+        {
             let dot_rect = Rect::from_min_size(
                 pos2(dots_left + index as f32 * 34.0, rect.top() + 2.0),
                 Vec2::splat(30.0),
@@ -924,8 +1115,7 @@ impl Launcher {
                 color
             };
             // The user asked for larger dots: 20px circle with a 10px glyph.
-            ui.painter()
-                .circle_filled(dot_rect.center(), 10.0, color);
+            ui.painter().circle_filled(dot_rect.center(), 10.0, color);
             let glyph = match kind {
                 Glyph::Max if maximized => Glyph::Restore,
                 other => other,
@@ -950,12 +1140,22 @@ impl Launcher {
     fn sidebar(&mut self, ui: &mut Ui, rect: Rect, pal: &Pal) {
         let painter = ui.painter();
         painter.rect_filled(rect, 0.0, pal.side);
-        painter.vline(rect.right() - 0.5, rect.y_range(), Stroke::new(1.0, pal.border));
-        let mark = Rect::from_min_size(pos2(rect.left() + 12.0, rect.top() + 22.0), Vec2::splat(30.0));
+        painter.vline(
+            rect.right() - 0.5,
+            rect.y_range(),
+            Stroke::new(1.0, pal.border),
+        );
+        let mark = Rect::from_min_size(
+            pos2(rect.left() + 12.0, rect.top() + 22.0),
+            Vec2::splat(30.0),
+        );
         brand_mark(ui.painter(), mark, pal);
         text_in(
             painter,
-            Rect::from_min_size(pos2(rect.left() + 50.0, rect.top() + 24.0), vec2(106.0, 26.0)),
+            Rect::from_min_size(
+                pos2(rect.left() + 50.0, rect.top() + 24.0),
+                vec2(106.0, 26.0),
+            ),
             "看直播",
             bold(19.0),
             pal.text,
@@ -969,11 +1169,16 @@ impl Launcher {
         let mut y = rect.top() + 100.0;
         for (index, page) in Page::ALL.into_iter().enumerate() {
             if index == Page::SETTINGS_GROUP {
-                group_rect = Rect::from_min_size(pos2(rect.left() + 12.0, y + 10.0), vec2(140.0, 16.0));
+                group_rect =
+                    Rect::from_min_size(pos2(rect.left() + 12.0, y + 10.0), vec2(140.0, 16.0));
                 group_label(ui, group_rect, "设置与账号", pal);
                 y += 29.0;
             }
-            let height = if page == Page::Data { NAV_H_TALL } else { NAV_H };
+            let height = if page == Page::Data {
+                NAV_H_TALL
+            } else {
+                NAV_H
+            };
             let item = Rect::from_min_size(pos2(rect.left() + NAV_INDENT, y), vec2(NAV_W, height));
             let selected = self.page == page;
             let response = ui.interact(item, Id::new(("nav", page.key())), Sense::click());
@@ -994,7 +1199,11 @@ impl Launcher {
             if fill.a() > 0 {
                 rounded(ui.painter(), item, 7.0, fill);
             }
-            let fore = if selected { pal.selection_text } else { pal.text };
+            let fore = if selected {
+                pal.selection_text
+            } else {
+                pal.text
+            };
             let glyph_rect = Rect::from_min_size(
                 pos2(item.left() + 11.0, item.center().y - 7.5),
                 Vec2::splat(15.0),
@@ -1046,10 +1255,20 @@ impl Launcher {
             pos2(rect.left() + CONTENT_PAD + 5.0, rect.top() + 8.0),
             vec2(title_width, 32.0),
         );
-        text_in(ui.painter(), title_rect, self.page.title(), title_font, pal.text, Align2::LEFT_CENTER);
+        text_in(
+            ui.painter(),
+            title_rect,
+            self.page.title(),
+            title_font,
+            pal.text,
+            Align2::LEFT_CENTER,
+        );
         let subtitle_rect = Rect::from_min_size(
             pos2(title_rect.left() + title_width + 14.0, rect.top() + 15.0),
-            vec2((rect.right() - CONTENT_PAD - title_rect.left() - title_width - 14.0).max(60.0), 18.0),
+            vec2(
+                (rect.right() - CONTENT_PAD - title_rect.left() - title_width - 14.0).max(60.0),
+                18.0,
+            ),
         );
         text_in(
             ui.painter(),
@@ -1102,9 +1321,16 @@ impl Launcher {
             (self.status.clone(), pal.accent)
         };
         let cancel_width = if self.playing { 118.0 } else { 0.0 };
-        let status_rect = Rect::from_min_max(rect.min, pos2(rect.right() - cancel_width - 8.0, rect.bottom()));
+        let status_rect = Rect::from_min_max(
+            rect.min,
+            pos2(rect.right() - cancel_width - 8.0, rect.bottom()),
+        );
         if self.playing || self.searching || self.verification_pending || self.storage_pending > 0 {
-            spinner(ui, pos2(status_rect.left() + 6.0, status_rect.center().y), pal);
+            spinner(
+                ui,
+                pos2(status_rect.left() + 6.0, status_rect.center().y),
+                pal,
+            );
         } else {
             let circle = Rect::from_center_size(
                 pos2(status_rect.left() + 6.5, status_rect.center().y),
@@ -1116,7 +1342,11 @@ impl Launcher {
                 ui.painter(),
                 circle.shrink(3.0),
                 Glyph::Check,
-                if self.status_error { pal.danger } else { pal.text_secondary },
+                if self.status_error {
+                    pal.danger
+                } else {
+                    pal.text_secondary
+                },
                 1.4,
             );
         }
@@ -1130,7 +1360,10 @@ impl Launcher {
         );
         if self.playing {
             let button_rect = Rect::from_min_size(
-                pos2(rect.right() - cancel_width, rect.top() + (rect.height() - 29.0) / 2.0),
+                pos2(
+                    rect.right() - cancel_width,
+                    rect.top() + (rect.height() - 29.0) / 2.0,
+                ),
                 vec2(cancel_width, 29.0),
             );
             if button(ui, button_rect, "取消启动", Btn::Secondary, pal, true).clicked() {
@@ -1166,7 +1399,10 @@ impl Launcher {
                 egui::CursorIcon::ResizeNorth,
             ),
             (
-                Rect::from_min_size(pos2(full.left(), full.bottom() - strip), vec2(full.width(), strip)),
+                Rect::from_min_size(
+                    pos2(full.left(), full.bottom() - strip),
+                    vec2(full.width(), strip),
+                ),
                 egui::ResizeDirection::South,
                 egui::CursorIcon::ResizeSouth,
             ),
@@ -1176,7 +1412,10 @@ impl Launcher {
                 egui::CursorIcon::ResizeWest,
             ),
             (
-                Rect::from_min_size(pos2(full.right() - strip, full.top()), vec2(strip, full.height())),
+                Rect::from_min_size(
+                    pos2(full.right() - strip, full.top()),
+                    vec2(strip, full.height()),
+                ),
                 egui::ResizeDirection::East,
                 egui::CursorIcon::ResizeEast,
             ),
@@ -1196,7 +1435,10 @@ impl Launcher {
                 egui::CursorIcon::ResizeSouthWest,
             ),
             (
-                Rect::from_min_size(pos2(full.right() - strip, full.bottom() - strip), Vec2::splat(strip)),
+                Rect::from_min_size(
+                    pos2(full.right() - strip, full.bottom() - strip),
+                    Vec2::splat(strip),
+                ),
                 egui::ResizeDirection::SouthEast,
                 egui::CursorIcon::ResizeSouthEast,
             ),
@@ -1227,7 +1469,8 @@ impl Launcher {
             for platform in Platform::ALL {
                 let selected = self.platform == platform;
                 let (rect, _) = ui.allocate_exact_size(vec2(88.0, 30.0), Sense::hover());
-                let response = ui.interact(rect, Id::new(("legacy-platform", platform)), Sense::click());
+                let response =
+                    ui.interact(rect, Id::new(("legacy-platform", platform)), Sense::click());
                 let fill = if selected {
                     pal.selection
                 } else if response.hovered() {
@@ -1240,14 +1483,25 @@ impl Launcher {
                     ui.painter(),
                     rect,
                     6.0,
-                    Stroke::new(1.0, if selected { pal.selection_border } else { pal.border }),
+                    Stroke::new(
+                        1.0,
+                        if selected {
+                            pal.selection_border
+                        } else {
+                            pal.border
+                        },
+                    ),
                 );
                 text_in(
                     ui.painter(),
                     rect,
                     platform.label(),
                     font(12.0),
-                    if selected { pal.selection_text } else { pal.text },
+                    if selected {
+                        pal.selection_text
+                    } else {
+                        pal.text
+                    },
                     Align2::CENTER_CENTER,
                 );
                 if response.clicked() {

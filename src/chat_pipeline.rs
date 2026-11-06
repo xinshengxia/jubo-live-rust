@@ -121,8 +121,7 @@ pub struct ChatPipeline {
     groups: BTreeMap<String, Group>,
     counts: BTreeMap<String, u32>,
     sequence: u64,
-    keywords: Vec<String>,
-    users: BTreeSet<String>,
+    rules: crate::danmaku_rules::CompiledRules,
     gate: Option<AdmissionGate>,
 }
 impl ChatPipeline {
@@ -147,16 +146,8 @@ impl ChatPipeline {
     }
 
     fn build(settings: DanmakuBehavior, derived_rate: f32) -> Self {
-        let keywords = settings
-            .blocked_keywords
-            .iter()
-            .map(|s| s.to_lowercase())
-            .collect();
-        let users = settings
-            .blocked_users
-            .iter()
-            .map(|s| s.to_lowercase())
-            .collect();
+        let rules = crate::danmaku_rules::compile_with_users(
+            &settings.blocked_keywords, &settings.blocked_users, &[], &[]);
         let gate = if settings.smooth_admission {
             Some(AdmissionGate::with_default_rate(
                 settings.admission_per_second,
@@ -172,18 +163,18 @@ impl ChatPipeline {
             groups: BTreeMap::new(),
             counts: BTreeMap::new(),
             sequence: 0,
-            keywords,
-            users,
+            rules,
             gate,
         }
     }
+    /// Applies blocking, visibility, duplicate merging and the admission gate.
+    ///
+    /// With duplicate merging on, the returned message id is rewritten to
+    /// `local-merge-N` (the merge group id). Callers that keep per-message state
+    /// keyed by id — e.g. the overlay's highlight colour set — must key it off
+    /// the *returned* id, never the wire id, or merged messages lose that state.
     pub fn admit(&mut self, mut message: DanmakuMessage, now: f64) -> Option<PendingMessage> {
-        let text = message.text.to_lowercase();
-        if self.users.contains(&message.user.to_lowercase())
-            || self.keywords.iter().any(|key| text.contains(key))
-        {
-            return None;
-        }
+        if self.rules.is_blocked(&message) { return None; }
         if !self.mode_visible(message.mode) {
             return None;
         }
@@ -265,11 +256,12 @@ impl ChatPipeline {
         }
     }
     pub fn allows(&self, user: &str, text: &str) -> bool {
-        !self.users.contains(&user.to_lowercase())
-            && !self
-                .keywords
-                .iter()
-                .any(|key| text.to_lowercase().contains(key))
+        !self.rules.is_blocked(&DanmakuMessage {
+            image_url: None, id: String::new(), user: user.into(), text: text.into(),
+            mode: DanmakuMode::Scroll, color: 0xffffff, font_size: 25,
+            user_id: 0, user_level: 0, guard_level: 0, medal: None,
+            image_width: 0, image_height: 0, image_large: false,
+        })
     }
     pub fn count(&self, id: &str) -> u32 {
         self.counts.get(id).copied().unwrap_or(1)
@@ -532,5 +524,49 @@ mod tests {
         pipe.admit(message(), 0.2);
         assert_eq!(pipe.count(&first.message.id), 2);
         assert_eq!(pipe.count(&other.message.id), 1);
+    }
+
+    #[test]
+    fn user_rules_from_settings_support_uid_name_regex_and_contains() {
+        let settings = DanmakuBehavior {
+            blocked_users: vec![
+                "uid:42".into(),
+                "name:Alice".into(),
+                "re:^Bob\\d+$".into(),
+                "观众".into(),
+            ],
+            ..Default::default()
+        };
+        let mut pipe = ChatPipeline::new(settings);
+        let blocked = |pipe: &mut ChatPipeline, user: &str, user_id: u64| {
+            pipe.admit(
+                DanmakuMessage {
+                    user: user.into(),
+                    user_id,
+                    ..message()
+                },
+                0.0,
+            )
+            .is_none()
+        };
+        assert!(blocked(&mut pipe, "anyone", 42));
+        assert!(blocked(&mut pipe, "alice", 1));
+        assert!(blocked(&mut pipe, "Bob123", 1));
+        assert!(blocked(&mut pipe, "老观众", 1));
+        assert!(!blocked(&mut pipe, "normal", 7));
+        // The live-event filter uses the same compiled rules.
+        assert!(!pipe.allows("Alice", "普通消息"));
+        assert!(pipe.allows("normal", "普通消息"));
+    }
+
+    #[test]
+    fn an_invalid_user_rule_is_skipped_instead_of_blocking_everything() {
+        let mut pipe = ChatPipeline::new(DanmakuBehavior {
+            blocked_users: vec!["re:[abc".into()],
+            ..Default::default()
+        });
+        // The overlay logs the compile error; the pipeline itself keeps working
+        // and must not interpret the malformed rule as a match-everything rule.
+        assert!(pipe.admit(message(), 0.0).is_some());
     }
 }

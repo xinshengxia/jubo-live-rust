@@ -168,13 +168,7 @@ fn assert_no_same_track_overlap(items: &[Snapshot]) {
             assert!(
                 clear,
                 "two messages overlap in track {}: {} x=[{:.1},{:.1}] {} x=[{:.1},{:.1}]",
-                left.lane,
-                left.id,
-                left.x,
-                left_end,
-                right.id,
-                right.x,
-                right_end
+                left.lane, left.id, left.x, left_end, right.id, right.x, right_end
             );
         }
     }
@@ -234,17 +228,35 @@ fn shrinking_the_window_preserves_progress_pace_and_tracks() {
     let now = 5.0;
     scheduler.advance(now);
     let before = snapshot(&scheduler, now);
-    assert!(before.len() >= 8, "synthetic scene too small: {}", before.len());
+    assert!(
+        before.len() >= 8,
+        "synthetic scene too small: {}",
+        before.len()
+    );
     let lanes_before = distinct_lanes(&before);
     assert!(lanes_before >= 3, "synthetic scene must use several tracks");
     if let Some(directory) = evidence_dir() {
-        save_scene(&scheduler, 1600, 900, now, &directory, "resize-before-1600x900");
+        save_scene(
+            &scheduler,
+            1600,
+            900,
+            now,
+            &directory,
+            "resize-before-1600x900",
+        );
     }
 
     scheduler.refit(1000.0, 700.0, now);
     let after = snapshot(&scheduler, now);
     if let Some(directory) = evidence_dir() {
-        save_scene(&scheduler, 1000, 700, now, &directory, "resize-after-1000x700");
+        save_scene(
+            &scheduler,
+            1000,
+            700,
+            now,
+            &directory,
+            "resize-after-1000x700",
+        );
     }
 
     assert_eq!(
@@ -290,7 +302,9 @@ fn shrinking_the_window_preserves_progress_pace_and_tracks() {
         "tracks collapsed {lanes_before} -> {lanes_after}"
     );
     assert!(
-        after.iter().all(|item| item.y >= -0.5 && item.y + 1.0 <= 700.0),
+        after
+            .iter()
+            .all(|item| item.y >= -0.5 && item.y + 1.0 <= 700.0),
         "a running message was left outside the new viewport"
     );
     assert_no_same_track_overlap(&after);
@@ -324,7 +338,14 @@ fn growing_the_window_keeps_every_message_flying() {
         }
     }
     if let Some(directory) = evidence_dir() {
-        save_scene(&scheduler, 2400, 1300, now, &directory, "grow-after-2400x1300");
+        save_scene(
+            &scheduler,
+            2400,
+            1300,
+            now,
+            &directory,
+            "grow-after-2400x1300",
+        );
     }
 }
 
@@ -337,9 +358,18 @@ fn a_very_small_window_drops_only_what_cannot_fit() {
     let before = snapshot(&scheduler, now);
     scheduler.refit(640.0, 360.0, now);
     let after = snapshot(&scheduler, now);
-    let lanes_capacity = (360.0 / (43.0_f32.max(scheduler.line_height()))).floor().max(1.0) as usize;
+    let lanes_capacity = (360.0 / (43.0_f32.max(scheduler.line_height())))
+        .floor()
+        .max(1.0) as usize;
     if let Some(directory) = evidence_dir() {
-        save_scene(&scheduler, 640, 360, now, &directory, "shrink-after-640x360");
+        save_scene(
+            &scheduler,
+            640,
+            360,
+            now,
+            &directory,
+            "shrink-after-640x360",
+        );
     }
     assert!(
         !after.is_empty(),
@@ -359,7 +389,9 @@ fn a_very_small_window_drops_only_what_cannot_fit() {
         "the shrink collapsed every surviving message into one track"
     );
     assert!(
-        after.iter().all(|item| item.y >= -0.5 && item.y + 1.0 <= 360.0),
+        after
+            .iter()
+            .all(|item| item.y >= -0.5 && item.y + 1.0 <= 360.0),
         "a surviving message was left outside the small viewport"
     );
     assert_no_same_track_overlap(&after);
@@ -376,7 +408,11 @@ fn dpi_change_is_the_same_progress_preserving_path() {
     let before = snapshot(&scheduler, now);
     scheduler.refit(1067.0, 600.0, now);
     let after = snapshot(&scheduler, now);
-    assert_eq!(after.len(), before.len(), "a DPI change must keep the layer");
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "a DPI change must keep the layer"
+    );
     for old in &before {
         let new = after
             .iter()
@@ -394,7 +430,10 @@ fn dpi_change_is_the_same_progress_preserving_path() {
 fn fixed_messages_survive_a_resize_and_stay_centred() {
     let mut scheduler = LaneScheduler::new(1600.0, 900.0, FONT, DURATION);
     let now = 1.0;
-    for (index, mode) in [DanmakuMode::Top, DanmakuMode::Bottom].into_iter().enumerate() {
+    for (index, mode) in [DanmakuMode::Top, DanmakuMode::Bottom]
+        .into_iter()
+        .enumerate()
+    {
         let mut entry = message(index, mode);
         entry.text = format!("合成固定弹幕 {index}");
         scheduler

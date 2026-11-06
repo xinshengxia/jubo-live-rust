@@ -22,6 +22,11 @@ use std::time::{Duration, Instant};
 pub const MAX_ACTIVE_SESSIONS: usize = 16;
 pub const MAX_TRACKED_SESSIONS: usize = 128;
 const MONITOR_INTERVAL: Duration = Duration::from_secs(20);
+/// Upper bound for waiting on the owned player/relay handles to terminate
+/// during one explicit resync. Stop itself is a cooperative kill of processes
+/// this manager owns, so this is a bounded wait, not a poll for a PID.
+const RESYNC_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+const RESYNC_STOP_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,6 +136,10 @@ pub struct SessionSnapshot {
 struct Entry {
     snapshot: SessionSnapshot,
     control: PlaybackControl,
+    settings: Settings,
+    vault: Option<CookieVault>,
+    resync_pending: bool,
+    resync_attempts: u32,
 }
 struct State {
     entries: BTreeMap<String, Entry>,
@@ -272,7 +281,7 @@ impl SessionManager {
                 let oldest = state
                     .entries
                     .values()
-                    .filter(|entry| entry.snapshot.phase.is_terminal())
+                    .filter(|entry| entry.snapshot.phase.is_terminal() && !entry.resync_pending)
                     .min_by_key(|entry| entry.snapshot.started_at)
                     .map(|entry| entry.snapshot.id.clone());
                 if let Some(oldest) = oldest {
@@ -303,6 +312,10 @@ impl SessionManager {
                 Entry {
                     snapshot: snapshot.clone(),
                     control: control.clone(),
+                    settings: settings.clone(),
+                    vault: vault.clone(),
+                    resync_pending: false,
+                    resync_attempts: 0,
                 },
             );
             broadcast(&mut state, &snapshot);
@@ -390,6 +403,113 @@ impl SessionManager {
         Ok(())
     }
 
+    /// One explicit recovery operation. Wait for this manager's owned player
+    /// and relay handles to terminate before opening an unchanged new session.
+    /// No PID lookup, global player message or periodic reset is used.
+    ///
+    /// The wait is bounded (RESYNC_STOP_TIMEOUT). On timeout the old row keeps
+    /// its real Stopping phase and records a diagnosable error; a later retry is
+    /// only possible after that stop actually completes, so no duplicate player
+    /// can be spawned while the old one may still be alive.
+    pub fn resync(&self, id: &str) -> Result<()> {
+        let (target, player, settings, vault, control, attempt) = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let entry = state
+                .entries
+                .get_mut(id)
+                .ok_or_else(|| anyhow!("找不到这个观看会话"))?;
+            ensure!(entry.snapshot.phase.can_stop(), "该会话当前不能重新同步");
+            ensure!(!entry.resync_pending, "该会话已经在重新同步");
+            entry.resync_pending = true;
+            entry.resync_attempts = entry.resync_attempts.saturating_add(1);
+            let attempt = entry.resync_attempts;
+            let spec = (
+                entry.snapshot.target.clone(),
+                entry.snapshot.player,
+                entry.settings.clone(),
+                entry.vault.clone(),
+                entry.control.clone(),
+                attempt,
+            );
+            entry.control.stop();
+            entry.snapshot.phase = SessionPhase::Stopping;
+            entry.snapshot.room_note =
+                "正在停止本会话，随后保留原选项重新打开以恢复同步；会短暂停顿".into();
+            entry.snapshot.updated_at = Utc::now();
+            let snapshot = entry.snapshot.clone();
+            broadcast(&mut state, &snapshot);
+            spec
+        };
+        let manager = self.clone();
+        let old_id = id.to_owned();
+        let spawned = thread::Builder::new()
+            .name("session-explicit-resync".into())
+            .spawn(move || {
+                let deadline = Instant::now() + RESYNC_STOP_TIMEOUT;
+                let stop_complete = || control.has_finished()
+                    && manager.snapshot(&old_id).is_none_or(|row| row.phase.is_terminal());
+                while !stop_complete() && Instant::now() < deadline {
+                    thread::sleep(RESYNC_STOP_POLL);
+                }
+                let stopped = stop_complete();
+                let result = if stopped {
+                    manager.start(target, player, settings, vault)
+                } else {
+                    Err(anyhow!(
+                        "旧播放器尚未确认退出（等待 {} 秒），本次未打开重复会话；停止完成后可重新打开",
+                        RESYNC_STOP_TIMEOUT.as_secs()
+                    ))
+                };
+                let mut state = manager
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let Some(entry) = state.entries.get_mut(&old_id) else {
+                    return;
+                };
+                entry.resync_pending = false;
+                match result {
+                    Ok(_) => {
+                        // The old row is left terminal (the stop event sets Stopped);
+                        // point the operator at the replacement session without
+                        // hiding the fact that content was interrupted.
+                        entry.snapshot.error = None;
+                        entry.snapshot.room_note = format!(
+                            "已安排新的观看会话（第 {attempt} 次重新同步），原会话已停止；启动结果请查看新会话"
+                        );
+                        entry.snapshot.updated_at = Utc::now();
+                        let snapshot = entry.snapshot.clone();
+                        broadcast(&mut state, &snapshot);
+                    }
+                    Err(error) => {
+                        entry.snapshot.error =
+                            Some(bounded_text(&format!("重新同步未完成：{error}"), 512));
+                        entry.snapshot.updated_at = Utc::now();
+                        let snapshot = entry.snapshot.clone();
+                        broadcast(&mut state, &snapshot);
+                    }
+                }
+            });
+        if spawned.is_err() {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = state.entries.get_mut(id) {
+                entry.resync_pending = false;
+                entry.snapshot.error = Some("无法安排重新同步，请等待旧会话停止后手动重新打开".into());
+                entry.snapshot.room_note = "本次未能安排重新同步；旧会话仍按停止请求退出".into();
+                entry.snapshot.updated_at = Utc::now();
+                let snapshot = entry.snapshot.clone();
+                broadcast(&mut state, &snapshot);
+            }
+            bail!("无法安排重新同步，请等待旧会话停止后手动重新打开");
+        }
+        Ok(())
+    }
+
     /// Never removes or stops a live session; it only clears finished rows.
     pub fn clear_finished(&self) -> usize {
         let mut state = self
@@ -400,7 +520,7 @@ impl SessionManager {
         let before = state.entries.len();
         state
             .entries
-            .retain(|_, entry| !entry.snapshot.phase.is_terminal());
+            .retain(|_, entry| !entry.snapshot.phase.is_terminal() || entry.resync_pending);
         before - state.entries.len()
     }
 
@@ -419,7 +539,7 @@ impl SessionManager {
         let Some(entry) = state.entries.get_mut(id) else {
             return;
         };
-        if entry.snapshot.phase.is_terminal() {
+        if entry.snapshot.phase.is_terminal() || entry.snapshot.phase == SessionPhase::Stopping {
             return;
         }
         entry.snapshot.room_state = room_state;
@@ -443,6 +563,14 @@ impl SessionManager {
             return;
         };
         if entry.snapshot.phase.is_terminal() {
+            return;
+        }
+        // A statistics request or room check can finish after Stop was pressed.
+        // Only the owner completion event may leave Stopping; stale telemetry
+        // must not re-enable Stop/Resync or replace the pending-operation note.
+        if entry.snapshot.phase == SessionPhase::Stopping
+            && !matches!(&event, PlaybackEvent::Stopped | PlaybackEvent::Ended { .. })
+        {
             return;
         }
         match event {
@@ -509,13 +637,13 @@ impl SessionManager {
                         entry.snapshot.room_state = SessionRoomState::Unknown;
                         entry.snapshot.room_note = "媒体已恢复，等待确认直播或重播状态".into();
                     }
-                    if entry.snapshot.phase == SessionPhase::Interrupted
-                        && entry
-                            .snapshot
-                            .error
-                            .as_deref()
-                            .is_some_and(|error| error.starts_with("中转连接"))
-                    {
+                    // Media recovered: clear a transient relay/policy error that
+                    // this same session raised, but never hide a different one.
+                    let recoverable = entry.snapshot.error.as_deref().is_some_and(|error| {
+                        error.starts_with("中转连接")
+                            || error.starts_with("媒体地址被中继策略拒绝")
+                    });
+                    if entry.snapshot.phase == SessionPhase::Interrupted && recoverable {
                         entry.snapshot.phase = SessionPhase::Playing;
                         entry.snapshot.error = None;
                     }
@@ -526,6 +654,37 @@ impl SessionManager {
                     entry.snapshot.phase = SessionPhase::Interrupted;
                     entry.snapshot.error =
                         Some("中转连接的连续失败预算已耗尽，等待播放器重连或手动重试".into());
+                } else if telemetry.state == "policy_rejected"
+                    && entry.snapshot.player_pid.is_some()
+                    && matches!(
+                        entry.snapshot.phase,
+                        SessionPhase::Playing
+                            | SessionPhase::WaitingBroadcast
+                            | SessionPhase::Interrupted
+                    )
+                {
+                    // The relay now records the redacted rule/stage/host/status of
+                    // the refused media hop; surface it instead of the old opaque
+                    // "upstream redirect is not an approved public CDN" line.
+                    let detail = telemetry
+                        .last_policy_reject
+                        .as_ref()
+                        .map(|reject| {
+                            let host = reject.host.as_deref().unwrap_or("未知主机");
+                            let status = reject
+                                .status
+                                .map(|status| format!(" HTTP {status}"))
+                                .unwrap_or_default();
+                            format!("{} / {} / host={host}{status}", reject.rule, reject.stage)
+                        })
+                        .unwrap_or_else(|| "原因未知".into());
+                    entry.snapshot.phase = SessionPhase::Interrupted;
+                    entry.snapshot.error = Some(bounded_text(
+                        &format!(
+                            "媒体地址被中继策略拒绝（{detail}）；可稍后重试或使用一次重新同步"
+                        ),
+                        512,
+                    ));
                 }
                 entry.snapshot.relay = Some(telemetry);
             }

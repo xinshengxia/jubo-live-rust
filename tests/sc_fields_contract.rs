@@ -1,6 +1,6 @@
 //! Offline contract tests for SuperChat protocol fields (face_frame / message_trans).
 
-use live_hub_rust::danmaku::{bili_packet, decode_bili, DanmakuEvent, SuperChat};
+use live_hub_rust::danmaku::{DanmakuEvent, SuperChat, bili_packet, decode_bili};
 
 fn decode_one(json: &str) -> SuperChat {
     let frame = bili_packet(5, 0, json.as_bytes()).unwrap();
@@ -41,11 +41,18 @@ const FULL_JSON: &str = r##"{
 #[test]
 fn bilibili_super_chat_parses_face_frame_and_translation() {
     let card = decode_one(FULL_JSON);
-    assert_eq!(card.price_cents, 3000, "protocol price is yuan, stored in cents");
+    assert_eq!(
+        card.price_cents, 3000,
+        "protocol price is yuan, stored in cents"
+    );
     assert_eq!(card.duration_secs, 60);
     assert_eq!(card.message_trans, "translated message");
     assert!(card.face.contains("i0.hdslb.com"), "face={}", card.face);
-    assert!(card.face_frame.contains("i0.hdslb.com"), "face_frame={}", card.face_frame);
+    assert!(
+        card.face_frame.contains("i0.hdslb.com"),
+        "face_frame={}",
+        card.face_frame
+    );
     assert_eq!(card.user, "观众甲");
     assert_eq!(card.user_level, 12);
     assert_eq!(card.guard_level, 3);

@@ -26,7 +26,8 @@
 //! 公共契约（stub 起就冻结，danmaku::connect / danmaku::decode_frame 会转接过来）：
 //! decode(payload) 解码一条 WebSocket 二进制消息（外层 Tars 命令包）；
 //! connect(target, sender, cancellation) 在调用方线程上阻塞运行，直到取消、UI 通道关闭
-//! 或（有界的）重连次数用尽。所有长度/深度/元素数均有上限，畸形输入返回 Err 而不是 panic。
+//! 或需要人工处理的终止条件；普通断线持续退避重连。所有长度/深度/元素数均有上限，
+//! 畸形输入返回 Err 而不是 panic。
 
 use crate::core::{Platform, Target};
 use crate::danmaku::{
@@ -37,7 +38,6 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::{
     io::{ErrorKind, Read},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
-    sync::mpsc::SyncSender,
     thread,
     time::{Duration, Instant},
 };
@@ -60,10 +60,13 @@ const MAX_MISSED_HEARTBEATS: u32 = 2;
 /// 读超时 <= 500ms：安静房间也要能及时响应 Cancellation。
 const READ_POLL: Duration = Duration::from_millis(500);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// 断线重连上限（旧实现无限重连；本工程要求有界，最多 3 次、退避 <= 2 秒）。
-const MAX_ATTEMPTS: u32 = 3;
-const RETRY_DELAY_CAP: Duration = Duration::from_secs(2);
-/// 同一连接持续解析失败的上限：超过即认为协议已经错位，交给有界重连。
+/// Stable connections reset backoff; recovery is not a lifetime retry budget.
+const STABLE_CONNECTION: Duration = Duration::from_secs(30);
+const RETRY_DELAY_CAP: Duration = Duration::from_secs(30);
+/// 同一连接持续解析失败的上限：超过即认为协议已经错位，交给连续失败退避重连。
+/// 重连本身没有会话总次数上限（同 C# `while (!_stopping)`），只有退避时间上限。
+/// 虎牙匿名通道没有"需要人工登录/验证"的错误类别；房间号格式在连接前已校验，
+/// 其余页面/网络错误都按可恢复处理并持续退避重试。
 const MAX_CONSECUTIVE_PARSE_ERRORS: u32 = 8;
 
 /// Tars 容器元素数上限（防止畸形长度触发长时间循环）。
@@ -1315,7 +1318,7 @@ fn cancellable_wait(cancellation: &Cancellation, duration: Duration) {
 /// 单次连接生命周期：握手 -> 订阅 -> 心跳 -> 收包，直到取消/服务端关闭/出错。
 fn huya_once(
     room: &RoomIds,
-    sender: &SyncSender<DanmakuEvent>,
+    sender: &crate::danmaku::EventSender,
     cancellation: &Cancellation,
 ) -> Result<()> {
     let stream = tcp_connect(WS_HOST, 443, cancellation)?;
@@ -1330,7 +1333,7 @@ fn huya_once(
     let request = WS_URL
         .into_client_request()
         .context("虎牙弹幕 WebSocket 请求无效")?;
-    // 单条消息上限与 danmaku 模块一致：超限由 tungstenite 中止连接，交给有界重连。
+    // 单条消息上限与 danmaku 模块一致：超限由 tungstenite 中止连接，交给连续失败退避重连。
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_WIRE_BYTES))
         .max_frame_size(Some(MAX_WIRE_BYTES));
@@ -1408,7 +1411,7 @@ fn huya_once(
                 }
                 Err(error) => {
                     // 单条坏报文不应该拖垮整条连接（旧实现同样只上报继续收），
-                    // 但连续失败说明协议已经错位，交给有界重连。
+                    // 但连续失败说明协议已经错位，交给连续失败退避重连。
                     consecutive_parse_errors += 1;
                     if consecutive_parse_errors >= MAX_CONSECUTIVE_PARSE_ERRORS {
                         return Err(error.context(format!(
@@ -1439,21 +1442,31 @@ fn huya_once(
     }
 }
 
+/// Consecutive-failure counter with the legacy reset (C# sets `attempt = 0`
+/// after a successful Connect): once a connection stayed alive for
+/// [`STABLE_CONNECTION`], its next failure starts over at 1. A short session
+/// therefore keeps backing off, while a long session can never be stopped for
+/// good by its lifetime total.
+fn next_failure_count(previous: u32, elapsed: Duration) -> u32 {
+    if elapsed >= STABLE_CONNECTION { 1 } else { previous.saturating_add(1) }
+}
+
+/// Bounded exponential backoff (500 ms doubling, 30 s cap). It only paces
+/// reconnects; it is not a session retry budget.
 fn retry_delay(attempt: u32) -> Duration {
-    let factor = 1_u64 << attempt.saturating_sub(1).min(2);
-    (Duration::from_millis(500) * factor as u32).min(RETRY_DELAY_CAP)
+    Duration::from_millis(500 * (1_u64 << attempt.saturating_sub(1).min(6))).min(RETRY_DELAY_CAP)
 }
 
 /// 打开匿名虎牙弹幕 WebSocket，订阅聊天房间，按旧实现周期心跳，解码后发送事件。
 ///
 /// 语义：
 /// - 阻塞运行在调用方线程（上层用工作线程启动），每 500ms 至少检查一次取消；
-/// - 断线只做有界重连：最多 3 次尝试、退避 500ms/1s、上限 2 秒；
-/// - 取消时返回 Ok(())；UI 通道关闭时尽快返回；重连次数用尽返回可操作错误；
+/// - 断线持续恢复、退避上限30秒，稳定运行30秒后复位连续失败次数；
+/// - 取消时返回 Ok(())；UI 通道关闭时尽快返回；不会耗尽会话累计重连预算；
 /// - 本函数不打日志、不读用户数据，只访问虎牙公开房间页与匿名 WSS。
 pub fn connect(
     target: &Target,
-    sender: SyncSender<DanmakuEvent>,
+    sender: crate::danmaku::EventSender,
     cancellation: Cancellation,
 ) -> Result<()> {
     ensure!(
@@ -1464,68 +1477,23 @@ pub fn connect(
     if cancellation.is_cancelled() {
         return Ok(());
     }
-    // Publish before connecting so early messages use the normal image path.
+    // Publish before connecting: initial/early messages and reconnects share
+    // the overlay's normal dictionary refresh path, with no HTTP dependency.
     crate::danmaku::cache_emoticons(emoticon_dictionary());
-    let mut last_error: Option<anyhow::Error> = None;
-    for attempt in 1..=MAX_ATTEMPTS {
-        if cancellation.is_cancelled() {
-            return Ok(());
-        }
-        if emit(
-            &sender,
-            DanmakuEvent::Status(format!(
-                "虎牙：正在解析房间并连接弹幕服务器（第 {attempt}/{MAX_ATTEMPTS} 次）"
-            )),
-        ) == Delivery::Closed
-        {
-            return Ok(());
-        }
+    let mut failures = 0_u32;
+    loop {
+        if cancellation.is_cancelled() { return Ok(()); }
+        if emit(&sender, DanmakuEvent::Status("虎牙：正在解析房间并连接弹幕服务器".into())) == Delivery::Closed { return Ok(()); }
+        let started = Instant::now();
         let outcome = resolve_room(&target.room, &cancellation)
             .and_then(|room| huya_once(&room, &sender, &cancellation));
-        if cancellation.is_cancelled() {
-            return Ok(());
-        }
-        match outcome {
-            Ok(()) => last_error = Some(anyhow!("虎牙弹幕连接被服务端关闭")),
-            Err(error) => last_error = Some(error),
-        }
-        let error = last_error.as_ref().expect("连结果分支总会写入错误");
-        if emit(
-            &sender,
-            DanmakuEvent::Status(format!(
-                "虎牙弹幕连接中断（第 {attempt}/{MAX_ATTEMPTS} 次）：{error}"
-            )),
-        ) == Delivery::Closed
-        {
-            return Ok(());
-        }
-        if attempt < MAX_ATTEMPTS {
-            if emit(
-                &sender,
-                DanmakuEvent::Status(format!(
-                    "虎牙：{} 毫秒后重连…",
-                    retry_delay(attempt).as_millis()
-                )),
-            ) == Delivery::Closed
-            {
-                return Ok(());
-            }
-            cancellable_wait(&cancellation, retry_delay(attempt));
-        }
+        if cancellation.is_cancelled() { return Ok(()); }
+        failures = next_failure_count(failures, started.elapsed());
+        let error = outcome.err().unwrap_or_else(|| anyhow!("虎牙弹幕连接已结束"));
+        let delay = retry_delay(failures);
+        if emit(&sender, DanmakuEvent::Status(format!("虎牙弹幕连接中断：{error}；{} 秒后重连", delay.as_secs_f32()))) == Delivery::Closed { return Ok(()); }
+        cancellable_wait(&cancellation, delay);
     }
-    let error = last_error.unwrap_or_else(|| anyhow!("虎牙弹幕连接失败"));
-    if emit(
-        &sender,
-        DanmakuEvent::Status(format!(
-            "虎牙弹幕已停止重试（上限 {MAX_ATTEMPTS} 次）：{error}"
-        )),
-    ) == Delivery::Closed
-    {
-        return Ok(());
-    }
-    Err(error.context(format!(
-        "虎牙弹幕连续 {MAX_ATTEMPTS} 次连接失败，已停止重连"
-    )))
 }
 
 // ------------------------------------------------------------------ 离线单元测试
@@ -1868,4 +1836,12 @@ mod tests {
         assert_eq!(message.mode, DanmakuMode::Scroll);
         assert_eq!(message.font_size, 25);
     }
+    #[test]
+    fn long_lived_connections_reset_consecutive_backoff() {
+        let mut failures = 0;
+        for _ in 0..100 { failures = next_failure_count(failures, Duration::from_secs(60)); assert_eq!(failures, 1); }
+        assert_eq!(next_failure_count(50, Duration::from_secs(1)), 51);
+        assert_eq!(retry_delay(u32::MAX), Duration::from_secs(30));
+    }
+
 }

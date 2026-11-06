@@ -45,7 +45,8 @@ impl Launcher {
                 self.start_playback_with(target, player, settings, context);
             }
             Err(error) => {
-                let message = room_input_hint(&self.room_input, self.platform, &format!("{error:#}"));
+                let message =
+                    room_input_hint(&self.room_input, self.platform, &format!("{error:#}"));
                 self.set_status(message, true);
             }
         }
@@ -75,6 +76,73 @@ impl Launcher {
         context: &egui::Context,
         pal: &Pal,
     ) {
+        // Deletion is a two-step action: the dialog defaults to cancel (Escape and
+        // the first button both cancel) and a successful delete leaves a short
+        // undo entry instead of making the user re-enter the room.
+        if let Some(entry) = self.favorite_delete_confirm.clone() {
+            let mut cancel = false;
+            egui::Window::new("删除收藏确认")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(context, |ui| {
+                    ui.label(format!(
+                        "确认删除“{}”？此操作不会停止正在播放的会话。",
+                        entry.name
+                    ));
+                    let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+                    ui.horizontal(|ui| {
+                        if ui.button("取消（默认）").clicked() {
+                            cancel = true;
+                        }
+                        if ui.button("确认删除").clicked() {
+                            self.send_store(StoreAction::RemoveFavorite(
+                                entry.target.platform,
+                                entry.target.room.clone(),
+                            ));
+                            self.favorite_undo =
+                                Some((entry.clone(), std::time::Instant::now()));
+                            self.favorite_selected = None;
+                            cancel = true;
+                        }
+                    });
+                    if escape {
+                        cancel = true;
+                    }
+                });
+            if cancel {
+                self.favorite_delete_confirm = None;
+            }
+        }
+        if let Some((entry, removed_at)) = self.favorite_undo.clone() {
+            if removed_at.elapsed() < std::time::Duration::from_secs(20) {
+                egui::Window::new("已删除收藏")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::Vec2::new(-18.0, -18.0))
+                    .show(context, |ui| {
+                        ui.label(format!("已删除“{}”。", entry.name));
+                        ui.horizontal(|ui| {
+                            if ui.button("撤销删除").clicked() {
+                                self.send_store(StoreAction::AddFavorite(
+                                    entry.name.clone(),
+                                    entry.target.clone(),
+                                ));
+                                self.favorite_undo = None;
+                                self.set_status("已撤销删除并恢复收藏。", false);
+                            }
+                            if ui.button("关闭").clicked() {
+                                self.favorite_undo = None;
+                            }
+                        });
+                    });
+                // Keep the undo window's auto-expiry visible without a busy loop.
+                context.request_repaint_after(std::time::Duration::from_millis(500));
+            } else {
+                self.favorite_undo = None;
+            }
+        }
+
         let width = host.width();
         let height = host.height();
         let pad = 16.0;
@@ -91,7 +159,12 @@ impl Launcher {
         let launch_height = launch_card_height(inner, compact_guess(inner));
         let launch_card = Rect::from_min_size(launch_origin, vec2(width, launch_height));
         rounded(ui.painter(), launch_card, 10.0, pal.card);
-        rounded_stroke(ui.painter(), launch_card, 10.0, Stroke::new(1.0, pal.border));
+        rounded_stroke(
+            ui.painter(),
+            launch_card,
+            10.0,
+            Stroke::new(1.0, pal.border),
+        );
         let strip_rect = Rect::from_min_size(
             launch_origin + vec2(pad - 3.0, y - 3.0),
             vec2(4.0 * tab_width + 3.0 * tab_gap + 6.0, 36.0),
@@ -99,8 +172,18 @@ impl Launcher {
         rounded(ui.painter(), strip_rect, 9.0, pal.hover);
         let mut tabs_x = pad;
         for platform in Platform::ALL {
-            let pill_rect = Rect::from_min_size(launch_origin + vec2(tabs_x, y), vec2(tab_width, 30.0));
-            if pill(ui, pill_rect, platform.label(), self.platform == platform, pal, true).clicked() {
+            let pill_rect =
+                Rect::from_min_size(launch_origin + vec2(tabs_x, y), vec2(tab_width, 30.0));
+            if pill(
+                ui,
+                pill_rect,
+                platform.label(),
+                self.platform == platform,
+                pal,
+                true,
+            )
+            .clicked()
+            {
                 self.platform = platform;
             }
             tabs_x += tab_width + tab_gap;
@@ -188,7 +271,8 @@ impl Launcher {
             let left = pad + column as f32 * (cell + column_gap);
             let top = y + row as f32 * (label_height + 3.0 + combo_height + 8.0);
             let scope_font = font(10.0);
-            let scope_width = (cell / 2.0).min(measure(ui.painter(), scopes[index], &scope_font) + 4.0);
+            let scope_width =
+                (cell / 2.0).min(measure(ui.painter(), scopes[index], &scope_font) + 4.0);
             let scope_rect = Rect::from_min_size(
                 launch_origin + vec2(left + cell - scope_width, top),
                 vec2(scope_width, label_height),
@@ -222,20 +306,45 @@ impl Launcher {
             Quality::High => 1,
             Quality::Low => 2,
         };
-        if dropdown(ui, combos[0].1, "launch-quality", &mut quality, &QUALITY_ITEMS, pal).changed() {
+        if dropdown(
+            ui,
+            combos[0].1,
+            "launch-quality",
+            &mut quality,
+            &QUALITY_ITEMS,
+            pal,
+        )
+        .changed()
+        {
             self.quality = [Quality::Best, Quality::High, Quality::Low][quality];
         }
         let mut buffer = match self.playback_draft.buffer_mode {
             BufferMode::LowLatency => 0,
             BufferMode::Stable => 1,
         };
-        if dropdown(ui, combos[1].1, "launch-buffer", &mut buffer, &BUFFER_ITEMS, pal).changed() {
+        if dropdown(
+            ui,
+            combos[1].1,
+            "launch-buffer",
+            &mut buffer,
+            &BUFFER_ITEMS,
+            pal,
+        )
+        .changed()
+        {
             self.playback_draft.buffer_mode = [BufferMode::LowLatency, BufferMode::Stable][buffer];
         }
         let launch_danmaku_text = ["跟随设置", "开启", "关闭"];
         let mut danmaku = self.launch_danmaku as usize;
-        if dropdown(ui, combos[2].1, "launch-danmaku", &mut danmaku, &launch_danmaku_text, pal)
-            .changed()
+        if dropdown(
+            ui,
+            combos[2].1,
+            "launch-danmaku",
+            &mut danmaku,
+            &launch_danmaku_text,
+            pal,
+        )
+        .changed()
         {
             self.launch_danmaku = danmaku.min(2) as u8;
         }
@@ -259,7 +368,16 @@ impl Launcher {
             Enhancement::Light => 1,
             Enhancement::High => 2,
         };
-        if dropdown(ui, combos[4].1, "launch-enhance", &mut enhance, &ENHANCE_ITEMS, pal).changed() {
+        if dropdown(
+            ui,
+            combos[4].1,
+            "launch-enhance",
+            &mut enhance,
+            &ENHANCE_ITEMS,
+            pal,
+        )
+        .changed()
+        {
             let value = [Enhancement::Off, Enhancement::Light, Enhancement::High][enhance];
             if value != self.playback_draft.enhancement {
                 self.playback_draft.enhancement = value;
@@ -288,17 +406,40 @@ impl Launcher {
         let launch_bottom = y + note_height + 8.0;
         debug_assert!((launch_bottom - launch_height).abs() < 0.5);
         // Launch buttons (painted after the card so they stay visible).
-        if button(ui, mpv_rect, "用 mpv 打开（回车）", Btn::Primary, pal, self.storage_pending == 0)
-            .clicked()
+        if button(
+            ui,
+            mpv_rect,
+            "用 mpv 打开（回车）",
+            Btn::Primary,
+            pal,
+            self.storage_pending == 0,
+        )
+        .clicked()
         {
             self.launch_with(Player::Mpv, context);
         }
-        if button(ui, pot_rect, "用 PotPlayer 打开", Btn::Secondary, pal, self.storage_pending == 0)
-            .clicked()
+        if button(
+            ui,
+            pot_rect,
+            "用 PotPlayer 打开",
+            Btn::Secondary,
+            pal,
+            self.storage_pending == 0,
+        )
+        .clicked()
         {
             self.launch_with(Player::PotPlayer, context);
         }
-        if button(ui, cancel_rect, "取消启动", Btn::Secondary, pal, self.playing).clicked() {
+        if button(
+            ui,
+            cancel_rect,
+            "取消启动",
+            Btn::Secondary,
+            pal,
+            self.playing,
+        )
+        .clicked()
+        {
             self.cancel_newest_launch();
         }
         // ---- favourites section header ----------------------------------
@@ -337,16 +478,17 @@ impl Launcher {
         let first_action = width - action_span;
         section_header(
             ui,
-            Rect::from_min_size(host.min + vec2(0.0, y + 5.0), vec2((first_action - 10.0).max(80.0), 20.0)),
+            Rect::from_min_size(
+                host.min + vec2(0.0, y + 5.0),
+                vec2((first_action - 10.0).max(80.0), 20.0),
+            ),
             &heading,
             pal,
         );
         // Import / export sit next to the favourite actions like the original
         // data page; both use the native file dialogs.
-        let import_rect = Rect::from_min_size(
-            host.min + vec2(first_action, y),
-            vec2(action_width, 30.0),
-        );
+        let import_rect =
+            Rect::from_min_size(host.min + vec2(first_action, y), vec2(action_width, 30.0));
         if button(
             ui,
             import_rect,
@@ -379,7 +521,16 @@ impl Launcher {
             host.min + vec2(first_action + (action_width + action_gap) * 2.0, y),
             vec2(action_width, 30.0),
         );
-        if button(ui, add_rect, "加入收藏", Btn::Secondary, pal, self.storage_pending == 0).clicked() {
+        if button(
+            ui,
+            add_rect,
+            "加入收藏",
+            Btn::Secondary,
+            pal,
+            self.storage_pending == 0,
+        )
+        .clicked()
+        {
             self.add_current_favorite();
         }
         let del_rect = Rect::from_min_size(
@@ -390,13 +541,19 @@ impl Launcher {
             .favorite_selected
             .filter(|index| *index < self.snapshot.favorites.len())
             .is_some();
-        if button(ui, del_rect, "删除收藏", Btn::Secondary, pal, delete_enabled && self.storage_pending == 0)
-            .clicked()
+        if button(
+            ui,
+            del_rect,
+            "删除收藏",
+            Btn::Secondary,
+            pal,
+            delete_enabled && self.storage_pending == 0,
+        )
+        .clicked()
             && let Some(index) = self.favorite_selected
             && let Some(entry) = self.snapshot.favorites.get(index).cloned()
         {
-            self.send_store(StoreAction::RemoveFavorite(entry.target.platform, entry.target.room));
-            self.favorite_selected = None;
+            self.favorite_delete_confirm = Some(entry);
         }
         y += 30.0 + 6.0;
         // ---- grid + home column -----------------------------------------
@@ -406,7 +563,11 @@ impl Launcher {
         } else {
             width
         };
-        let browser_width = if wide_tail { width - home_width - 16.0 } else { width };
+        let browser_width = if wide_tail {
+            width - home_width - 16.0
+        } else {
+            width
+        };
         let hint_line = 18.0;
         let two_rows = CARD_INSET * 2.0 + CARD_HEIGHT * 2.0 + CARD_GAP;
         let mut browser_height = CARD_INSET * 2.0 + CARD_HEIGHT;
@@ -414,7 +575,8 @@ impl Launcher {
         if available >= two_rows {
             browser_height = available;
         }
-        let browser_rect = Rect::from_min_size(host.min + vec2(0.0, y), vec2(browser_width, browser_height));
+        let browser_rect =
+            Rect::from_min_size(host.min + vec2(0.0, y), vec2(browser_width, browser_height));
         self.favorite_grid(ui, browser_rect, context, pal, &platform_favorites);
         let hint_top = (browser_rect.bottom() + 4.0)
             .min(host.bottom() - hint_line - 2.0)
@@ -455,17 +617,24 @@ impl Launcher {
             )
         });
         let popup_open = ui.memory(|memory| memory.any_popup_open());
-        if escape {
+        // The delete confirmation must swallow Enter/arrow shortcuts: launching a
+        // player while answering a destructive dialog is never intended.
+        let confirm_open = self.favorite_delete_confirm.is_some();
+        if escape && !confirm_open {
             self.favorite_selected = None;
         }
-        if enter && !popup_open {
+        if enter && !popup_open && !confirm_open {
             if shift {
                 self.launch_with(Player::PotPlayer, context);
             } else {
                 self.launch_with(Player::Mpv, context);
             }
         }
-        if !ui.ctx().wants_keyboard_input() && !popup_open && !platform_favorites.is_empty() {
+        if !ui.ctx().wants_keyboard_input()
+            && !popup_open
+            && !confirm_open
+            && !platform_favorites.is_empty()
+        {
             let columns = if inner >= 660.0 {
                 3
             } else if inner >= 420.0 {
@@ -473,13 +642,11 @@ impl Launcher {
             } else {
                 1
             };
-            let current = self
-                .favorite_selected
-                .and_then(|selected| {
-                    platform_favorites
-                        .iter()
-                        .position(|(index, _, _)| *index == selected)
-                });
+            let current = self.favorite_selected.and_then(|selected| {
+                platform_favorites
+                    .iter()
+                    .position(|(index, _, _)| *index == selected)
+            });
             let next = if up {
                 current.map(|position| position.saturating_sub(columns))
             } else if down {
@@ -577,9 +744,15 @@ impl Launcher {
                     pos2(card.left() + CARD_INNER, button_top),
                     vec2(button_width, 30.0),
                 );
-                let pot = Rect::from_min_size(pos2(mpv.right() + 8.0, button_top), vec2(button_width, 30.0));
+                let pot = Rect::from_min_size(
+                    pos2(mpv.right() + 8.0, button_top),
+                    vec2(button_width, 30.0),
+                );
                 let choose = Rect::from_min_size(
-                    pos2(card.right() - CARD_INNER - 52.0, card.top() + CARD_COVER - 6.0 - 24.0),
+                    pos2(
+                        card.right() - CARD_INNER - 52.0,
+                        card.top() + CARD_COVER - 6.0 - 24.0,
+                    ),
                     vec2(52.0, 24.0),
                 );
                 let mpv_hot = ui
@@ -590,7 +763,9 @@ impl Launcher {
                     .interact(pot, id.with("pot"), Sense::click())
                     .on_hover_text("用 PotPlayer 打开")
                     .hovered();
-                let choose_hot = ui.interact(choose, id.with("choose"), Sense::click()).hovered();
+                let choose_hot = ui
+                    .interact(choose, id.with("choose"), Sense::click())
+                    .hovered();
                 self.paint_card_button(ui, mpv, "mpv", true, pal, selected, mpv_hot);
                 self.paint_card_button(ui, pot, "PotPlayer", false, pal, selected, pot_hot);
                 // The 选择 pill paints above the state pill slot.
@@ -600,14 +775,25 @@ impl Launcher {
                     ui.painter(),
                     choose,
                     6.0,
-                    Stroke::new(1.0, if selected { pal.selection_border } else { pal.border }),
+                    Stroke::new(
+                        1.0,
+                        if selected {
+                            pal.selection_border
+                        } else {
+                            pal.border
+                        },
+                    ),
                 );
                 text_in(
                     ui.painter(),
                     choose,
                     "选择",
                     font(11.0),
-                    if selected { pal.selection_text } else { pal.text },
+                    if selected {
+                        pal.selection_text
+                    } else {
+                        pal.text
+                    },
                     Align2::CENTER_CENTER,
                 );
                 if choose_hot {
@@ -619,7 +805,9 @@ impl Launcher {
                     self.favorite_selected = Some(*favorite_index);
                     self.fill_room(name, target);
                 }
-                if ui.interact(mpv, id.with("mpv"), Sense::click()).double_clicked()
+                if ui
+                    .interact(mpv, id.with("mpv"), Sense::click())
+                    .double_clicked()
                     || ui.interact(mpv, id.with("mpv"), Sense::click()).clicked()
                 {
                     action = Some((*favorite_index, false));
@@ -627,7 +815,10 @@ impl Launcher {
                 if ui.interact(pot, id.with("pot"), Sense::click()).clicked() {
                     action = Some((*favorite_index, true));
                 }
-                if ui.interact(choose, id.with("choose"), Sense::click()).clicked() {
+                if ui
+                    .interact(choose, id.with("choose"), Sense::click())
+                    .clicked()
+                {
                     self.favorite_selected = Some(*favorite_index);
                     self.fill_room(name, target);
                 }
@@ -642,7 +833,11 @@ impl Launcher {
         {
             self.favorite_selected = Some(index);
             let settings = self.launch_settings();
-            let player = if potplayer { Player::PotPlayer } else { Player::Mpv };
+            let player = if potplayer {
+                Player::PotPlayer
+            } else {
+                Player::Mpv
+            };
             self.start_playback_with(target, player, settings, context);
         }
     }
@@ -661,16 +856,36 @@ impl Launcher {
     ) {
         let painter = ui.painter();
         let box_rect = Rect::from_min_size(card.min, vec2(card.width() - 1.0, card.height() - 1.0));
-        rounded(painter, box_rect, CARD_RADIUS, if selected { pal.selection_soft } else { pal.card });
+        rounded(
+            painter,
+            box_rect,
+            CARD_RADIUS,
+            if selected {
+                pal.selection_soft
+            } else {
+                pal.card
+            },
+        );
         rounded_stroke(
             painter,
             box_rect,
             CARD_RADIUS,
-            Stroke::new(1.0, if hovered { pal.border_hover } else { pal.border }),
+            Stroke::new(
+                1.0,
+                if hovered {
+                    pal.border_hover
+                } else {
+                    pal.border
+                },
+            ),
         );
         // Cover gradient: blend(accent, card, .55) -> blend(accent, card, .88).
         let accent = pal.platform(target.platform);
-        let tone = if selected { pal.selection_soft } else { pal.card };
+        let tone = if selected {
+            pal.selection_soft
+        } else {
+            pal.card
+        };
         let cover = Rect::from_min_size(
             card.min + vec2(1.0, 1.0),
             vec2(card.width() - 2.0, CARD_COVER),
@@ -696,17 +911,30 @@ impl Launcher {
             };
             let state_font = font(10.5);
             let text_width = measure(painter, text, &state_font);
-            let pill_width = (text_width + 24.0).max(52.0).min((card.width() - CARD_INNER * 2.0 - 52.0).max(40.0));
+            let pill_width = (text_width + 24.0)
+                .max(52.0)
+                .min((card.width() - CARD_INNER * 2.0 - 52.0).max(40.0));
             let state_rect = Rect::from_min_size(
                 pos2(card.right() - 9.0 - pill_width, card.top() + 9.0),
                 vec2(pill_width, 22.0),
             );
             rounded(painter, state_rect, 5.0, pal.card);
-            let color = if live { pal.success } else { pal.text_secondary };
-            painter.circle_filled(pos2(state_rect.left() + 10.5, state_rect.center().y), 2.5, color);
+            let color = if live {
+                pal.success
+            } else {
+                pal.text_secondary
+            };
+            painter.circle_filled(
+                pos2(state_rect.left() + 10.5, state_rect.center().y),
+                2.5,
+                color,
+            );
             text_in(
                 painter,
-                Rect::from_min_max(pos2(state_rect.left() + 16.0, state_rect.top()), state_rect.max),
+                Rect::from_min_max(
+                    pos2(state_rect.left() + 16.0, state_rect.top()),
+                    state_rect.max,
+                ),
                 text,
                 state_font,
                 color,
@@ -714,10 +942,15 @@ impl Launcher {
             );
         }
         if selected {
-            let badge_rect =
-                Rect::from_min_size(card.min + vec2(40.0, 42.0), Vec2::splat(14.0));
+            let badge_rect = Rect::from_min_size(card.min + vec2(40.0, 42.0), Vec2::splat(14.0));
             painter.circle_filled(badge_rect.center(), 7.0, pal.selection);
-            draw_glyph(painter, badge_rect.shrink(2.5), Glyph::Check, pal.selection_text, 1.6);
+            draw_glyph(
+                painter,
+                badge_rect.shrink(2.5),
+                Glyph::Check,
+                pal.selection_text,
+                1.6,
+            );
         }
         let body_top = card.top() + CARD_COVER;
         text_in(
@@ -771,14 +1004,24 @@ impl Launcher {
             painter,
             rect,
             6.0,
-            Stroke::new(1.0, if hovered { pal.border_hover } else { pal.border }),
+            Stroke::new(
+                1.0,
+                if hovered {
+                    pal.border_hover
+                } else {
+                    pal.border
+                },
+            ),
         );
         // The original card open buttons keep the normal text colour even when
         // the card itself is selected (only the card fill/border/check change).
         let color = pal.text;
         if play_icon {
             let icon = Rect::from_center_size(
-                pos2(rect.center().x - measure(painter, text, &font(11.0)) / 2.0 - 10.0, rect.center().y),
+                pos2(
+                    rect.center().x - measure(painter, text, &font(11.0)) / 2.0 - 10.0,
+                    rect.center().y,
+                ),
                 Vec2::splat(9.0),
             );
             draw_glyph(painter, icon, Glyph::Play, color, 1.0);
@@ -791,7 +1034,14 @@ impl Launcher {
                 Align2::CENTER_CENTER,
             );
         } else {
-            text_in(painter, rect, text, font(11.0), color, Align2::CENTER_CENTER);
+            text_in(
+                painter,
+                rect,
+                text,
+                font(11.0),
+                color,
+                Align2::CENTER_CENTER,
+            );
         }
     }
 
@@ -836,7 +1086,8 @@ impl Launcher {
         let snapshots = self.sessions.snapshots();
         let mut area = child(ui, list_rect);
         scroll_area(&mut area, "home-session-list", |ui| {
-            let mut rows: Vec<(String, String, String, bool, Option<String>, Option<Target>)> = Vec::new();
+            let mut rows: Vec<(String, String, String, bool, Option<String>, Option<Target>)> =
+                Vec::new();
             // sessions.snapshots() is newest-first already; reversing it pushed the
             // session the user is watching to the bottom of an overflowing list
             // (user report: "正在看的不在右边显示"). Keep the source order, exactly
@@ -846,10 +1097,7 @@ impl Launcher {
                 // One row per room, newest session wins — the legacy list built a
                 // seen-set from Platform:Room before appending history, so opening
                 // the same room twice never duplicated a row.
-                let key = format!(
-                    "{}:{}",
-                    session.target.platform, session.target.room
-                );
+                let key = format!("{}:{}", session.target.platform, session.target.room);
                 if seen_rooms.iter().any(|seen| seen == &key) {
                     continue;
                 }
@@ -890,7 +1138,8 @@ impl Launcher {
             }
             rows.truncate(24);
             if rows.is_empty() {
-                let empty_card = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 94.0));
+                let empty_card =
+                    Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 94.0));
                 rounded(ui.painter(), empty_card, 10.0, pal.card);
                 rounded_stroke(ui.painter(), empty_card, 10.0, Stroke::new(1.0, pal.border));
                 avatar(
@@ -902,7 +1151,10 @@ impl Launcher {
                 );
                 text_in(
                     ui.painter(),
-                    Rect::from_min_size(empty_card.min + vec2(54.0, 8.0), vec2(empty_card.width() - 64.0, 19.0)),
+                    Rect::from_min_size(
+                        empty_card.min + vec2(54.0, 8.0),
+                        vec2(empty_card.width() - 64.0, 19.0),
+                    ),
                     "暂无播放记录",
                     bold(13.0),
                     pal.text,
@@ -910,7 +1162,10 @@ impl Launcher {
                 );
                 text_in(
                     ui.painter(),
-                    Rect::from_min_size(empty_card.min + vec2(54.0, 27.0), vec2(empty_card.width() - 64.0, 17.0)),
+                    Rect::from_min_size(
+                        empty_card.min + vec2(54.0, 27.0),
+                        vec2(empty_card.width() - 64.0, 17.0),
+                    ),
                     "打开房间后，这里保留最近播放。",
                     font(11.0),
                     pal.text_secondary,
@@ -919,7 +1174,9 @@ impl Launcher {
                 ui.allocate_space(vec2(ui.available_width(), 94.0));
                 return;
             }
-            for (index, (name, meta, room, active, session_id, history_target)) in rows.into_iter().enumerate() {
+            for (index, (name, meta, room, active, session_id, history_target)) in
+                rows.into_iter().enumerate()
+            {
                 let texture = session_id
                     .as_ref()
                     .and_then(|id| {
@@ -945,8 +1202,7 @@ impl Launcher {
                         Sense::hover(),
                     )
                     .0;
-                let card =
-                    Rect::from_min_size(row_rect.min, vec2(row_rect.width(), card_height));
+                let card = Rect::from_min_size(row_rect.min, vec2(row_rect.width(), card_height));
                 let id = ui.id().with(("home-session", index));
                 let response = ui.interact(card, id, Sense::click());
                 rounded(ui.painter(), card, 10.0, pal.card);
@@ -954,14 +1210,24 @@ impl Launcher {
                     ui.painter(),
                     card,
                     10.0,
-                    Stroke::new(1.0, if response.hovered() { pal.border_hover } else { pal.border }),
+                    Stroke::new(
+                        1.0,
+                        if response.hovered() {
+                            pal.border_hover
+                        } else {
+                            pal.border
+                        },
+                    ),
                 );
                 let card_pad = 12.0;
                 let avatar_size = 32.0;
                 if compact_card {
                     avatar(
                         ui.painter(),
-                        Rect::from_min_size(card.min + vec2(card_pad, 8.0), Vec2::splat(avatar_size)),
+                        Rect::from_min_size(
+                            card.min + vec2(card_pad, 8.0),
+                            Vec2::splat(avatar_size),
+                        ),
                         texture.as_ref(),
                         &name,
                         pal,
@@ -969,7 +1235,10 @@ impl Launcher {
                     let text_left = card_pad + avatar_size + 10.0;
                     text_in(
                         ui.painter(),
-                        Rect::from_min_size(card.min + vec2(text_left, 7.0), vec2(card.width() - text_left - 10.0, 19.0)),
+                        Rect::from_min_size(
+                            card.min + vec2(text_left, 7.0),
+                            vec2(card.width() - text_left - 10.0, 19.0),
+                        ),
                         &name,
                         bold(13.0),
                         pal.text,
@@ -977,14 +1246,21 @@ impl Launcher {
                     );
                     text_in(
                         ui.painter(),
-                        Rect::from_min_size(card.min + vec2(text_left, 26.0), vec2(card.width() - text_left - 10.0, 17.0)),
+                        Rect::from_min_size(
+                            card.min + vec2(text_left, 26.0),
+                            vec2(card.width() - text_left - 10.0, 17.0),
+                        ),
                         &meta,
                         font(11.0),
                         pal.text_secondary,
                         Align2::LEFT_CENTER,
                     );
                     let state = room;
-                    let state_color = if active { pal.success } else { pal.text_secondary };
+                    let state_color = if active {
+                        pal.success
+                    } else {
+                        pal.text_secondary
+                    };
                     ui.painter().circle_filled(
                         pos2(card.left() + card_pad + 3.0, card.top() + 55.0),
                         2.5,
@@ -992,7 +1268,10 @@ impl Launcher {
                     );
                     text_in(
                         ui.painter(),
-                        Rect::from_min_size(card.min + vec2(card_pad + 10.0, 46.0), vec2(card.width() - card_pad * 2.0 - 10.0, 18.0)),
+                        Rect::from_min_size(
+                            card.min + vec2(card_pad + 10.0, 46.0),
+                            vec2(card.width() - card_pad * 2.0 - 10.0, 18.0),
+                        ),
                         &state,
                         font(11.0),
                         state_color,
@@ -1003,7 +1282,8 @@ impl Launcher {
                         pos2(card.right() - card_pad - reopen_width, card.top() + 66.0),
                         vec2(reopen_width, 24.0),
                     );
-                    if button(ui, reopen_rect, "重新打开", Btn::Secondary, pal, true).clicked() {
+                    if button(ui, reopen_rect, "重新打开", Btn::Secondary, pal, true).clicked()
+                    {
                         if let Some(id) = session_id.clone() {
                             reopen_session = Some(id);
                         } else if let Some(target) = history_target.clone() {
@@ -1022,12 +1302,18 @@ impl Launcher {
                         pal,
                     );
                     let text_left = card_pad + avatar_size + 10.0;
-                    let state_width = (card.width() / 4.0).clamp(96.0, 150.0).min(card.width() / 3.0);
+                    let state_width = (card.width() / 4.0)
+                        .clamp(96.0, 150.0)
+                        .min(card.width() / 3.0);
                     let reopen_width = (card.width() / 4.0).min(92.0);
-                    let text_width = (card.width() - text_left - reopen_width - state_width - 26.0).max(80.0);
+                    let text_width =
+                        (card.width() - text_left - reopen_width - state_width - 26.0).max(80.0);
                     text_in(
                         ui.painter(),
-                        Rect::from_min_size(card.min + vec2(text_left, 9.0), vec2(text_width, 19.0)),
+                        Rect::from_min_size(
+                            card.min + vec2(text_left, 9.0),
+                            vec2(text_width, 19.0),
+                        ),
                         &name,
                         bold(13.0),
                         pal.text,
@@ -1035,13 +1321,20 @@ impl Launcher {
                     );
                     text_in(
                         ui.painter(),
-                        Rect::from_min_size(card.min + vec2(text_left, 29.0), vec2(text_width, 17.0)),
+                        Rect::from_min_size(
+                            card.min + vec2(text_left, 29.0),
+                            vec2(text_width, 17.0),
+                        ),
                         &meta,
                         font(11.0),
                         pal.text_secondary,
                         Align2::LEFT_CENTER,
                     );
-                    let state_color = if active { pal.success } else { pal.text_secondary };
+                    let state_color = if active {
+                        pal.success
+                    } else {
+                        pal.text_secondary
+                    };
                     ui.painter().circle_filled(
                         pos2(card.left() + text_left + 3.0, card.top() + 44.0),
                         2.5,
@@ -1062,7 +1355,8 @@ impl Launcher {
                         pos2(card.right() - card_pad - reopen_width, card.top() + 17.0),
                         vec2(reopen_width, 28.0),
                     );
-                    if button(ui, reopen_rect, "重新打开", Btn::Secondary, pal, true).clicked() {
+                    if button(ui, reopen_rect, "重新打开", Btn::Secondary, pal, true).clicked()
+                    {
                         if let Some(id) = session_id.clone() {
                             reopen_session = Some(id);
                         } else if let Some(target) = history_target.clone() {
@@ -1092,7 +1386,10 @@ impl Launcher {
             return;
         };
         let launch = self.session_launch.get(id).cloned();
-        let player = launch.as_ref().map(|launch| launch.player).unwrap_or(session.player);
+        let player = launch
+            .as_ref()
+            .map(|launch| launch.player)
+            .unwrap_or(session.player);
         let settings = launch
             .map(|launch| launch.settings)
             .unwrap_or_else(|| self.snapshot.settings.clone());
@@ -1110,7 +1407,11 @@ fn launch_card_height(inner: f32, compact: bool) -> f32 {
     let pad = 16.0;
     let mut y = 8.0;
     y += 30.0 + 8.0;
-    y += if compact { 36.0 + 6.0 + 32.0 + 10.0 } else { 38.0 + 10.0 };
+    y += if compact {
+        36.0 + 6.0 + 32.0 + 10.0
+    } else {
+        38.0 + 10.0
+    };
     let columns = if inner >= 680.0 {
         5
     } else if inner >= 420.0 {
@@ -1160,22 +1461,15 @@ impl Launcher {
         };
         let filter = crate::gui::file_dialog::build_filter(&[("收藏 JSON (*.json)", "*.json")]);
         let default_name = crate::favorites_transfer::export_file_name(chrono::Local::now());
-        let Some(path) = crate::gui::file_dialog::save_file_name(
-            &filter,
-            "导出收藏",
-            &default_name,
-            None,
-        ) else {
+        let Some(path) =
+            crate::gui::file_dialog::save_file_name(&filter, "导出收藏", &default_name, None)
+        else {
             self.set_status("已取消导出。", false);
             return;
         };
         match std::fs::write(&path, text.as_bytes()) {
             Ok(()) => self.set_status(
-                format!(
-                    "已导出 {} 条收藏到 {}。",
-                    favorites.len(),
-                    path.display()
-                ),
+                format!("已导出 {} 条收藏到 {}。", favorites.len(), path.display()),
                 false,
             ),
             Err(error) => self.set_status(format!("写入导出文件失败：{error}"), true),

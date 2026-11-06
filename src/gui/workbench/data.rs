@@ -32,7 +32,11 @@ impl Launcher {
             ui,
             local_tab,
             "本地数据",
-            if selected_local { Btn::Secondary } else { Btn::Tab },
+            if selected_local {
+                Btn::Secondary
+            } else {
+                Btn::Tab
+            },
             pal,
             true,
         )
@@ -45,7 +49,11 @@ impl Launcher {
             ui,
             diagnostic_tab,
             "平台运行状态",
-            if selected_local { Btn::Tab } else { Btn::Secondary },
+            if selected_local {
+                Btn::Tab
+            } else {
+                Btn::Secondary
+            },
             pal,
             true,
         )
@@ -167,7 +175,10 @@ impl Launcher {
             column_x[index] = x;
             text_in(
                 ui.painter(),
-                Rect::from_min_size(pos2(x + 8.0, table_top), vec2(table_width * fraction - 12.0, HEADER_H)),
+                Rect::from_min_size(
+                    pos2(x + 8.0, table_top),
+                    vec2(table_width * fraction - 12.0, HEADER_H),
+                ),
                 label,
                 font(11.0),
                 pal.text_secondary,
@@ -227,7 +238,10 @@ impl Launcher {
             );
             text_in(
                 ui.painter(),
-                Rect::from_min_size(pos2(column_x[1] + 8.0, row.top()), vec2(table_width * 0.31 - 12.0, ROW_H)),
+                Rect::from_min_size(
+                    pos2(column_x[1] + 8.0, row.top()),
+                    vec2(table_width * 0.31 - 12.0, ROW_H),
+                ),
                 &location,
                 font(11.0),
                 pal.text_secondary,
@@ -235,15 +249,25 @@ impl Launcher {
             );
             text_in(
                 ui.painter(),
-                Rect::from_min_size(pos2(column_x[2] + 8.0, row.top()), vec2(table_width * 0.12 - 12.0, ROW_H)),
-                if bytes == 0 { "—".to_owned() } else { size_text(bytes) },
+                Rect::from_min_size(
+                    pos2(column_x[2] + 8.0, row.top()),
+                    vec2(table_width * 0.12 - 12.0, ROW_H),
+                ),
+                if bytes == 0 {
+                    "—".to_owned()
+                } else {
+                    size_text(bytes)
+                },
                 font(11.0),
                 pal.text_secondary,
                 Align2::LEFT_CENTER,
             );
             text_in(
                 ui.painter(),
-                Rect::from_min_size(pos2(column_x[3] + 8.0, row.top()), vec2(table_width * 0.21 - 12.0, ROW_H)),
+                Rect::from_min_size(
+                    pos2(column_x[3] + 8.0, row.top()),
+                    vec2(table_width * 0.21 - 12.0, ROW_H),
+                ),
                 data_page::modified_text(modified),
                 font(11.0),
                 pal.text_secondary,
@@ -266,18 +290,23 @@ impl Launcher {
             Rect::from_min_size(card.min + vec2(17.0, 425.0), vec2(width - 34.0, 19.0)),
             &note,
             font(11.0),
-            if snapshot.warning.is_some() { pal.warning } else { pal.text_secondary },
+            if snapshot.warning.is_some() {
+                pal.warning
+            } else {
+                pal.text_secondary
+            },
             Align2::LEFT_CENTER,
         );
         // Maintenance strip.
-        let maintenance = Rect::from_min_size(
-            card.min + vec2(17.0, 466.0),
-            vec2(width - 34.0, 74.0),
-        );
+        let maintenance =
+            Rect::from_min_size(card.min + vec2(17.0, 466.0), vec2(width - 34.0, 74.0));
         rounded(ui.painter(), maintenance, 8.0, pal.hover);
         text_in(
             ui.painter(),
-            Rect::from_min_size(maintenance.min + vec2(12.0, 10.0), vec2(maintenance.width() - 160.0, 20.0)),
+            Rect::from_min_size(
+                maintenance.min + vec2(12.0, 10.0),
+                vec2(maintenance.width() - 160.0, 20.0),
+            ),
             "缓存与日志维护",
             font(12.0),
             pal.text,
@@ -285,17 +314,31 @@ impl Launcher {
         );
         text_in(
             ui.painter(),
-            Rect::from_min_size(maintenance.min + vec2(12.0, 37.0), vec2(maintenance.width() - 160.0, 20.0)),
+            Rect::from_min_size(
+                maintenance.min + vec2(12.0, 37.0),
+                vec2(maintenance.width() - 160.0, 20.0),
+            ),
             "清理运行缓存和日志，保留收藏、历史、配置和登录资料。",
             font(11.0),
             pal.text_secondary,
             Align2::LEFT_CENTER,
         );
         let cleanup = Rect::from_min_size(
-            pos2(maintenance.right() - 12.0 - 108.0, maintenance.top() + (74.0 - 36.0) / 2.0),
+            pos2(
+                maintenance.right() - 12.0 - 108.0,
+                maintenance.top() + (74.0 - 36.0) / 2.0,
+            ),
             vec2(108.0, 36.0),
         );
-        if button(ui, cleanup, "清理缓存和日志", Btn::Secondary, pal, self.storage_pending == 0).clicked()
+        if button(
+            ui,
+            cleanup,
+            "清理缓存和日志",
+            Btn::Secondary,
+            pal,
+            self.storage_pending == 0,
+        )
+        .clicked()
         {
             self.cleanup_cache();
         }
@@ -331,10 +374,11 @@ impl Launcher {
         // Rust diagnostics preview for the selected category.
         let mut height = CARD_H;
         if self.data_detail {
-            let panel = Rect::from_min_size(
-                card.min + vec2(17.0, 640.0),
-                vec2(width - 34.0, 190.0),
-            );
+            // The detail drawer is taller than the old 190px stub: every row of
+            // the selected category (not only the first eight) must be reachable
+            // with its own scrollbar.
+            let panel =
+                Rect::from_min_size(card.min + vec2(17.0, 640.0), vec2(width - 34.0, 330.0));
             rounded(ui.painter(), panel, 8.0, pal.hover);
             let view = snapshot
                 .categories
@@ -347,7 +391,10 @@ impl Launcher {
             );
             text_in(
                 ui.painter(),
-                Rect::from_min_size(panel.min + vec2(12.0, 8.0), vec2(panel.width() - 120.0, 20.0)),
+                Rect::from_min_size(
+                    panel.min + vec2(12.0, 8.0),
+                    vec2(panel.width() - 120.0, 20.0),
+                ),
                 &title,
                 font(12.0),
                 pal.text,
@@ -360,30 +407,28 @@ impl Launcher {
             if button(ui, close, "关闭", Btn::Secondary, pal, true).clicked() {
                 self.data_detail = false;
             }
-            let mut lines: Vec<String> = Vec::new();
-            if let Some(view) = view {
-                for row in view.rows.iter().take(8) {
-                    lines.push(row.join(" · "));
-                }
-            }
-            if lines.is_empty() {
-                lines.push("没有可预览的行。".to_owned());
-            }
-            let text = lines.join("\n");
-            wrap_text(
-                ui.painter(),
-                Rect::from_min_size(panel.min + vec2(12.0, 34.0), vec2(panel.width() - 24.0, 148.0)),
-                &text,
-                font(11.0),
-                pal.text_secondary,
+            let detail_rect = Rect::from_min_size(
+                panel.min + vec2(8.0, 32.0),
+                vec2(panel.width() - 16.0, 290.0),
             );
-            height += 200.0;
+            let mut detail_ui = child(ui, detail_rect);
+            detail_ui.set_clip_rect(detail_rect);
+            egui::ScrollArea::vertical()
+                .id_salt("workbench-all-data-details")
+                .max_height(290.0)
+                .show(&mut detail_ui, |ui| {
+                    self.data_detail_card(ui);
+                });
+            height += 340.0;
         }
         if let Some(category) = clicked_detail {
             self.data_category = category;
             self.data_detail = true;
         }
-        ui.allocate_space(vec2((card.width() + 17.0).max(ui.available_width()), height));
+        ui.allocate_space(vec2(
+            (card.width() + 17.0).max(ui.available_width()),
+            height,
+        ));
     }
 
     fn data_platform_card(&mut self, ui: &mut Ui, origin: egui::Pos2, pal: &Pal) {
@@ -420,7 +465,16 @@ impl Launcher {
             pos2(card.right() - pad - 112.0, card.top() + 10.0),
             vec2(112.0, 32.0),
         );
-        if dropdown(ui, select, "data-platform", &mut selected, &platform_items, pal).changed() {
+        if dropdown(
+            ui,
+            select,
+            "data-platform",
+            &mut selected,
+            &platform_items,
+            pal,
+        )
+        .changed()
+        {
             self.platform = Platform::ALL[selected];
         }
         let table_x = card.left() + 17.0;
@@ -435,7 +489,10 @@ impl Launcher {
             column_x[index] = x;
             text_in(
                 ui.painter(),
-                Rect::from_min_size(pos2(x + 8.0, table_top), vec2(table_width * fraction - 12.0, 18.0)),
+                Rect::from_min_size(
+                    pos2(x + 8.0, table_top),
+                    vec2(table_width * fraction - 12.0, 18.0),
+                ),
                 label,
                 font(11.0),
                 pal.text_secondary,
@@ -450,7 +507,10 @@ impl Launcher {
             );
             text_in(
                 ui.painter(),
-                Rect::from_min_size(pos2(column_x[0] + 8.0, row_rect.top()), vec2(table_width * 0.26 - 12.0, 40.0)),
+                Rect::from_min_size(
+                    pos2(column_x[0] + 8.0, row_rect.top()),
+                    vec2(table_width * 0.26 - 12.0, 40.0),
+                ),
                 row.stage.label(),
                 font(11.0),
                 pal.text_secondary,
@@ -458,15 +518,25 @@ impl Launcher {
             );
             text_in(
                 ui.painter(),
-                Rect::from_min_size(pos2(column_x[1] + 8.0, row_rect.top()), vec2(table_width * 0.54 - 12.0, 40.0)),
+                Rect::from_min_size(
+                    pos2(column_x[1] + 8.0, row_rect.top()),
+                    vec2(table_width * 0.54 - 12.0, 40.0),
+                ),
                 &row.result,
                 font(11.0),
-                if row.stale { pal.warning } else { pal.text_secondary },
+                if row.stale {
+                    pal.warning
+                } else {
+                    pal.text_secondary
+                },
                 Align2::LEFT_CENTER,
             );
             text_in(
                 ui.painter(),
-                Rect::from_min_size(pos2(column_x[2] + 8.0, row_rect.top()), vec2(table_width * 0.20 - 12.0, 40.0)),
+                Rect::from_min_size(
+                    pos2(column_x[2] + 8.0, row_rect.top()),
+                    vec2(table_width * 0.20 - 12.0, 40.0),
+                ),
                 &row.time,
                 font(11.0),
                 pal.text_secondary,
@@ -478,8 +548,12 @@ impl Launcher {
                 Stroke::new(1.0, with_alpha(pal.border, 0.6)),
             );
         }
-        let refresh = Rect::from_min_size(pos2(table_x, table_top + 18.0 + 3.0 * 40.0 + 8.0), vec2(96.0, 36.0));
-        let logs = Rect::from_min_size(pos2(refresh.right() + 8.0, refresh.top()), vec2(96.0, 36.0));
+        let refresh = Rect::from_min_size(
+            pos2(table_x, table_top + 18.0 + 3.0 * 40.0 + 8.0),
+            vec2(96.0, 36.0),
+        );
+        let logs =
+            Rect::from_min_size(pos2(refresh.right() + 8.0, refresh.top()), vec2(96.0, 36.0));
         if button(ui, refresh, "刷新运行状态", Btn::Secondary, pal, true).clicked() {
             self.set_status("已刷新本地观测；此页不发起平台请求。", false);
         }
@@ -488,7 +562,10 @@ impl Launcher {
         }
         text_in(
             ui.painter(),
-            Rect::from_min_size(pos2(table_x, refresh.bottom() + 8.0), vec2(table_width, 19.0)),
+            Rect::from_min_size(
+                pos2(table_x, refresh.bottom() + 8.0),
+                vec2(table_width, 19.0),
+            ),
             "这里展示本地最近观测，不发起平台请求；历史结果不能代表当前状态。",
             font(11.0),
             pal.text_secondary,
@@ -502,7 +579,10 @@ impl Launcher {
             rounded(ui.painter(), panel, 8.0, pal.hover);
             text_in(
                 ui.painter(),
-                Rect::from_min_size(panel.min + vec2(12.0, 8.0), vec2(panel.width() - 24.0, 20.0)),
+                Rect::from_min_size(
+                    panel.min + vec2(12.0, 8.0),
+                    vec2(panel.width() - 24.0, 20.0),
+                ),
                 "诊断日志 · 最近记录（已脱敏）",
                 font(12.0),
                 pal.text,
@@ -510,13 +590,19 @@ impl Launcher {
             );
             wrap_text(
                 ui.painter(),
-                Rect::from_min_size(panel.min + vec2(12.0, 32.0), vec2(panel.width() - 24.0, 130.0)),
+                Rect::from_min_size(
+                    panel.min + vec2(12.0, 32.0),
+                    vec2(panel.width() - 24.0, 130.0),
+                ),
                 &self.diagnostics.preview(),
                 font(11.0),
                 pal.text_secondary,
             );
         }
-        ui.allocate_space(vec2((card.width() + 17.0).max(ui.available_width()), height));
+        ui.allocate_space(vec2(
+            (card.width() + 17.0).max(ui.available_width()),
+            height,
+        ));
     }
 }
 
@@ -530,7 +616,8 @@ impl Launcher {
             ImportKind::FavoritesOrExport => "导入原版收藏/导出 JSON",
             ImportKind::LegacyHistory => "导入原版播放历史 JSON",
         };
-        let Some(path) = crate::gui::file_dialog::open_file_name(&filter, title, Some(root.as_path()))
+        let Some(path) =
+            crate::gui::file_dialog::open_file_name(&filter, title, Some(root.as_path()))
         else {
             self.set_status("已取消导入。", false);
             return;

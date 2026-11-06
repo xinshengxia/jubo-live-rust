@@ -6,9 +6,9 @@
 //! TarsWriter/CommandRegisterGroup/CommandHeartbeat/HandlePush/HandlePushV2/
 //! ParseMessageNotice，以及 docs/decisions/003-虎牙-tars.md。
 
+use live_hub_rust::danmaku::rich::{TextSegment, split_text_segments};
 use live_hub_rust::danmaku::{DanmakuEvent, DanmakuMode, MAX_TEXT_CHARS, MAX_WIRE_BYTES};
 use live_hub_rust::danmaku_huya::decode;
-use live_hub_rust::danmaku::rich::{TextSegment, split_text_segments};
 use live_hub_rust::danmaku_huya::emoticon_dictionary;
 
 #[test]

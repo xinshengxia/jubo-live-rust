@@ -8,20 +8,34 @@ use serde_json::json;
 fn media_addresses_reject_private_untrusted_and_credential_urls() {
     for bad in [
         "http://127.0.0.1/live.flv",
-        "https://bilivideo.com.attacker.invalid/live.flv",
         "https://user:pass@a.bilivideo.com/live.flv",
         "file:///video.flv",
+        "https://localhost/live.flv",
     ] {
         assert!(
             validate_media_url(bad).is_err(),
             "unexpectedly accepted {bad}"
         );
     }
+    // Unknown public CDNs are accepted (platforms rotate hostnames); the
+    // private-answer check still refuses an internal destination without DNS.
+    assert!(validate_media_url_with_resolver(
+        "https://bilivideo.com.attacker.invalid/live.flv",
+        &|_| Some(vec!["8.8.8.8".parse().unwrap()]),
+    )
+    .is_ok());
+    assert!(validate_media_url_with_resolver(
+        "https://bilivideo.com.attacker.invalid/live.flv",
+        &|_| Some(vec!["127.0.0.1".parse().unwrap()]),
+    )
+    .is_err());
+    // The protocol is preserved for http media targets: not every CDN endpoint
+    // has an equivalent HTTPS service.
     assert_eq!(
         validate_media_url("http://cdn.bilivideo.com/live.flv")
             .unwrap()
             .scheme(),
-        "https"
+        "http"
     );
     // Douyu's getH5PlayV1 rtmp_url can carry an explicit CDN port; the host
     // allowlist still applies, so this is a legitimate media address.
@@ -128,11 +142,11 @@ fn douyin_distinguishes_live_offline_rate_limit_and_verification() {
 }
 
 #[test]
-fn douyin_accepts_observed_douyinliving_cdn_and_reports_rejected_hosts() {
+fn douyin_accepts_observed_douyinliving_cdn_and_preserves_http() {
     // 2026-10-29 anonymous observation: a live room handed out
-    // http://pull-flv-*.douyinliving.com (whose HTTPS edge answers video/x-flv),
-    // so the CDN allowlist must cover that family and the http→https upgrade
-    // stays valid.
+    // http://pull-flv-*.douyinliving.com (whose HTTPS edge answers video/x-flv).
+    // Rust now keeps the platform protocol instead of forcing an HTTPS upgrade,
+    // because not every HTTP CDN endpoint has an equivalent HTTPS service.
     let page = douyin_page_with_flv(
         2,
         "http://pull-flv-f13.douyinliving.com/thirdgame/stream-synthetic.flv?sign=synthetic",
@@ -140,19 +154,57 @@ fn douyin_accepts_observed_douyinliving_cdn_and_reports_rejected_hosts() {
     let output = parse_douyin_page(&page, &Quality::Best).unwrap();
     assert_eq!(
         output.url,
-        "https://pull-flv-f13.douyinliving.com/thirdgame/stream-synthetic.flv?sign=synthetic"
+        "http://pull-flv-f13.douyinliving.com/thirdgame/stream-synthetic.flv?sign=synthetic"
     );
     assert_eq!(
         validate_media_url("http://pull-flv-f13.douyinliving.com/x.flv")
             .unwrap()
             .scheme(),
-        "https"
+        "http"
     );
-    // A genuinely unknown CDN family must surface the concrete rejection instead
-    // of being hidden behind the generic "no usable FLV address" message.
-    let rejected = douyin_page_with_flv(2, "https://pull-flv.invalid.example/stream.flv");
-    let error = parse_douyin_page(&rejected, &Quality::Best).unwrap_err();
-    assert!(error.to_string().contains("尚未允许的媒体主机"), "{error}");
+    // A new public CDN family outside the documented list is accepted through the
+    // public-answer check, so a platform hostname rotation cannot strand a room.
+    let new_cdn = douyin_page_with_flv(2, "https://pull-flv-new.douyincdn9.example/stream.flv");
+    let accepted = validate_media_url_with_resolver(
+        "https://pull-flv-new.douyincdn9.example/stream.flv",
+        &|_| Some(vec!["8.8.8.8".parse().unwrap()]),
+    );
+    assert!(accepted.is_ok(), "new public CDN rejected: {accepted:?}");
+    assert!(parse_douyin_page(&new_cdn, &Quality::Best).is_ok());
+    // A target that resolves into the private range is still refused.
+    assert!(validate_media_url_with_resolver(
+        "https://pull-flv-new.douyincdn9.example/stream.flv",
+        &|_| Some(vec!["10.1.2.3".parse().unwrap()]),
+    )
+    .is_err());
+}
+
+#[test]
+fn douyin_quality_keys_are_case_insensitive_but_keep_priority() {
+    let room = json!({"room":{"status":2,"title":"Synthetic","stream_url":{"flv_pull_url":{
+        "full_hd1": "https://pull.douyincdn.com/full.flv",
+        "Sd1": "https://pull.douyincdn.com/low.flv"
+    }}}});
+    let payload = format!("7:{}", json!({"state":{"roomStore":{"roomInfo":room}}}));
+    let page = format!(
+        "self.__pace_f.push([1,{}])</script>",
+        serde_json::to_string(&payload).unwrap()
+    );
+    assert_eq!(
+        parse_douyin_page(&page, &Quality::Best).unwrap().url,
+        "https://pull.douyincdn.com/full.flv"
+    );
+    assert_eq!(
+        parse_douyin_page(&page, &Quality::Low).unwrap().url,
+        "https://pull.douyincdn.com/low.flv"
+    );
+    // A normal room page carries captcha script names in its payloads; that must
+    // never turn a real room into a verification error.
+    let with_script = format!("<script>sec_sdk_build/captcha/index.js verifyFp</script>{page}");
+    assert_eq!(
+        parse_douyin_page(&with_script, &Quality::Best).unwrap().url,
+        "https://pull.douyincdn.com/full.flv"
+    );
 }
 
 #[test]

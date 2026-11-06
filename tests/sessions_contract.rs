@@ -22,6 +22,7 @@ enum Mode {
     RelayFails,
     Fail,
     StaleAfterCancel,
+    DelayedStop,
 }
 struct SyntheticLauncher {
     mode: Mode,
@@ -72,6 +73,18 @@ impl SessionLauncher for SyntheticLauncher {
             while !control.is_stop_requested() {
                 thread::sleep(Duration::from_millis(2));
             }
+            if matches!(mode, Mode::DelayedStop) {
+                // Statistics/exit callbacks already queued before Stop are
+                // allowed to arrive late, but cannot undo the user's request.
+                observer(PlaybackEvent::RelayExited { exit_code: Some(7) });
+                observer(PlaybackEvent::RelayStatistics {
+                    telemetry: live_hub_rust::playback::RelayTelemetry {
+                        state: "policy_rejected".into(), ..Default::default()
+                    },
+                });
+                thread::sleep(Duration::from_millis(150));
+            }
+            control.finish();
             observer(PlaybackEvent::Stopped);
         });
         Ok(LaunchOutcome {
@@ -273,4 +286,54 @@ fn state_events_include_title_pid_and_ordered_utc_timestamps() {
     assert_eq!(phases.last(), Some(&SessionPhase::Playing));
     manager.stop(&id).unwrap();
     wait(&manager, &id, SessionPhase::Stopped);
+}
+
+#[test]
+fn stop_is_not_undone_by_late_relay_or_room_events() {
+    let manager = manager(Mode::DelayedStop);
+    let id = manager.start(target(), Player::Mpv, settings(), None).unwrap();
+    wait(&manager, &id, SessionPhase::Playing);
+    manager.stop(&id).unwrap();
+    manager.update_room_status(&id, SessionRoomState::Offline, Some("late title".into()), "late room check".into());
+    thread::sleep(Duration::from_millis(40));
+    let row = manager.snapshot(&id).unwrap();
+    assert_eq!(row.phase, SessionPhase::Stopping);
+    assert!(row.error.is_none());
+    assert_ne!(row.title, "late title");
+    assert!(!row.room_note.contains("late room check"));
+    wait(&manager, &id, SessionPhase::Stopped);
+}
+
+#[test]
+fn explicit_resync_waits_for_owned_completion_and_opens_one_replacement() {
+    let manager = manager(Mode::DelayedStop);
+    let mut original = target();
+    original.quality = live_hub_rust::core::Quality::Low;
+    let id = manager.start(original.clone(), Player::PotPlayer, settings(), None).unwrap();
+    let unrelated = manager.start(target(), Player::Mpv, settings(), None).unwrap();
+    wait(&manager, &id, SessionPhase::Playing);
+    wait(&manager, &unrelated, SessionPhase::Playing);
+    manager.resync(&id).unwrap();
+    assert!(manager.resync(&id).is_err());
+    thread::sleep(Duration::from_millis(40));
+    assert_eq!(manager.snapshots().len(), 2, "no replacement before the owned player finishes");
+    assert_eq!(manager.snapshot(&id).unwrap().phase, SessionPhase::Stopping);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let replacement = loop {
+        if let Some(row) = manager.snapshots().into_iter()
+            .find(|row| row.id != id && row.id != unrelated && row.phase == SessionPhase::Playing) {
+            break row;
+        }
+        assert!(Instant::now() < deadline, "resync never opened its replacement");
+        thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(replacement.target, original);
+    assert_eq!(replacement.player, Player::PotPlayer);
+    assert_eq!(manager.snapshot(&id).unwrap().phase, SessionPhase::Stopped);
+    assert_eq!(manager.snapshot(&unrelated).unwrap().phase, SessionPhase::Playing);
+    assert_eq!(manager.snapshots().len(), 3);
+    manager.stop(&replacement.id).unwrap();
+    manager.stop(&unrelated).unwrap();
+    wait(&manager, &replacement.id, SessionPhase::Stopped);
+    wait(&manager, &unrelated, SessionPhase::Stopped);
 }

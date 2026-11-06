@@ -235,7 +235,7 @@ pub fn build_snapshot(
             category,
             count: files.len(),
             unit: category.unit(files.len()),
-            location: relative_location(root, &runtime_dir(root)),
+            location: if category == DataCategory::Logs { "runtime/ 与 logs/".into() } else { "runtime/ 与 avatars/".into() },
             bytes: files.iter().map(|file| file.bytes).sum(),
             modified: files.iter().filter_map(|file| file.modified).max(),
             rows,
@@ -270,7 +270,7 @@ pub fn build_snapshot(
             files_view(
                 DataCategory::Cache,
                 cache_files,
-                "仅列本程序运行目录中的缓存/状态文件；不遍历 profile、凭据或子目录。",
+                "仅列本程序runtime状态与已知头像缓存；不遍历profile或凭据目录。",
             ),
             files_view(
                 DataCategory::Logs,
@@ -282,46 +282,58 @@ pub fn build_snapshot(
     }
 }
 
+fn owned_component_log(name: &str) -> bool {
+    matches!(name, "relay.log" | "overlay.log" | "panic.log" | "search.log" | "login.log" |
+        "window.log" | "playback.log" | "network.log" | "auth.log" | "flv.log" | "sync.log" |
+        "avsync.log" | "live-hub-rust.log" | "live-hub-rust.log.1")
+}
+
+/// Avatar cache files written by avatars.rs: index.json plus
+/// <platform>-<sanitised room>.png (at most 64 characters in the room part).
+fn owned_avatar_cache(name: &str) -> bool {
+    if name == "index.json" {
+        return true;
+    }
+    let Some(stem) = name.strip_suffix(".png") else {
+        return false;
+    };
+    let Some((platform, room)) = stem.split_once('-') else {
+        return false;
+    };
+    platform.parse::<Platform>().is_ok()
+        && !room.is_empty()
+        && room.len() <= 64
+        && room
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 fn scan_runtime(root: &Path) -> (Vec<DataFile>, Vec<DataFile>, Option<String>) {
-    let directory = runtime_dir(root);
     let mut cache = Vec::new();
     let mut logs = Vec::new();
     let mut warning = None;
-    let Ok(entries) = fs::read_dir(&directory) else {
-        return (cache, logs, warning);
-    };
     let mut visited = 0;
-    for entry in entries.flatten() {
-        if visited >= MAX_DATA_FILES {
-            warning = Some("运行文件较多，仅显示前 200 个；未修改任何文件。".to_owned());
-            break;
-        }
-        visited += 1;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if protected_name(&name) {
-            continue;
-        }
-        let path = entry.path();
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            continue;
-        }
-        let file = DataFile {
-            name: name.clone(),
-            bytes: metadata.len(),
-            modified: modified_secs(&metadata),
-            path,
-        };
-        if name.ends_with(".log") {
-            logs.push(file);
-        } else {
-            cache.push(file);
+    for (folder, kind) in [("runtime", 0), ("logs", 1), ("avatars", 2)] {
+        let directory = root.join(folder);
+        let Ok(dir_meta) = fs::symlink_metadata(&directory) else { continue; };
+        if !dir_meta.is_dir() || dir_meta.file_type().is_symlink() { continue; }
+        let Ok(entries) = fs::read_dir(&directory) else { continue; };
+        for entry in entries.flatten() {
+            if visited >= MAX_DATA_FILES { warning = Some("运行文件较多，仅显示前200个；未修改任何文件。".into()); break; }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if protected_name(&name) || (kind == 1 && !owned_component_log(&name)) || (kind == 2 && !owned_avatar_cache(&name)) { continue; }
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else { continue; };
+            if !metadata.is_file() || metadata.file_type().is_symlink() { continue; }
+            visited += 1;
+            let is_log = kind == 1 || name.ends_with(".log");
+            let file = DataFile { name: if kind == 0 { name } else { format!("{folder}/{name}") },
+                bytes: metadata.len(), modified: modified_secs(&metadata), path };
+            if is_log { logs.push(file); } else { cache.push(file); }
         }
     }
-    cache.sort_by(|left, right| left.name.cmp(&right.name));
-    logs.sort_by(|left, right| left.name.cmp(&right.name));
+    cache.sort_by(|a,b| a.name.cmp(&b.name));
+    logs.sort_by(|a,b| a.name.cmp(&b.name));
     (cache, logs, warning)
 }
 
@@ -794,9 +806,6 @@ fn disposable_runtime_names() -> [&'static str; 4] {
 /// Deletes only the launcher's own cache/log files. Returns freed bytes.
 pub fn cleanup_runtime(root: &Path) -> Result<u64> {
     let directory = runtime_dir(root);
-    if !directory.is_dir() {
-        return Ok(0);
-    }
     let mut freed = 0_u64;
     for name in disposable_runtime_names() {
         let path = directory.join(name);
@@ -810,6 +819,26 @@ pub fn cleanup_runtime(root: &Path) -> Result<u64> {
             freed += metadata.len();
         }
     }
+    for (folder, allow) in [
+        ("logs", owned_component_log as fn(&str) -> bool),
+        ("avatars", owned_avatar_cache as fn(&str) -> bool),
+    ] {
+        let directory = root.join(folder);
+        let Ok(meta) = fs::symlink_metadata(&directory) else { continue; };
+        if !meta.is_dir() || meta.file_type().is_symlink() { continue; }
+        let Ok(entries) = fs::read_dir(&directory) else { continue; };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !allow(&name) || protected_name(&name) { continue; }
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else { continue; };
+            if meta.is_file() && !meta.file_type().is_symlink() {
+                fs::remove_file(&path).with_context(|| format!("无法清理{folder}中的自有缓存/日志"))?;
+                freed += meta.len();
+            }
+        }
+    }
+
     Ok(freed)
 }
 
@@ -999,7 +1028,7 @@ impl Launcher {
         }
     }
 
-    fn data_detail_card(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn data_detail_card(&mut self, ui: &mut egui::Ui) {
         let Some(snapshot) = self.data_snapshot.clone() else {
             return;
         };

@@ -33,9 +33,7 @@ fn fixture_dir() -> Option<PathBuf> {
 
 fn webp_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap_or_else(|error| {
-            panic!("cannot read fixture directory {}: {error}", dir.display())
-        })
+        .unwrap_or_else(|error| panic!("cannot read fixture directory {}: {error}", dir.display()))
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
         .filter(|path| {

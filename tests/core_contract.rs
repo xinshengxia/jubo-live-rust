@@ -14,10 +14,7 @@ fn official_urls_and_prefixed_rooms_have_the_same_identity() {
         ("https://live.bilibili.com/123?from=synthetic", "bili:123"),
         ("https://live.bilibili.com/123/", "bili:123"),
         ("https://live.bilibili.com/123/extra", "bili:123"),
-        (
-            "https://live.bilibili.com/blanc/7777",
-            "bili:7777",
-        ),
+        ("https://live.bilibili.com/blanc/7777", "bili:7777"),
         ("https://live.bilibili.com/h5/7777", "bili:7777"),
         (
             "https://www.huya.com/example_room-1/",

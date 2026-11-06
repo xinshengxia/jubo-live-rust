@@ -99,7 +99,10 @@ fn normal_scene_lanes_are_inside_the_viewport() {
         assert!(item.width > 0.0 && item.height > 0.0);
         // Legacy speed model: every scrolling message crosses in the same fixed
         // duration, so its speed depends on its own width; fixed rows keep 0.
-        if matches!(item.message.mode, DanmakuMode::Scroll | DanmakuMode::Reverse) {
+        if matches!(
+            item.message.mode,
+            DanmakuMode::Scroll | DanmakuMode::Reverse
+        ) {
             assert!((item.speed - (1280.0 + item.width) / 8.0).abs() < 1e-3);
         } else {
             assert_eq!(item.speed, 0.0);
@@ -118,7 +121,12 @@ fn normal_scene_lanes_are_inside_the_viewport() {
             };
             fill(
                 &mut image,
-                (x as i64, item.y as i64, item.width as u32, item.height as u32),
+                (
+                    x as i64,
+                    item.y as i64,
+                    item.width as u32,
+                    item.height as u32,
+                ),
                 color,
             );
         }
@@ -177,7 +185,11 @@ fn crowded_scene_applies_the_crowded_scale_and_stays_bounded() {
     // The crowded policy shrinks ordinary messages once occupancy reaches 80%.
     let budget = usize::from(max_visible).min(scheduler.track_count() * 2);
     assert_eq!(crowd_scale(0, budget, true, 85), 1.0);
-    let expected_scale = if accepted * 10 >= budget * 8 { 0.85 } else { 1.0 };
+    let expected_scale = if accepted * 10 >= budget * 8 {
+        0.85
+    } else {
+        1.0
+    };
     assert!(
         (crowd_scale(accepted, budget, true, 85) - expected_scale).abs() < 1e-4,
         "accepted={accepted}"

@@ -157,11 +157,8 @@ fn huya_mobile_observation(room: &str) -> RoomObservation {
     let Ok(mut url) = Url::parse("https://mp.huya.com/cache.php") else {
         return RoomObservation::unknown("虎牙状态接口地址无效");
     };
-    url.query_pairs_mut().extend_pairs([
-        ("m", "Live"),
-        ("do", "profileRoom"),
-        ("roomid", room),
-    ]);
+    url.query_pairs_mut()
+        .extend_pairs([("m", "Live"), ("do", "profileRoom"), ("roomid", room)]);
     match platforms::json_get(url, "https://www.huya.com/") {
         Ok(root) => parse_huya(&root),
         Err(_) => RoomObservation::unknown("虎牙状态接口查询失败"),
@@ -221,11 +218,10 @@ fn query(target: &Target) -> Result<RoomObservation> {
             "https://www.douyu.com/",
         )?)),
         Platform::Douyin => {
-            let page = platforms::get(
-                Url::parse(&format!("https://live.douyin.com/{}", target.room))?,
-                "https://live.douyin.com/",
-                None,
-            )?;
+            // Status/title lookups share the same gated, route-failover read as
+            // playback (with the 4 s same-room short reuse); a bare pinned GET
+            // would miss the captcha/shell recovery and the request gate.
+            let page = platforms::douyin_room_page_shared(&target.room, None)?;
             Ok(parse_douyin_page(&page))
         }
     }

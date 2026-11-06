@@ -4,6 +4,7 @@
 //! with that upstream connection rather than spliced into the next response.
 
 use std::io::{self, ErrorKind, Read};
+use std::time::{Duration, Instant};
 
 pub const MAX_TAG_PAYLOAD: usize = 8 * 1024 * 1024;
 pub const MAX_HEADER_BYTES: usize = 4096;
@@ -460,6 +461,18 @@ pub fn measure_video_window<R: Read>(
 /// advancing even when the upstream clock jumps over dropped content.
 const MEDIA_JUMP_GAP_MS: u64 = 20;
 
+/// How long an epoch transition may stay unconfirmed before the guard is dropped.
+///
+/// A normal transition is confirmed by the peer track within a few interleaved
+/// tags (tens of milliseconds). If the HTTP response ends first, or one track
+/// stays absent, the next response may carry a completely different clock; a
+/// permanent "unknown generation" guard would then discard every tag forever
+/// while the relay kept reading (the player would starve without any error).
+/// After this bound the pending guard is abandoned and the ordinary reconnect /
+/// forward rebase logic takes over; a genuine old-track tail is still dropped by
+/// the per-track backward watermark check.
+const EPOCH_GUARD_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Media tracks have separate watermarks: equal audio/video timestamps are valid.
 /// Duplicate filtering is enabled only while catching up after a reconnect.
 ///
@@ -471,103 +484,172 @@ const MEDIA_JUMP_GAP_MS: u64 = 20;
 /// cache, which is a visible re-buffer. The timeline rebases such a jump onto
 /// the already forwarded clock (the skipped content stays lost, the clock does
 /// not break). The correction is shared by both tracks so A/V stay aligned.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
+struct ClockEpoch {
+    origin: u64,
+    latest: u64,
+    confirmed: [bool; 2],
+}
+
+#[derive(Debug)]
 pub struct ReconnectTimeline {
     last: [Option<u64>; 2],
+    last_raw: [Option<u64>; 2],
     catching_up: [bool; 2],
-    /// Signed correction from the raw upstream clock to the forwarded clock.
     shift: i64,
-    rebased: bool,
+    epoch: Option<ClockEpoch>,
+    epoch_started: Option<Instant>,
     jumps: u64,
+    epochs: u64,
     last_jump_ms: i64,
+    exhausted: bool,
+    discarded_epoch_tail: u64,
+    /// Test-injectable guard bound; production always uses EPOCH_GUARD_TIMEOUT.
+    epoch_guard_timeout: Duration,
+}
+
+impl Default for ReconnectTimeline {
+    fn default() -> Self {
+        Self {
+            last: [None; 2],
+            last_raw: [None; 2],
+            catching_up: [false; 2],
+            shift: 0,
+            epoch: None,
+            epoch_started: None,
+            jumps: 0,
+            epochs: 0,
+            last_jump_ms: 0,
+            exhausted: false,
+            discarded_epoch_tail: 0,
+            epoch_guard_timeout: EPOCH_GUARD_TIMEOUT,
+        }
+    }
 }
 
 impl ReconnectTimeline {
     pub fn begin_reconnect(&mut self) {
         self.catching_up = [self.last[0].is_some(), self.last[1].is_some()];
-        self.rebased = false;
+        // Keep an unfinished epoch guard across HTTP boundaries: an old tail
+        // must not acquire the new offset merely because transport reconnected.
+    }
+    pub fn jumps(&self) -> u64 { self.jumps }
+    /// Clock generations (epoch transitions). Reconnect resets are generations
+    /// too, so this can exceed the in-response jump counter.
+    pub fn epochs(&self) -> u64 { self.epochs }
+    pub fn last_jump_ms(&self) -> i64 { self.last_jump_ms }
+    /// Current common clock correction: output timestamp minus input timestamp.
+    pub fn shift_ms(&self) -> i64 { self.shift }
+    pub fn exhausted(&self) -> bool { self.exhausted }
+    pub fn discarded_epoch_tail(&self) -> u64 { self.discarded_epoch_tail }
+
+    fn adjusted(&self, raw: u64) -> i128 {
+        i128::from(raw) + i128::from(self.shift)
     }
 
-    /// In-response discontinuities rebased since this timeline was created.
-    pub fn jumps(&self) -> u64 {
-        self.jumps
+    fn begin_epoch(&mut self, slot: usize, raw: u64, target: u64, jump: i128, transport_reset: bool) {
+        // Compute from the original clock, never from a clamped intermediate.
+        self.shift = (i128::from(target) - i128::from(raw)) as i64;
+        let mut confirmed = [self.last[0].is_none(), self.last[1].is_none()];
+        confirmed[slot] = true;
+        self.epoch = Some(ClockEpoch {
+            origin: raw, latest: raw, confirmed,
+        });
+        self.epoch_started = Some(Instant::now());
+        self.catching_up[slot] = false;
+        self.epochs = self.epochs.saturating_add(1);
+        if !transport_reset { self.jumps = self.jumps.saturating_add(1); }
+        self.last_jump_ms = jump.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
     }
 
-    /// Signed raw jump of the most recently rebased discontinuity (diagnostics).
-    pub fn last_jump_ms(&self) -> i64 {
-        self.last_jump_ms
+    /// Drop an epoch guard that stayed unconfirmed for too long. Kept separate
+    /// from the accept path so the condition and its comment stay auditable.
+    fn expire_stale_epoch(&mut self) {
+        if self
+            .epoch_started
+            .is_some_and(|started| started.elapsed() >= self.epoch_guard_timeout)
+        {
+            self.epoch = None;
+            self.epoch_started = None;
+        }
     }
 
-    fn adjusted(&self, raw: u64) -> u64 {
-        let adjusted = i128::from(raw).saturating_add(i128::from(self.shift));
-        adjusted.clamp(0, i128::from(u32::MAX)) as u64
-    }
-
-    /// Return true when the complete tag should be forwarded.
+    /// Forward complete tags while preserving one common affine clock mapping.
+    /// A discontinuity is an epoch transition, not permission to rebase on each
+    /// interleaved tag. Until both tracks confirm the new epoch, old-track tails
+    /// are discarded. Payload/CTS is never rewritten.
     pub fn accept(&mut self, tag: &mut FlvTag) -> bool {
         let boundary = self.last.iter().flatten().copied().max().unwrap_or(0);
         if tag.is_codec_header() {
             tag.set_timestamp(boundary.min(u64::from(u32::MAX)) as u32);
             return true;
         }
-        let slot = match tag.kind() {
-            8 => 0,
-            9 => 1,
-            _ => return true,
-        };
+        let slot = match tag.kind() { 8 => 0, 9 => 1, _ => return true };
         let raw = u64::from(tag.timestamp());
-        let mut adjusted = self.adjusted(raw);
-        if self.catching_up[slot] {
-            let last = self.last[slot].unwrap_or(0);
-            if adjusted > last {
-                self.catching_up[slot] = false;
-            } else if !self.rebased
-                && raw < 1000
-                && last.saturating_sub(adjusted) > MAX_TIMELINE_JUMP_MS as u64
-            {
-                // A fresh upstream clock that restarted near zero is distinct from
-                // a short overlapping tail: continue the forwarded clock instead of
-                // dropping the rest of the new segment as duplicate overlap.
-                let target = boundary.saturating_add(1);
-                self.shift = (i128::from(target) - i128::from(raw))
-                    .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
-                    as i64;
-                adjusted = self.adjusted(raw);
-                self.rebased = true;
-                self.catching_up[slot] = false;
-            } else {
+        let limit = MAX_TIMELINE_JUMP_MS as u64;
+
+        // A pending epoch is expected to resolve within a few interleaved tags.
+        // Never let an unresolved guard survive indefinitely: after a reconnect
+        // the next response can use a different clock, and a permanent unknown-
+        // generation guard would discard every tag forever (silent starvation).
+        self.expire_stale_epoch();
+        if let Some(epoch) = self.epoch.as_mut() {
+            // A track's first packet may be slightly earlier than its peer's
+            // first DTS. Permit that normal interleave, but not the previous
+            // generation many seconds away. A moving upper edge also permits
+            // a temporarily absent track to join the established new clock.
+            let lower = epoch.origin.saturating_sub(limit);
+            let upper = epoch.latest.saturating_add(limit);
+            if raw < lower || raw > upper {
+                self.discarded_epoch_tail = self.discarded_epoch_tail.saturating_add(1);
                 return false;
             }
-        } else if let (Some(boundary), Some(track_last)) = (
-            self.last.iter().flatten().copied().max(),
-            self.last[slot],
-        ) {
-            // A forward jump means the CDN skipped queued media; a large backwards
-            // jump means its clock restarted. Both would reset the player demuxer.
-            let forward = i128::from(adjusted) - i128::from(boundary);
-            let backward = i128::from(track_last) - i128::from(adjusted);
-            let limit = i128::from(MAX_TIMELINE_JUMP_MS);
-            if forward > limit || backward > limit {
-                let target = boundary.saturating_add(MEDIA_JUMP_GAP_MS);
-                self.shift = (i128::from(self.shift) + i128::from(target) - i128::from(adjusted))
-                    .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
-                    as i64;
-                adjusted = target;
-                self.jumps = self.jumps.saturating_add(1);
-                self.last_jump_ms = if forward > limit {
-                    forward as i64
-                } else {
-                    -(backward as i64)
-                };
+            epoch.confirmed[slot] = true;
+            epoch.latest = epoch.latest.max(raw);
+        }
+
+        let mut adjusted = self.adjusted(raw);
+        let track_last = self.last[slot];
+        let catching = self.catching_up[slot];
+        if self.epoch.is_none() {
+            if let Some(last) = track_last {
+                let forward = adjusted - i128::from(boundary);
+                let backward = i128::from(last) - adjusted;
+                let clock_reset = catching && raw < 1000
+                    && self.last_raw[slot].unwrap_or(0).saturating_sub(raw) > limit;
+                if clock_reset || forward > i128::from(limit) || (!catching && backward > i128::from(limit)) {
+                    let gap = if clock_reset { 1 } else { MEDIA_JUMP_GAP_MS };
+                    let target = boundary.saturating_add(gap);
+                    self.begin_epoch(slot, raw, target, if forward > i128::from(limit) { forward } else { -backward }, clock_reset);
+                    adjusted = self.adjusted(raw);
+                }
             }
         }
-        // A 32-bit FLV timestamp cannot represent a rebased session beyond this.
-        // End this segment rather than silently wrapping and corrupting its clock.
-        if adjusted > u64::from(u32::MAX) {
+        if catching && self.epoch.is_none() {
+            if track_last.is_some_and(|last| adjusted <= i128::from(last)) { return false; }
+            self.catching_up[slot] = false;
+        } else if self.epoch.is_some() {
+            // Tail/duplicate data must not move an already forwarded track
+            // backwards even if it lies within the epoch's interleave window.
+            if track_last.is_some_and(|last| adjusted < i128::from(last)
+                || (catching && adjusted == i128::from(last))) { return false; }
+            self.catching_up[slot] = false;
+        }
+        if adjusted < 0 || adjusted > i128::from(u32::MAX) {
+            self.exhausted = true;
             return false;
         }
+        let adjusted = adjusted as u64;
         self.last[slot] = Some(self.last[slot].unwrap_or(0).max(adjusted));
+        self.last_raw[slot] = Some(raw);
         tag.set_timestamp(adjusted as u32);
+        let epoch_complete = self.epoch.as_ref().is_some_and(|epoch| {
+            epoch.confirmed.iter().all(|ready| *ready)
+        });
+        if epoch_complete {
+            self.epoch = None;
+            self.epoch_started = None;
+        }
         true
     }
 }
@@ -915,5 +997,104 @@ mod tests {
         let mut reset = media(9, 0);
         assert!(timeline.accept(&mut reset));
         assert_eq!(reset.timestamp(), 9022);
+    }
+
+    #[test]
+    fn epoch_transition_discards_old_audio_tail_without_changing_pair_delay() {
+        let mut timeline = ReconnectTimeline::default();
+        for kind in [8, 9] { assert!(timeline.accept(&mut media(kind, 100_000))); }
+        let mut video = media(9, 110_000);
+        assert!(timeline.accept(&mut video));
+        for raw in (100_020..=101_500).step_by(20) {
+            assert!(!timeline.accept(&mut media(8, raw)));
+        }
+        let mut audio = media(8, 110_000);
+        assert!(timeline.accept(&mut audio));
+        assert_eq!(audio.timestamp(), video.timestamp());
+        assert_eq!(timeline.jumps(), 1);
+        assert_eq!(timeline.discarded_epoch_tail(), 75);
+        for raw in [110_040, 110_080] {
+            let mut a = media(8, raw); let mut v = media(9, raw);
+            assert!(timeline.accept(&mut a) && timeline.accept(&mut v));
+            assert_eq!(a.timestamp(), v.timestamp());
+        }
+    }
+
+    #[test]
+    fn reconnect_reset_never_applies_new_shift_to_old_other_track_tail() {
+        let mut timeline = ReconnectTimeline::default();
+        for kind in [8, 9] { assert!(timeline.accept(&mut media(kind, 9000))); }
+        timeline.begin_reconnect();
+        let mut v = media(9, 0); assert!(timeline.accept(&mut v));
+        assert!(!timeline.accept(&mut media(8, 8900)));
+        let mut a = media(8, 0); assert!(timeline.accept(&mut a));
+        assert_eq!(a.timestamp(), v.timestamp());
+        assert_eq!(a.timestamp(), 9001);
+        timeline.begin_reconnect();
+        assert!(!timeline.accept(&mut media(8, 0)), "same-epoch duplicate on a new connection is dropped");
+    }
+
+    #[test]
+    fn normal_two_hour_span_and_signed_cts_do_not_accumulate_drift() {
+        let mut timeline = ReconnectTimeline::default();
+        for raw in (100_000..=7_300_000).step_by(40) {
+            let mut audio = media(8, raw); let mut video = media(9, raw);
+            assert!(timeline.accept(&mut audio) && timeline.accept(&mut video));
+            assert_eq!(audio.timestamp(), raw); assert_eq!(video.timestamp(), raw);
+        }
+        assert_eq!(timeline.jumps(), 0);
+        for cts in [-80_i32, 0, 120] {
+            let bytes = cts.to_be_bytes();
+            let mut tag = FlvTag::new(9, 7_300_040, &[0x27, 1, bytes[1], bytes[2], bytes[3], 9]).unwrap();
+            let payload = tag.payload().to_vec(); assert!(timeline.accept(&mut tag));
+            assert_eq!(tag.payload(), payload); assert_eq!(tag.timestamp(), 7_300_040);
+        }
+    }
+
+    #[test]
+    fn stale_unconfirmed_epoch_is_abandoned_instead_of_starving_the_stream() {
+        let mut timeline = ReconnectTimeline {
+            epoch_guard_timeout: Duration::from_millis(1),
+            ..ReconnectTimeline::default()
+        };
+        assert!(timeline.accept(&mut media(8, 100_000)));
+        assert!(timeline.accept(&mut media(9, 100_000)));
+        // A mid-response jump starts an epoch; the audio track cannot confirm it
+        // before the HTTP response ends.
+        let mut jumped = media(9, 200_000);
+        assert!(timeline.accept(&mut jumped));
+        assert_eq!(timeline.jumps(), 1);
+        assert_eq!(timeline.epochs(), 1);
+        std::thread::sleep(Duration::from_millis(3));
+        timeline.begin_reconnect();
+        // The next CDN response uses a completely different clock. A permanent
+        // unknown-generation guard would discard every tag forever (the relay
+        // keeps reading, the player starves, no reconnect is triggered).
+        let mut audio = media(8, 500);
+        assert!(
+            timeline.accept(&mut audio),
+            "a stale epoch guard must not starve the forwarded stream"
+        );
+        let mut video = media(9, 500);
+        assert!(timeline.accept(&mut video));
+        // The abandoned guard must not rewind the forwarded clock.
+        assert!(audio.timestamp() >= 100_020, "audio out={}", audio.timestamp());
+        assert!(video.timestamp() >= 100_020, "video out={}", video.timestamp());
+        assert!(timeline.epochs() >= 2, "generation count must expose the rebase");
+        // The common affine correction stays positive and keeps both tracks on
+        // the already forwarded clock (an exact value depends on which tag
+        // triggers the rebase, so only its sign/size bound is asserted here).
+        assert!(timeline.shift_ms() > 0);
+        assert!((audio.timestamp() as i64 - video.timestamp() as i64).abs() <= 20);
+    }
+
+    #[test]
+    fn output_clock_overflow_is_rejected_instead_of_saturated() {
+        let mut timeline = ReconnectTimeline::default();
+        for kind in [8, 9] { assert!(timeline.accept(&mut media(kind, u32::MAX - 10))); }
+        timeline.begin_reconnect();
+        for kind in [8, 9] { assert!(timeline.accept(&mut media(kind, 0))); }
+        assert!(!timeline.accept(&mut media(8, 100)));
+        assert!(timeline.exhausted());
     }
 }

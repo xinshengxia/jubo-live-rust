@@ -11,7 +11,7 @@ use live_hub_rust::avatars::{
 };
 use live_hub_rust::core::Platform;
 use live_hub_rust::platforms::{
-    avatar_thumbnail_url, bili_avatar_from_info, douyu_avatar_from_json, douyin_avatar_from_page,
+    avatar_thumbnail_url, bili_avatar_from_info, douyin_avatar_from_page, douyu_avatar_from_json,
     huya_avatar_from_json, normalize_avatar_url,
 };
 use serde_json::json;
@@ -156,12 +156,7 @@ impl FakeTransport {
     fn new(avatars: &[(Platform, &str, Option<&str>)], payload: Vec<u8>) -> Arc<Self> {
         let map = avatars
             .iter()
-            .map(|(platform, room, url)| {
-                (
-                    avatar_key(*platform, room),
-                    url.map(str::to_owned),
-                )
-            })
+            .map(|(platform, room, url)| (avatar_key(*platform, room), url.map(str::to_owned)))
             .collect();
         Arc::new(Self {
             avatars: Mutex::new(map),
@@ -192,8 +187,7 @@ impl AvatarTransport for FakeTransport {
         if let Some(failure) = *self.resolve_failure.lock().unwrap() {
             return Err(failure);
         }
-        self.resolve(platform, room)
-            .ok_or(AvatarFailure::Missing)
+        self.resolve(platform, room).ok_or(AvatarFailure::Missing)
     }
 
     fn fetch(&self, _url: &str) -> Option<Vec<u8>> {
@@ -254,12 +248,20 @@ fn request_resolves_downloads_and_persists_without_repeating_work() {
     assert_eq!(transport.resolve_calls.load(Ordering::SeqCst), 1);
     assert_eq!(transport.fetch_calls.load(Ordering::SeqCst), 1);
     // Cached lookup and a repeat request do no further work.
-    let cached = service.cached(Platform::Bili, "7777").expect("memory cache");
+    let cached = service
+        .cached(Platform::Bili, "7777")
+        .expect("memory cache");
     assert_eq!(cached.url, entry.url);
     service.request(Platform::Bili, "7777");
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(transport.resolve_calls.load(Ordering::SeqCst), 1);
-    assert!(directory.path().join("avatars").join("index.json").is_file());
+    assert!(
+        directory
+            .path()
+            .join("avatars")
+            .join("index.json")
+            .is_file()
+    );
     assert!(
         directory
             .path()
@@ -286,10 +288,7 @@ fn a_restart_paints_cached_avatars_without_network() {
         AvatarLimits::default(),
     );
     service.request(Platform::Douyu, "8888");
-    assert_eq!(
-        wait_updates(&service, 1, Duration::from_secs(5)).len(),
-        1
-    );
+    assert_eq!(wait_updates(&service, 1, Duration::from_secs(5)).len(), 1);
     drop(service);
 
     let second_transport = FakeTransport::new(&[], png_bytes(8, 8));
@@ -372,7 +371,10 @@ fn concurrency_is_bounded_by_the_pool_size() {
     assert_eq!(updates.len(), rooms.len());
     let max_active = transport.max_active.load(Ordering::SeqCst);
     assert!(max_active <= 3, "exceeded the pool: {max_active}");
-    assert!(max_active >= 2, "pool did not run in parallel: {max_active}");
+    assert!(
+        max_active >= 2,
+        "pool did not run in parallel: {max_active}"
+    );
 }
 
 #[test]
@@ -453,10 +455,7 @@ fn a_corrupt_index_or_missing_image_degrades_to_a_placeholder() {
     assert!(service.cached(Platform::Bili, "5").is_none());
     // The cache miss schedules a normal resolve instead of staying broken.
     service.request(Platform::Bili, "5");
-    assert_eq!(
-        wait_updates(&service, 1, Duration::from_secs(5)).len(),
-        1
-    );
+    assert_eq!(wait_updates(&service, 1, Duration::from_secs(5)).len(), 1);
 
     // A valid index whose image file vanished also falls back to None.
     let valid_index = directory.path().join("avatars").join("index.json");
@@ -497,7 +496,10 @@ fn avatar_entries_are_png_and_48px() {
     let entry: &AvatarEntry = &updates[0].entry;
     assert_eq!((entry.width, entry.height), (AVATAR_EDGE, AVATAR_EDGE));
     let decoded = image::load_from_memory(&entry.png).unwrap();
-    assert_eq!((decoded.width(), decoded.height()), (AVATAR_EDGE, AVATAR_EDGE));
+    assert_eq!(
+        (decoded.width(), decoded.height()),
+        (AVATAR_EDGE, AVATAR_EDGE)
+    );
 }
 
 #[test]

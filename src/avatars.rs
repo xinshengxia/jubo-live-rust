@@ -119,8 +119,7 @@ pub trait AvatarTransport: Send + Sync {
     /// Classified variant used for the diagnostics channel. The default wraps the
     /// Option API; the production transport reports platform/transport details.
     fn resolve_detailed(&self, platform: Platform, room: &str) -> Result<String, AvatarFailure> {
-        self.resolve(platform, room)
-            .ok_or(AvatarFailure::Missing)
+        self.resolve(platform, room).ok_or(AvatarFailure::Missing)
     }
     /// Classified download variant; the default reports a generic network failure.
     fn fetch_detailed(&self, url: &str) -> Result<Vec<u8>, AvatarFailure> {
@@ -163,8 +162,8 @@ impl AvatarTransport for OfficialTransport {
         let thumbnail = crate::platforms::avatar_thumbnail_url(url);
         // The URL was normalized by the resolver; re-check before every request so a
         // future caller cannot point the downloader at a non-allowlisted host.
-        let checked = crate::platforms::normalize_avatar_url(&thumbnail)
-            .ok_or(AvatarFailure::Disallowed)?;
+        let checked =
+            crate::platforms::normalize_avatar_url(&thumbnail).ok_or(AvatarFailure::Disallowed)?;
         download(&checked, MAX_AVATAR_BYTES, DEFAULT_TIMEOUT)
     }
 }
@@ -208,7 +207,15 @@ fn download(url: &str, max_bytes: usize, timeout: Duration) -> Result<Vec<u8>, A
 /// Decode and resize a public avatar on its worker before it reaches the UI.
 pub(crate) fn decode_avatar(bytes: &[u8]) -> Option<image::RgbaImage> {
     let image = decode_limited(bytes, MAX_AVATAR_BYTES, MAX_SOURCE_EDGE)?;
-    Some(image.resize_to_fill(AVATAR_EDGE, AVATAR_EDGE, image::imageops::FilterType::Triangle).into_rgba8())
+    Some(
+        image
+            .resize_to_fill(
+                AVATAR_EDGE,
+                AVATAR_EDGE,
+                image::imageops::FilterType::Triangle,
+            )
+            .into_rgba8(),
+    )
 }
 
 fn decode_limited(bytes: &[u8], max_bytes: usize, max_edge: u32) -> Option<image::DynamicImage> {
@@ -218,11 +225,17 @@ fn decode_limited(bytes: &[u8], max_bytes: usize, max_edge: u32) -> Option<image
     // Inspect the container before creating a pixel decoder. Decoder limits
     // below also bound allocation when a format carries inconsistent metadata.
     let dimensions = image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format().ok()?.into_dimensions().ok()?;
-    if dimensions.0 == 0 || dimensions.1 == 0 || dimensions.0 > max_edge || dimensions.1 > max_edge {
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if dimensions.0 == 0 || dimensions.1 == 0 || dimensions.0 > max_edge || dimensions.1 > max_edge
+    {
         return None;
     }
-    let mut reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(max_edge);
     limits.max_image_height = Some(max_edge);
@@ -608,10 +621,7 @@ impl Shared {
             return None;
         }
         let key = avatar_key(platform, room);
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(entry) = state.entries.get(&key).cloned() {
             touch(&mut state, &key);
             return Some(entry);
@@ -625,7 +635,11 @@ impl Shared {
                 return None;
             }
             let path = self.root.join(&index_entry.file);
-            if std::fs::symlink_metadata(&path).ok()?.file_type().is_symlink() {
+            if std::fs::symlink_metadata(&path)
+                .ok()?
+                .file_type()
+                .is_symlink()
+            {
                 return None;
             }
             let file = std::fs::File::open(path).ok()?;
@@ -634,7 +648,9 @@ impl Shared {
                 return None;
             }
             let mut bytes = Vec::new();
-            file.take(MAX_AVATAR_BYTES as u64 + 1).read_to_end(&mut bytes).ok()?;
+            file.take(MAX_AVATAR_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
             let image = decode_limited(&bytes, MAX_AVATAR_BYTES, AVATAR_EDGE)?;
             (image.width() == AVATAR_EDGE && image.height() == AVATAR_EDGE).then_some(bytes)
         })();
@@ -662,10 +678,7 @@ impl Shared {
         }
         let key = avatar_key(platform, room);
         {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             if state.pending.contains(&key) {
                 return;
             }
@@ -707,10 +720,7 @@ impl Shared {
             Ok(entry) => entry,
             Err(failure) => {
                 {
-                    let mut state = self
-                        .state
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
+                    let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
                     state.pending.remove(&key);
                     state.last_failure.insert(key, failure);
                     state.retry_at.insert(
@@ -731,10 +741,7 @@ impl Shared {
         let file = avatar_file_name(job.platform, &job.room);
         let persisted = write_atomic(&self.root, &file, &entry.png).is_ok();
         {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.pending.remove(&key);
             state.retry_at.remove(&key);
             state.last_failure.remove(&key);
@@ -764,10 +771,7 @@ impl Shared {
 
     /// Remembered URL for one platform/room, loaded from the persisted index.
     fn remembered_url(&self, platform: Platform, room: &str) -> Option<String> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         self.ensure_index(&mut state);
         state
             .index
@@ -826,10 +830,7 @@ impl Shared {
 
     fn save_index(&self) {
         let index = {
-            let state = self
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.index.clone()
         };
         if let Ok(bytes) = serde_json::to_vec(&index) {
@@ -941,12 +942,21 @@ mod tests {
 
     #[test]
     fn regression_avatar_decode_checks_dimensions_and_normalizes_all_formats() {
-        for format in [image::ImageFormat::Png, image::ImageFormat::Jpeg, image::ImageFormat::WebP] {
+        for format in [
+            image::ImageFormat::Png,
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::WebP,
+        ] {
             let mut bytes = Cursor::new(Vec::new());
-            image::DynamicImage::new_rgb8(96, 64).write_to(&mut bytes, format).unwrap();
+            image::DynamicImage::new_rgb8(96, 64)
+                .write_to(&mut bytes, format)
+                .unwrap();
             let decoded = decode_avatar(bytes.get_ref()).expect("bounded avatar");
             assert_eq!(decoded.dimensions(), (AVATAR_EDGE, AVATAR_EDGE));
-            assert_eq!(decoded.as_raw().len(), (AVATAR_EDGE * AVATAR_EDGE * 4) as usize);
+            assert_eq!(
+                decoded.as_raw().len(),
+                (AVATAR_EDGE * AVATAR_EDGE * 4) as usize
+            );
         }
         let oversized = png_bytes(4096, 1);
         assert!(oversized.len() < MAX_AVATAR_BYTES);
@@ -963,29 +973,51 @@ mod tests {
             std::fs::create_dir(&root).unwrap();
             let file = avatar_file_name(Platform::Bili, "123");
             let mut index = AvatarIndex::default();
-            index.entries.insert("bili:123".into(), IndexEntry {
-                url: "https://i0.hdslb.com/synthetic.png".into(), file: file.clone(), checked_at: None,
-            });
+            index.entries.insert(
+                "bili:123".into(),
+                IndexEntry {
+                    url: "https://i0.hdslb.com/synthetic.png".into(),
+                    file: file.clone(),
+                    checked_at: None,
+                },
+            );
             std::fs::write(root.join(INDEX_FILE), serde_json::to_vec(&index).unwrap()).unwrap();
-            if let Some(bytes) = content { std::fs::write(root.join(file), bytes).unwrap(); }
+            if let Some(bytes) = content {
+                std::fs::write(root.join(file), bytes).unwrap();
+            }
             let transport = Arc::new(FakeTransport {
                 avatar: Some("https://i0.hdslb.com/synthetic.png".into()),
-                payload: png_bytes(96, 96), calls: AtomicUsize::new(0),
+                payload: png_bytes(96, 96),
+                calls: AtomicUsize::new(0),
             });
-            let service = AvatarService::with_transport(directory.path(), transport.clone(), AvatarLimits::default());
+            let service = AvatarService::with_transport(
+                directory.path(),
+                transport.clone(),
+                AvatarLimits::default(),
+            );
             assert!(service.cached(Platform::Bili, "123").is_none());
-            let saved: AvatarIndex = serde_json::from_slice(&std::fs::read(root.join(INDEX_FILE)).unwrap()).unwrap();
-            assert!(!saved.entries.contains_key("bili:123"), "invalid index must be removed durably");
+            let saved: AvatarIndex =
+                serde_json::from_slice(&std::fs::read(root.join(INDEX_FILE)).unwrap()).unwrap();
+            assert!(
+                !saved.entries.contains_key("bili:123"),
+                "invalid index must be removed durably"
+            );
             service.request(Platform::Bili, "123");
             let deadline = Instant::now() + Duration::from_secs(3);
             let update = loop {
-                if let Some(update) = service.try_recv() { break update; }
-                assert!(Instant::now() < deadline, "recovery download did not complete");
+                if let Some(update) = service.try_recv() {
+                    break update;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "recovery download did not complete"
+                );
                 thread::sleep(Duration::from_millis(10));
             };
             assert_eq!(update.entry.width, AVATAR_EDGE);
             assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
-            let reloaded = AvatarService::with_transport(directory.path(), transport, AvatarLimits::default());
+            let reloaded =
+                AvatarService::with_transport(directory.path(), transport, AvatarLimits::default());
             assert!(reloaded.cached(Platform::Bili, "123").is_some());
         }
     }
@@ -998,15 +1030,28 @@ mod tests {
             payload: png_bytes(96, 96),
             calls: AtomicUsize::new(0),
         });
-        let service =
-            AvatarService::with_transport(directory.path(), transport.clone(), AvatarLimits::default());
+        let service = AvatarService::with_transport(
+            directory.path(),
+            transport.clone(),
+            AvatarLimits::default(),
+        );
         assert_eq!(
-            service.remember(Platform::Douyin, "989125753255", "//p3-pc.douyinpic.com/aweme/100x100/synthetic.jpeg"),
+            service.remember(
+                Platform::Douyin,
+                "989125753255",
+                "//p3-pc.douyinpic.com/aweme/100x100/synthetic.jpeg"
+            ),
             Some("https://p3-pc.douyinpic.com/aweme/100x100/synthetic.jpeg".into())
         );
-        assert!(service
-            .remember(Platform::Douyin, "989125753255", "https://example.com/avatar.jpg")
-            .is_none());
+        assert!(
+            service
+                .remember(
+                    Platform::Douyin,
+                    "989125753255",
+                    "https://example.com/avatar.jpg"
+                )
+                .is_none()
+        );
         service.request(Platform::Douyin, "989125753255");
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut update = None;
@@ -1039,7 +1084,9 @@ mod tests {
             AvatarLimits::default(),
         );
         assert_eq!(
-            reloaded.remembered(Platform::Douyin, "989125753255").as_deref(),
+            reloaded
+                .remembered(Platform::Douyin, "989125753255")
+                .as_deref(),
             Some("https://p3-pc.douyinpic.com/aweme/100x100/synthetic.jpeg")
         );
     }
@@ -1084,11 +1131,7 @@ mod tests {
         assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
 
         // Corrupted index: ignored, no panic, cache miss.
-        std::fs::write(
-            directory.path().join("avatars").join(INDEX_FILE),
-            b"{oops",
-        )
-        .unwrap();
+        std::fs::write(directory.path().join("avatars").join(INDEX_FILE), b"{oops").unwrap();
         let transport = Arc::new(FakeTransport {
             avatar: None,
             payload: Vec::new(),

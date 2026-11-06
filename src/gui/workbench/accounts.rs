@@ -17,6 +17,15 @@ impl Launcher {
         host: Rect,
         context: &egui::Context,
     ) {
+        let mut area = child(ui, host);
+        scroll_area(&mut area, "accounts-page-scroll", |ui| {
+            let origin = ui.cursor().min;
+            let content = Rect::from_min_size(origin, vec2(ui.available_width().max(200.0), host.height()));
+            self.accounts_workbench_body(ui, content, context);
+        });
+    }
+
+    fn accounts_workbench_body(&mut self, ui: &mut Ui, host: Rect, context: &egui::Context) {
         let pal = self.palette();
         if let Some(image) = self.login_image.take() {
             self.login_qr = Some(context.load_texture(
@@ -36,7 +45,16 @@ impl Launcher {
             Align2::LEFT_CENTER,
         );
         let check_all = Rect::from_min_size(host.min + vec2(128.0, 0.0), vec2(101.0, 32.0));
-        if button(ui, check_all, "检测全部平台", Btn::Secondary, &pal, !self.health_busy).clicked() {
+        if button(
+            ui,
+            check_all,
+            "检测全部平台",
+            Btn::Secondary,
+            &pal,
+            !self.health_busy,
+        )
+        .clicked()
+        {
             self.health_all_requested = true;
             self.login_message = "将按平台顺序逐个检查已保存的凭据。".to_owned();
         }
@@ -60,7 +78,10 @@ impl Launcher {
             let pad = 14.0;
             text_in(
                 ui.painter(),
-                Rect::from_min_size(card.min + vec2(pad, 8.0), vec2(card_width - pad * 2.0, 31.5)),
+                Rect::from_min_size(
+                    card.min + vec2(pad, 8.0),
+                    vec2(card_width - pad * 2.0, 31.5),
+                ),
                 platform.label(),
                 bold(15.0),
                 pal.text,
@@ -83,7 +104,10 @@ impl Launcher {
             let (summary, summary_color, reason) = self.account_summary(platform, now, &pal);
             text_in(
                 ui.painter(),
-                Rect::from_min_size(card.min + vec2(pad, 34.5), vec2(card_width - pad * 2.0, 19.0)),
+                Rect::from_min_size(
+                    card.min + vec2(pad, 34.5),
+                    vec2(card_width - pad * 2.0, 19.0),
+                ),
                 &summary,
                 font(12.0),
                 summary_color,
@@ -98,7 +122,10 @@ impl Launcher {
             );
             text_in(
                 ui.painter(),
-                Rect::from_min_size(card.min + vec2(pad, 53.5), vec2(card_width - pad * 2.0, 17.0)),
+                Rect::from_min_size(
+                    card.min + vec2(pad, 53.5),
+                    vec2(card_width - pad * 2.0, 17.0),
+                ),
                 &check_line,
                 font(12.0),
                 summary_color,
@@ -106,15 +133,24 @@ impl Launcher {
             );
             text_in(
                 ui.painter(),
-                Rect::from_min_size(card.min + vec2(pad, 72.0), vec2(card_width - pad * 2.0, 16.5)),
+                Rect::from_min_size(
+                    card.min + vec2(pad, 72.0),
+                    vec2(card_width - pad * 2.0, 16.5),
+                ),
                 &reason,
                 font(11.0),
                 pal.text_secondary,
                 Align2::LEFT_CENTER,
             );
-            // Four ghost action buttons, 25% columns.
+            // Four ghost action buttons, 25% columns. Douyin's first action is
+            // its dedicated web-verification window (the same window also allows
+            // signing in); the other platforms keep their QR/open-login entry.
             let actions = [
-                format!("{}扫码", platform.label()),
+                if platform == Platform::Douyin {
+                    "抖音网页验证".to_owned()
+                } else {
+                    format!("{}扫码", platform.label())
+                },
                 "检测 Cookie".to_owned(),
                 "状态详情".to_owned(),
                 "退出登录".to_owned(),
@@ -122,10 +158,15 @@ impl Launcher {
             let action_width = (card_width - pad * 2.0) / 4.0;
             for (action_index, label) in actions.iter().enumerate() {
                 let rect = Rect::from_min_size(
-                    pos2(card.left() + pad + action_index as f32 * action_width, card.top() + 94.0),
+                    pos2(
+                        card.left() + pad + action_index as f32 * action_width,
+                        card.top() + 94.0,
+                    ),
                     vec2(action_width - 6.0, 24.0),
                 );
-                let id = ui.id().with(("account-action", platform.to_string(), action_index));
+                let id = ui
+                    .id()
+                    .with(("account-action", platform.to_string(), action_index));
                 let response = ui.interact(rect, id, Sense::click());
                 if response.hovered() {
                     rounded(ui.painter(), rect, 6.0, pal.hover);
@@ -135,12 +176,23 @@ impl Launcher {
                 } else {
                     pal.text
                 };
-                text_in(ui.painter(), rect, label, font(12.0), color, Align2::CENTER_CENTER);
+                text_in(
+                    ui.painter(),
+                    rect,
+                    label,
+                    font(12.0),
+                    color,
+                    Align2::CENTER_CENTER,
+                );
                 if response.clicked() {
                     self.platform = platform;
                     match action_index {
                         0 => {
-                            let kind = if platform == Platform::Bili { 0 } else { 1 };
+                            let kind = match platform {
+                                Platform::Bili => 0,
+                                Platform::Douyin => 3,
+                                Platform::Huya | Platform::Douyu => 1,
+                            };
                             self.start_login(context, kind);
                         }
                         1 => self.start_login(context, 2),
@@ -244,7 +296,16 @@ impl Launcher {
                     pos2(panel.right() - 16.0 - 220.0, panel.top() + 16.0),
                     vec2(220.0, 34.0),
                 );
-                if button(ui, capture, "我已登录，检查并保存", Btn::Primary, &pal, true).clicked() {
+                if button(
+                    ui,
+                    capture,
+                    "我已登录，检查并保存",
+                    Btn::Primary,
+                    &pal,
+                    true,
+                )
+                .clicked()
+                {
                     self.login_capture.store(true, Ordering::Release);
                 }
                 let cancel = Rect::from_min_size(
@@ -265,12 +326,18 @@ impl Launcher {
                 pal.text_secondary,
             );
         }
-        let _ = y;
+        ui.allocate_space(vec2(width, y + if show_activity { 16.0 } else { 66.0 }));
     }
 
     /// Current Cookie verdict + reason for one platform card.
-    fn account_summary(&self, platform: Platform, now: u64, pal: &Pal) -> (String, Color32, String) {
-        if let Some(health) = self.login_health.get(&platform) {
+    fn account_summary(
+        &self,
+        platform: Platform,
+        now: u64,
+        pal: &Pal,
+    ) -> (String, Color32, String) {
+        if self.snapshot.credentials.imported_for(platform)
+            && let Some(health) = self.login_health.get(&platform) {
             let color = match health.state {
                 HealthState::Valid => {
                     if health.is_stale(now) {
@@ -284,11 +351,7 @@ impl Launcher {
                 _ => pal.text_secondary,
             };
             return (
-                format!(
-                    "{} Cookie：{}",
-                    platform.label(),
-                    health.current_label(now)
-                ),
+                format!("{} Cookie：{}", platform.label(), health.current_label(now)),
                 color,
                 health.current_reason(now),
             );

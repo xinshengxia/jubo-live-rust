@@ -69,16 +69,38 @@
         "path": "LICENSE",
         "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
       }
-    }
-  ],
-  "emoji": {
-    "name": "Noto Emoji",
-    "source_record": "assets/emoji-source.json",
-    "license": {
-      "path": "licenses/NotoEmoji-LICENSE.txt",
-      "sha256": "500bb1ccf43df7bbb522112f9133a52b16e1c35e809632f5d8609b179152de5b"
     },
-    "path": "assets/emoji-sheet.png",
-    "sha256": "5138ad7abb5174a608b9354eaa33a0def4cf2f572880b329855dfcf020800fcf"
-  }
+    {
+      "name": "DouyinLiveJava",
+      "license": {
+        "sha256": "20e6da4b621360c34ae7ff2d27ff22da805abe391bf317951ef1005f5eea088b",
+        "path": "licenses/DouyinLiveJava-LICENSE.txt"
+      },
+      "modules": [
+        "src/danmaku_douyin.rs"
+      ],
+      "revision": "b812242787ae9b5f4bbbf4e2239e4eec43318119",
+      "usage": "Douyin WebcastGiftMessage/MemberMessage/LikeMessage protobuf field definitions and event routing semantics; protocol facts only, no upstream source copied",
+      "repository": "https://github.com/lulajax/DouyinLiveJava",
+      "references": [
+        "client/src/main/proto/douyin.proto sha256:3ecf4474c9608aa048bc438a039d0210d7a9292bc5c936df5de280178cb2f1c0"
+      ]
+    },
+    {
+      "name": "douyinlive-proto",
+      "license": {
+        "sha256": "b45cae8cbf4b812bbe6078026fa73fda54af228667aa2df423d0be326918ae62",
+        "path": "licenses/douyinlive-proto-LICENSE.txt"
+      },
+      "modules": [
+        "src/danmaku_douyin.rs"
+      ],
+      "revision": "0d661be57c8f80947054b2ef0cd1ac2fdce3cc4b",
+      "usage": "Independent MIT cross-check of the Douyin rich-event protobuf field numbers; protocol facts only, no upstream source copied",
+      "repository": "https://github.com/jwwsjlm/douyinlive-proto",
+      "references": [
+        "protobuf/new_douyin.proto sha256:d00e9d8dd59df4fc8925172d2a9d5fa9a129a96ee567bdff2e4a9e74deefa2ef"
+      ]
+    }
+  ]
 }

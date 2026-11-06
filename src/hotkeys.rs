@@ -4,9 +4,10 @@
 //! (danmaku-1-config.cs / danmaku-4-overlay.cs). This module owns the
 //! accelerator-string grammar, the default binding table, duplicate / reserved-key
 //! validation and the Win32 registration wrapper. It never touches the overlay
-//! window: the overlay follow thread calls GlobalHotkeys::apply once, then polls
-//! GlobalHotkeys::poll_events from the same thread each tick and forwards the
-//! returned HotkeyEvent to its normal hotkey channel.
+//! window: the overlay follow thread applies configurable bindings while its
+//! player is foreground, clears them on blur, and polls GlobalHotkeys::poll_events
+//! from that same thread. Only the current player's events are forwarded to its
+//! normal hotkey channel, so concurrent sessions release each other's bindings.
 //!
 //! The fixed F7-F10 overlay keys are owned by this module too, but in a second
 //! registration range (FIXED_HOTKEY_ID_BASE) and only while the player owns the
@@ -322,6 +323,19 @@ impl FixedHotkeyState {
         self.held[action.index()] = registered;
     }
 
+    /// Explicit retry plan for a caller with its own pacing (the overlay uses
+    /// two seconds). transition() stays idempotent; a failed registration can
+    /// still recover after the previous foreground session releases the key.
+    pub fn retry_unheld(&self) -> Vec<FixedHotkeyStep> {
+        if !self.active {
+            return Vec::new();
+        }
+        FixedOverlayAction::ALL.into_iter()
+            .filter(|action| !self.holds(*action))
+            .map(FixedHotkeyStep::Register)
+            .collect()
+    }
+
     /// Whether this key is currently held through RegisterHotKey.
     pub const fn holds(&self, action: FixedOverlayAction) -> bool {
         self.held[action.index()]
@@ -518,13 +532,13 @@ fn key_name(vk: u32) -> &'static str {
 }
 
 const LETTERS: [&str; 26] = [
-    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",
-    "S", "T", "U", "V", "W", "X", "Y", "Z",
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
+    "T", "U", "V", "W", "X", "Y", "Z",
 ];
 const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
 const F_KEYS: [&str; 24] = [
-    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13", "F14",
-    "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24",
+    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13", "F14", "F15",
+    "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24",
 ];
 
 fn virtual_key_for(token: &str) -> Option<u32> {
@@ -607,10 +621,7 @@ pub enum HotkeyConfigError {
     },
     /// The bare F7-F10 keys are reserved by the fixed overlay keys (hint line);
     /// binding them globally would make one of the two registrations fail.
-    Reserved {
-        action: HotkeyAction,
-        spec: String,
-    },
+    Reserved { action: HotkeyAction, spec: String },
 }
 
 impl std::fmt::Display for HotkeyConfigError {
@@ -624,7 +635,11 @@ impl std::fmt::Display for HotkeyConfigError {
                 formatter,
                 "热键 {}（{}）无效：{error}",
                 action.label_zh(),
-                if spec.is_empty() { "空" } else { spec.as_str() }
+                if spec.is_empty() {
+                    "空"
+                } else {
+                    spec.as_str()
+                }
             ),
             Self::Duplicate {
                 first,
@@ -770,7 +785,10 @@ pub struct HotkeyRegisterError {
 
 impl std::fmt::Display for HotkeyRegisterError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let label = self.action.map(|action| action.label_zh()).unwrap_or("热键");
+        let label = self
+            .action
+            .map(|action| action.label_zh())
+            .unwrap_or("热键");
         write!(
             formatter,
             "{label}（{}）注册失败：{} (code {})",
@@ -894,8 +912,9 @@ mod windows_impl {
             for binding in parsed {
                 let id = HOTKEY_ID_BASE + binding.action.index() as i32;
                 let modifiers = binding.hotkey.register_modifiers();
-                let registered =
-                    unsafe { RegisterHotKey(std::ptr::null_mut(), id, modifiers, binding.hotkey.vk) };
+                let registered = unsafe {
+                    RegisterHotKey(std::ptr::null_mut(), id, modifiers, binding.hotkey.vk)
+                };
                 if registered == 0 {
                     errors.push(HotkeyRegisterError {
                         action: Some(binding.action),
@@ -968,21 +987,22 @@ mod windows_impl {
         /// MOD_NOREPEAT. While a key is registered the system consumes it, so
         /// the foreground player (PotPlayer) never sees it.
         ///
-        /// Only a state transition touches the OS: calling this with the
-        /// current state again is a no-op, so the overlay follow loop can call
-        /// it every tick with the current foreground status. Every failed
-        /// RegisterHotKey is returned (HotkeyRegisterError.action is None here,
-        /// spec is "F7".."F10"); the key stays unregistered, is reported by
-        /// fixed_registered() as not held, and is retried on the next
-        /// activation transition. The overlay's GetAsyncKeyState polling keeps
-        /// working as the fallback for exactly the unregistered keys.
+        /// State transitions release held keys or register the full set.
+        /// Repeating active=true retries only failed keys, so callers must pace
+        /// retries (the overlay uses two seconds). Every failed RegisterHotKey
+        /// is returned (action=None, spec="F7".."F10"); it remains unheld and
+        /// the overlay keeps GetAsyncKeyState polling as its fallback until a
+        /// subsequent registration succeeds.
         ///
         /// Thread constraint (same as apply/poll_events): RegisterHotKey(NULL)
         /// posts WM_HOTKEY to the calling thread's message queue, so the
         /// registration and the PeekMessageW drain must happen on the same
         /// thread (the overlay follow thread).
         pub fn set_fixed_active(&mut self, active: bool) -> Vec<HotkeyRegisterError> {
-            let steps = self.fixed.transition(active);
+            let mut steps = self.fixed.transition(active);
+            if active && steps.is_empty() {
+                steps = self.fixed.retry_unheld();
+            }
             if steps.is_empty() {
                 return Vec::new();
             }
@@ -1008,16 +1028,15 @@ mod windows_impl {
                                 action: None,
                                 spec: action.spec().to_owned(),
                                 code: 0,
-                                message: "RegisterHotKey 失败（固定键可能被其他程序占用或权限不足）"
-                                    .into(),
+                                message:
+                                    "RegisterHotKey 失败（固定键可能被其他程序占用或权限不足）"
+                                        .into(),
                             });
                         }
                     }
-                    FixedHotkeyStep::Unregister(action) => {
-                        unsafe {
-                            UnregisterHotKey(std::ptr::null_mut(), fixed_hotkey_id(action));
-                        }
-                    }
+                    FixedHotkeyStep::Unregister(action) => unsafe {
+                        UnregisterHotKey(std::ptr::null_mut(), fixed_hotkey_id(action));
+                    },
                 }
             }
             if active {
@@ -1436,5 +1455,27 @@ mod tests {
         state.clear();
         assert!(!state.is_active());
         assert_eq!(state.held_count(), 0);
+    }
+
+    #[test]
+    fn fixed_hotkey_retry_targets_only_unheld_keys_of_the_active_session() {
+        let mut state = FixedHotkeyState::new();
+        assert!(state.retry_unheld().is_empty());
+        assert_eq!(state.transition(true).len(), 4);
+        for action in FixedOverlayAction::ALL {
+            state.record(action, action != FixedOverlayAction::ToggleDanmaku);
+        }
+        assert!(state.transition(true).is_empty());
+        assert_eq!(
+            state.retry_unheld(),
+            vec![FixedHotkeyStep::Register(FixedOverlayAction::ToggleDanmaku)]
+        );
+        state.record(FixedOverlayAction::ToggleDanmaku, true);
+        assert!(state.retry_unheld().is_empty());
+        assert_eq!(state.transition(false).len(), 4);
+        assert!(state.retry_unheld().is_empty());
+        state.transition(true);
+        state.clear();
+        assert!(state.retry_unheld().is_empty());
     }
 }

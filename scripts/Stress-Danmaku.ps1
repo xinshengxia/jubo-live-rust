@@ -2,7 +2,7 @@
 param(
     # Release exe under test (GUI-subsystem release build; CLI path is used).
     [string]$Exe = '',
-    [string]$TargetDirectory = $env:LIVE_HUB_BUILD_DIR,
+    [string]$TargetDirectory = '',
     # Accepts either a real string array or one semicolon/comma separated string
     # (pwsh -File passes every argument as a single string).
     [string[]]$Rooms = @('bili:7777', 'huya:660000', 'douyu:952595', 'douyin:723910165684'),

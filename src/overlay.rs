@@ -196,6 +196,22 @@ pub fn fixed_overlay_hotkey_for(action: crate::hotkeys::FixedOverlayAction) -> O
     }
 }
 
+/// Win32 can leave a WM_HOTKEY queued after its registration is released. Gate
+/// both ranges at delivery time so a focus change or disabling hotkeys cannot
+/// apply a stale F7-F10 event to the previous session.
+pub fn active_overlay_hotkey(
+    event: crate::hotkeys::HotkeyEvent,
+    active: bool,
+) -> Option<OverlayHotkey> {
+    if !active {
+        return None;
+    }
+    Some(match event {
+        crate::hotkeys::HotkeyEvent::Action(action) => overlay_hotkey_for(action),
+        crate::hotkeys::HotkeyEvent::Fixed(action) => fixed_overlay_hotkey_for(action),
+    })
+}
+
 /// Display-area hotkey steps (legacy AreaSteps: full / 3/4 / half / quarter).
 pub const DISPLAY_AREA_STEPS: [u8; 4] = [100, 75, 50, 25];
 /// Speed hotkey steps (legacy SpeedSteps + labels).
@@ -384,7 +400,7 @@ fn fixture_sleep(cancellation: &Cancellation, duration: Duration) -> bool {
 /// the same bounded channel the real decoders use.
 fn run_fixture(
     path: &Path,
-    sender: SyncSender<DanmakuEvent>,
+    sender: crate::danmaku::EventSender,
     cancellation: Cancellation,
 ) -> Result<()> {
     let metadata = std::fs::metadata(path).context("无法读取覆盖层诊断夹具")?;
@@ -498,7 +514,8 @@ pub fn sc_points_scale(
     reference_height: u16,
     scale_with_window: bool,
 ) -> f32 {
-    let percent = f32::from(scale_percent.clamp(SC_SCALE_MIN_PERCENT, SC_SCALE_MAX_PERCENT)) / 100.0;
+    let percent =
+        f32::from(scale_percent.clamp(SC_SCALE_MIN_PERCENT, SC_SCALE_MAX_PERCENT)) / 100.0;
     let window_scale = if scale_with_window && picture_height_points.is_finite() {
         (picture_height_points / f32::from(reference_height.max(180))).clamp(0.45, 4.5)
     } else {
@@ -696,6 +713,53 @@ pub fn emoticon_size(
     };
     let width = (height * aspect.max(0.05)).clamp(1.0, font * max_width_factor);
     (width, height)
+}
+
+/// Effective emote size for one message. Legacy semantics
+/// (danmaku-3-render.cs `RefreshFlyingVisual`:
+/// `large = EmoteSizeMode == "large" || (EmoteSizeMode == "platform" && LargeEmoticon)`)
+/// mean the platform's large marker only applies in `platform` mode; an explicit
+/// Small or Large choice always wins, so a user Small preference is never
+/// overridden by a platform large marker.
+pub fn effective_emote_size(configured: EmoteSizeMode, platform_large: bool) -> EmoteSizeMode {
+    if platform_large && configured == EmoteSizeMode::Platform {
+        EmoteSizeMode::Large
+    } else {
+        configured
+    }
+}
+
+/// Text rows reserved for one image message. Only the effective Large size paints
+/// taller than one row (height factor 1.8 vs a 1.25 row), so the reserved rows
+/// must follow the same effective mode as the painter; otherwise a Small choice
+/// still reserves two rows and a Platform message without the large marker
+/// over-reserves.
+fn emote_rows(
+    show_images: bool,
+    has_image: bool,
+    configured: EmoteSizeMode,
+    platform_large: bool,
+) -> usize {
+    let large = show_images
+        && has_image
+        && effective_emote_size(configured, platform_large) == EmoteSizeMode::Large;
+    if large { 2 } else { 1 }
+}
+
+/// Records a highlight against a message id that has already passed admission.
+///
+/// The admission pipeline rewrites ids to `local-merge-N` when duplicate merging
+/// is on, while the painter looks highlights up on the queued/scheduled item.
+/// Storing the wire id therefore silently dropped the highlight colour; every
+/// writer must pass the id of the message it actually queued.
+fn remember_highlight(
+    ids: &mut std::collections::BTreeSet<String>,
+    highlight: bool,
+    admitted_id: &str,
+) {
+    if highlight && ids.len() < 4096 {
+        ids.insert(admitted_id.to_owned());
+    }
 }
 
 /// Converts the configured opacity percentage into a byte alpha. The legacy
@@ -915,7 +979,13 @@ pub struct ScLayout {
 /// Legacy viewport rule: top corners start at 12 px; bottom corners stick to
 /// the lower edge. The content anchors to the top for top corners and to the
 /// bottom for bottom corners, which makes new cards push the group up.
-pub fn sc_view_top(area: Rect, bottom: bool, margin: f32, view_height: f32, px_to_points: f32) -> f32 {
+pub fn sc_view_top(
+    area: Rect,
+    bottom: bool,
+    margin: f32,
+    view_height: f32,
+    px_to_points: f32,
+) -> f32 {
     let height = area.height().max(0.0);
     let px = if px_to_points.is_finite() {
         px_to_points.clamp(0.01, 8.0)
@@ -954,7 +1024,13 @@ pub fn sc_layout(
     let mut total = 0.0;
     let heights: Vec<f32> = heights
         .iter()
-        .map(|value| if value.is_finite() { value.max(1.0) } else { 1.0 })
+        .map(|value| {
+            if value.is_finite() {
+                value.max(1.0)
+            } else {
+                1.0
+            }
+        })
         .collect();
     for card_height in &heights {
         total += card_height + gap;
@@ -1089,7 +1165,11 @@ pub fn sc_badge_rect(
     text_height: f32,
     px_to_points: f32,
 ) -> Rect {
-    let scale = if scale.is_finite() { scale.max(0.05) } else { 1.0 };
+    let scale = if scale.is_finite() {
+        scale.max(0.05)
+    } else {
+        1.0
+    };
     let px = if px_to_points.is_finite() {
         px_to_points.clamp(0.01, 8.0)
     } else {
@@ -1345,10 +1425,7 @@ fn interaction_bar_hit(x: f32, y: f32) -> bool {
                 }
                 match state.bar_track {
                     Some(track) => {
-                        x >= track[0] - 4.0
-                            && x <= track[2] + 4.0
-                            && y >= track[1]
-                            && y <= track[3]
+                        x >= track[0] - 4.0 && x <= track[2] + 4.0 && y >= track[1] && y <= track[3]
                     }
                     None => false,
                 }
@@ -2063,7 +2140,7 @@ fn emoticons_refresh_due(current_version: u64, cache_version: u64) -> bool {
 }
 
 struct Overlay {
-    receiver: Receiver<DanmakuEvent>,
+    receiver: crate::danmaku::EventReceiver,
     cancellation: Cancellation,
     fatal: FatalSlot,
     settings: DisplaySettings,
@@ -2163,7 +2240,7 @@ impl Default for SchedulerMetrics {
 impl Overlay {
     fn new(
         context: &eframe::CreationContext<'_>,
-        receiver: Receiver<DanmakuEvent>,
+        receiver: crate::danmaku::EventReceiver,
         cancellation: Cancellation,
         fatal: FatalSlot,
         options: OverlaySettings,
@@ -2206,8 +2283,9 @@ impl Overlay {
             options.max_visible,
             danmaku_duration_secs(options.speed_percent),
         );
-        let rules = crate::danmaku_rules::compile(
+        let rules = crate::danmaku_rules::compile_with_users(
             &options.behavior.blocked_keywords,
+            &options.behavior.blocked_users,
             &options.behavior.highlight_keywords,
             &options.behavior.pin_keywords,
         );
@@ -2315,8 +2393,9 @@ impl Overlay {
             options.max_visible,
             danmaku_duration_secs(options.speed_percent),
         );
-        self.rules = crate::danmaku_rules::compile(
+        self.rules = crate::danmaku_rules::compile_with_users(
             &options.behavior.blocked_keywords,
+            &options.behavior.blocked_users,
             &options.behavior.highlight_keywords,
             &options.behavior.pin_keywords,
         );
@@ -2328,10 +2407,10 @@ impl Overlay {
         self.highlighted_ids.clear();
         self.scheduler
             .set_capacity(usize::from(options.max_visible));
-        self.scheduler.set_duration(
-            danmaku_duration_secs(options.speed_percent) as f32,
-        );
-        self.scheduler.set_line_gap_percent(options.line_gap_percent);
+        self.scheduler
+            .set_duration(danmaku_duration_secs(options.speed_percent) as f32);
+        self.scheduler
+            .set_line_gap_percent(options.line_gap_percent);
         self.scheduler.set_fixed_layout(
             options.behavior.top_fixed_zone_percent,
             options.behavior.bottom_fixed_zone_percent,
@@ -2365,9 +2444,10 @@ impl Overlay {
             if store.save_overlay_settings(self.options.clone()).is_ok() {
                 // Keep the polled mtime in sync so our own write does not look
                 // like an external change on the next tick.
-                self.state_mtime = std::fs::metadata(self.state_dir.as_ref().unwrap().join("state.json"))
-                    .and_then(|metadata| metadata.modified())
-                    .ok();
+                self.state_mtime =
+                    std::fs::metadata(self.state_dir.as_ref().unwrap().join("state.json"))
+                        .and_then(|metadata| metadata.modified())
+                        .ok();
             }
         }
     }
@@ -2541,12 +2621,15 @@ impl Overlay {
                         continue;
                     }
                     // Pinned messages become top fixed messages (legacy
-                    // PrepareDanmaku), still subject to the ShowTop switch.
-                    if verdict.pinned && self.options.behavior.show_top {
+                    // PrepareDanmaku), still subject to the ShowTop switch. The
+                    // legacy colour rule is `highlight || item.Pinned`, and Pinned
+                    // is only set while ShowTop is on, so a pin keyword must not
+                    // colour messages when top danmaku are hidden.
+                    let pinned = verdict.pinned && self.options.behavior.show_top;
+                    if pinned {
                         message.mode = danmaku::DanmakuMode::Top;
                     }
-                    let highlight = verdict.highlighted || verdict.pinned;
-                    let id = message.id.clone();
+                    let highlight = verdict.highlighted || pinned;
                     let admitted = self.pipeline.admit(message, now);
                     if admitted.is_some() {
                         self.stats_admitted = self.stats_admitted.saturating_add(1);
@@ -2554,11 +2637,11 @@ impl Overlay {
                         self.stats_dropped = self.stats_dropped.saturating_add(1);
                     }
                     if let Some(message) = admitted {
-                        if highlight {
-                            if self.highlighted_ids.len() < 4096 {
-                                self.highlighted_ids.insert(id);
-                            }
-                        }
+                        remember_highlight(
+                            &mut self.highlighted_ids,
+                            highlight,
+                            &message.message.id,
+                        );
                         if self.pending.len() < MAX_PENDING_DANMAKU {
                             self.pending.push(message);
                         }
@@ -2642,8 +2725,7 @@ impl Overlay {
                 self.event_ids.clear();
             }
         }
-        let priority =
-            matches!(event.kind, LiveEventKind::Guard | LiveEventKind::Notice);
+        let priority = matches!(event.kind, LiveEventKind::Guard | LiveEventKind::Notice);
         // Merge repeated gift/combo events into the visible row.
         let key = (
             event.kind,
@@ -2671,8 +2753,8 @@ impl Overlay {
         if now - self.event_window.0 >= 1.0 {
             self.event_window = (now, 0);
         }
-        let limit = u16::from(self.options.behavior.event_rate_per_second.max(1))
-            + u16::from(priority);
+        let limit =
+            u16::from(self.options.behavior.event_rate_per_second.max(1)) + u16::from(priority);
         if u16::from(self.event_window.1) >= limit {
             return;
         }
@@ -2795,19 +2877,18 @@ impl Overlay {
                 danmaku::DanmakuMode::Top | danmaku::DanmakuMode::Bottom
             ) {
                 1
-            } else if show_images && message.image_url.is_some() && message.image_large {
-                2
             } else {
-                1
+                emote_rows(
+                    show_images,
+                    message.image_url.is_some(),
+                    self.options.emote_size,
+                    message.image_large,
+                )
             };
             let width = if show_images && message.image_url.is_some() {
                 let (image_width, _) = emoticon_size(
                     item_font.size,
-                    if message.image_large {
-                        EmoteSizeMode::Large
-                    } else {
-                        self.options.emote_size
-                    },
+                    effective_emote_size(self.options.emote_size, message.image_large),
                     message.image_width,
                     message.image_height,
                 );
@@ -2896,33 +2977,30 @@ impl Overlay {
                 } else {
                     None
                 };
-                let image_rows =
-                    if show_images && message.image_url.is_some() && message.image_large {
-                        2
-                    } else {
-                        1
-                    };
+                let image_rows = emote_rows(
+                    show_images,
+                    message.image_url.is_some(),
+                    self.options.emote_size,
+                    message.image_large,
+                );
                 let prefix = message_prefix(&message, &self.options);
                 let width = if show_images && message.image_url.is_some() {
                     let (image_width, _) = emoticon_size(
                         font_points,
-                        if message.image_large {
-                            EmoteSizeMode::Large
-                        } else {
-                            self.options.emote_size
-                        },
+                        effective_emote_size(self.options.emote_size, message.image_large),
                         message.image_width,
                         message.image_height,
                     );
-                    image_width.max(font_points) + measure_label_width(
-                        painter,
-                        &prefix,
-                        &item_font,
-                        &self.options,
-                        self.color_emoji.as_ref(),
-                        dictionary,
-                        manifest,
-                    )
+                    image_width.max(font_points)
+                        + measure_label_width(
+                            painter,
+                            &prefix,
+                            &item_font,
+                            &self.options,
+                            self.color_emoji.as_ref(),
+                            dictionary,
+                            manifest,
+                        )
                 } else {
                     let label = self.display_label(&message);
                     measure_label_width(
@@ -3009,11 +3087,7 @@ impl Overlay {
                     ) {
                         let (_, height) = emoticon_size(
                             font_points,
-                            if item.message.image_large {
-                                EmoteSizeMode::Large
-                            } else {
-                                self.options.emote_size
-                            },
+                            effective_emote_size(self.options.emote_size, item.message.image_large),
                             item.message.image_width,
                             item.message.image_height,
                         );
@@ -3085,7 +3159,11 @@ impl Overlay {
             let Ok(mut state) = self.interaction.lock() else {
                 return;
             };
-            (state.click.take(), std::mem::take(&mut state.wheel), state.bar_drag)
+            (
+                state.click.take(),
+                std::mem::take(&mut state.wheel),
+                state.bar_drag,
+            )
         };
         let scale = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
             pixels_per_point
@@ -3205,11 +3283,7 @@ impl Overlay {
                 break;
             }
         }
-        if out.is_empty() {
-            "…".into()
-        } else {
-            out
-        }
+        if out.is_empty() { "…".into() } else { out }
     }
 
     /// Width of one paid-message text fragment, measured with the same segment
@@ -3271,12 +3345,7 @@ impl Overlay {
     /// Avatar: platform square image masked into a circle by the texture loader;
     /// falls back to a white circle with the first character, like the legacy
     /// widget. Images are downloaded through the existing bounded pipeline.
-    fn paint_sc_avatar(
-        &mut self,
-        painter: &egui::Painter,
-        rect: Rect,
-        card: &ScCard,
-    ) {
+    fn paint_sc_avatar(&mut self, painter: &egui::Painter, rect: Rect, card: &ScCard) {
         let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         let mut painted = false;
         if !card.face.is_empty() {
@@ -3307,7 +3376,11 @@ impl Overlay {
             }
             return;
         }
-        painter.circle_filled(rect.center(), rect.width() / 2.0, Color32::from_white_alpha(235));
+        painter.circle_filled(
+            rect.center(),
+            rect.width() / 2.0,
+            Color32::from_white_alpha(235),
+        );
         let _ = full_uv;
         let initial = card
             .user
@@ -3340,8 +3413,17 @@ impl Overlay {
         let padx = 10.0 * scale;
         let pady = 8.0 * scale;
         let line_height = 20.0 * scale;
-        let avatar = if self.options.sc_show_avatar { 30.0 * scale } else { 0.0 };
-        let text_x = padx + if avatar > 0.0 { avatar + 6.0 * scale } else { 0.0 };
+        let avatar = if self.options.sc_show_avatar {
+            30.0 * scale
+        } else {
+            0.0
+        };
+        let text_x = padx
+            + if avatar > 0.0 {
+                avatar + 6.0 * scale
+            } else {
+                0.0
+            };
         let text_width = (sc_card_width_points(scale) - padx - text_x).max(30.0);
         let body_font = FontId::proportional((12.0 * scale).max(6.0));
         let lines = self.wrap_sc_lines(painter, &card.text, &body_font, text_width, 8);
@@ -3373,8 +3455,18 @@ impl Overlay {
         let pady = 8.0 * scale;
         let top_height = 50.0 * scale;
         let line_height = 20.0 * scale;
-        let avatar = if self.options.sc_show_avatar { 30.0 * scale } else { 0.0 };
-        let text_x = rect.left() + padx + if avatar > 0.0 { avatar + 6.0 * scale } else { 0.0 };
+        let avatar = if self.options.sc_show_avatar {
+            30.0 * scale
+        } else {
+            0.0
+        };
+        let text_x = rect.left()
+            + padx
+            + if avatar > 0.0 {
+                avatar + 6.0 * scale
+            } else {
+                0.0
+            };
         let body_size = (12.0 * scale).max(6.0);
         let body_font = FontId::proportional(body_size);
         let (lines, trans_lines, content_height) = self.sc_full_content(painter, card, scale);
@@ -3390,7 +3482,10 @@ impl Overlay {
         painter.rect_stroke(
             header,
             radius,
-            Stroke::new(1.0_f32.max(scale), color_with_alpha(card.background_bottom_color, 255)),
+            Stroke::new(
+                1.0_f32.max(scale),
+                color_with_alpha(card.background_bottom_color, 255),
+            ),
             StrokeKind::Inside,
         );
         if avatar > 0.0 {
@@ -3405,8 +3500,16 @@ impl Overlay {
         let name_font = FontId::proportional(body_size);
         let name = truncate_chars(&card.user, SC_USER_MAX_CHARS);
         let name_galley = painter.layout_no_wrap(name, name_font.clone(), name_color);
-        painter.galley(Pos2::new(text_x, rect.top() + pady + 2.0 * scale), name_galley, name_color);
-        let price_galley = painter.layout_no_wrap(price_label(card.price_cents), name_font.clone(), price_color);
+        painter.galley(
+            Pos2::new(text_x, rect.top() + pady + 2.0 * scale),
+            name_galley,
+            name_color,
+        );
+        let price_galley = painter.layout_no_wrap(
+            price_label(card.price_cents),
+            name_font.clone(),
+            price_color,
+        );
         let name_height = painter
             .layout_no_wrap(
                 truncate_chars(&card.user, SC_USER_MAX_CHARS),
@@ -3416,7 +3519,10 @@ impl Overlay {
             .size()
             .y;
         painter.galley(
-            Pos2::new(text_x, rect.top() + pady + 2.0 * scale + name_height + 2.0 * scale),
+            Pos2::new(
+                text_x,
+                rect.top() + pady + 2.0 * scale + name_height + 2.0 * scale,
+            ),
             price_galley,
             price_color,
         );
@@ -3522,13 +3628,7 @@ impl Overlay {
 
     /// Compact paid-message card: a single 36*scale row with the circular
     /// avatar, a bold-ish "name price元" head and the truncated message body.
-    fn paint_sc_compact(
-        &mut self,
-        painter: &egui::Painter,
-        card: &ScCard,
-        rect: Rect,
-        scale: f32,
-    ) {
+    fn paint_sc_compact(&mut self, painter: &egui::Painter, card: &ScCard, rect: Rect, scale: f32) {
         let alpha = self.sc_surface_alpha();
         let height = 36.0 * scale;
         let radius = egui::CornerRadius::same((6.0 * scale).round().clamp(1.0, 24.0) as u8);
@@ -3541,7 +3641,10 @@ impl Overlay {
         painter.rect_stroke(
             card_rect,
             radius,
-            Stroke::new(1.0_f32.max(scale), color_with_alpha(card.background_bottom_color, 255)),
+            Stroke::new(
+                1.0_f32.max(scale),
+                color_with_alpha(card.background_bottom_color, 255),
+            ),
             StrokeKind::Inside,
         );
         let pad = 6.0 * scale;
@@ -3712,8 +3815,17 @@ impl Overlay {
         let line_height = 20.0 * scale;
         let padx = 10.0 * scale;
         let pady = 8.0 * scale;
-        let avatar = if self.options.sc_show_avatar { 30.0 * scale } else { 0.0 };
-        let text_x = padx + if avatar > 0.0 { avatar + 6.0 * scale } else { 0.0 };
+        let avatar = if self.options.sc_show_avatar {
+            30.0 * scale
+        } else {
+            0.0
+        };
+        let text_x = padx
+            + if avatar > 0.0 {
+                avatar + 6.0 * scale
+            } else {
+                0.0
+            };
         let text_width = (sc_card_width_points(scale) - padx - text_x).max(30.0);
         let heights: Vec<f32> = cards
             .iter()
@@ -3797,12 +3909,13 @@ impl Overlay {
             obstacle_left = obstacle_left.min(hit.0.left() - rect.left());
             obstacle_right = obstacle_right.max(hit.0.right() - rect.left());
         }
-        self.sc_obstacle = (obstacle_left.is_finite() && obstacle_right > obstacle_left).then_some((
-            (layout.view.top() - rect.top()).max(0.0),
-            (layout.view.bottom() - rect.top()).max(0.0),
-            obstacle_left,
-            obstacle_right,
-        ));
+        self.sc_obstacle =
+            (obstacle_left.is_finite() && obstacle_right > obstacle_left).then_some((
+                (layout.view.top() - rect.top()).max(0.0),
+                (layout.view.bottom() - rect.top()).max(0.0),
+                obstacle_left,
+                obstacle_right,
+            ));
         publish_sc_hits(
             &hits,
             pixels_per_point,
@@ -3841,9 +3954,14 @@ impl Overlay {
         if height > rect.height() {
             return None;
         }
-        let obstacle = self
-            .sc_obstacle
-            .map(|(y0, y1, x0, x1)| (rect.top() + y0, rect.top() + y1, rect.left() + x0, rect.left() + x1));
+        let obstacle = self.sc_obstacle.map(|(y0, y1, x0, x1)| {
+            (
+                rect.top() + y0,
+                rect.top() + y1,
+                rect.left() + x0,
+                rect.left() + x1,
+            )
+        });
         let reserved: Vec<Rect> = self
             .options
             .reserved_areas
@@ -3864,7 +3982,10 @@ impl Overlay {
         let step = (8.0 * ui).max(4.0);
         let mut y = rect.top() + 10.0 * ui;
         while y + height <= rect.bottom() {
-            let candidate = Rect::from_min_size(Pos2::new(rect.left() + 10.0 * ui, y), Vec2::new(width, height));
+            let candidate = Rect::from_min_size(
+                Pos2::new(rect.left() + 10.0 * ui, y),
+                Vec2::new(width, height),
+            );
             let blocked_by_sc = obstacle.is_some_and(|(top, bottom, left, right)| {
                 candidate.top() < bottom
                     && candidate.bottom() > top
@@ -3894,7 +4015,10 @@ impl Overlay {
         let font = FontId::proportional((13.0 * ui).max(8.0));
         let mut y = band.top();
         for (_, event) in self.live_events.iter() {
-            let row = Rect::from_min_size(Pos2::new(band.left(), y), Vec2::new(band.width(), row_height));
+            let row = Rect::from_min_size(
+                Pos2::new(band.left(), y),
+                Vec2::new(band.width(), row_height),
+            );
             painter.rect_filled(row, egui::CornerRadius::same(2), background);
             let label = self.truncate_to_width(
                 painter,
@@ -3921,7 +4045,11 @@ impl Overlay {
                 }
             }
             if values.is_empty() {
-                values = self.live_status.values().map(|(text, _)| text.as_str()).collect();
+                values = self
+                    .live_status
+                    .values()
+                    .map(|(text, _)| text.as_str())
+                    .collect();
             }
             let row = Rect::from_min_size(
                 Pos2::new(band.left(), y),
@@ -3951,10 +4079,13 @@ impl Overlay {
         let hint_font = FontId::proportional((13.0 / dpi).clamp(9.0, 17.0));
         // The persistent shortcut hint is a Rust-only addition; users can turn
         // it off in the danmaku/SC settings without losing status feedback.
-        let hint = self
-            .options
-            .show_shortcut_hint
-            .then(|| painter.layout_no_wrap(hint_text(&self.settings), hint_font, Color32::from_white_alpha(150)));
+        let hint = self.options.show_shortcut_hint.then(|| {
+            painter.layout_no_wrap(
+                hint_text(&self.settings),
+                hint_font,
+                Color32::from_white_alpha(150),
+            )
+        });
         let mut top = rect.bottom() - margin;
         if let Some(hint) = hint {
             top -= hint.size().y;
@@ -4228,10 +4359,7 @@ fn paint_label_segments(
                     let top = position.y + (font.size - height) / 2.0;
                     painter.image(
                         texture.id(),
-                        Rect::from_min_size(
-                            Pos2::new(cursor, top),
-                            Vec2::new(width, height),
-                        ),
+                        Rect::from_min_size(Pos2::new(cursor, top), Vec2::new(width, height)),
                         full_uv,
                         Color32::WHITE,
                     );
@@ -4344,8 +4472,7 @@ impl eframe::App for Overlay {
             // Be honest instead of looking broken: after 15 s without a single
             // message the room may simply restrict who can chat.
             if self.stats_received == 0 && self.start.elapsed().as_secs() >= 15 {
-                self.status =
-                    "已连接弹幕 · 房间暂无新消息（B站可能限制发言等级/粉丝）".into();
+                self.status = "已连接弹幕 · 房间暂无新消息（B站可能限制发言等级/粉丝）".into();
                 self.status_at = Instant::now();
             }
         }
@@ -4437,7 +4564,7 @@ fn paint_galley_with_outline(
 #[cfg(windows)]
 mod native {
     use super::*;
-    use crate::hotkeys::{FixedOverlayAction, HotkeyEvent};
+    use crate::hotkeys::FixedOverlayAction;
     use std::ffi::c_void;
     type Hwnd = *mut c_void;
     #[repr(C)]
@@ -4592,8 +4719,7 @@ mod native {
             }
             WM_LBUTTONDOWN => {
                 let point = client_point(window, lparam);
-                if let Some(offset) = super::interaction_bar_grab(point.x as f32, point.y as f32)
-                {
+                if let Some(offset) = super::interaction_bar_grab(point.x as f32, point.y as f32) {
                     // The scrollbar starts a drag; never treat it as a card click.
                     super::begin_native_bar_drag(offset);
                     super::move_native_bar_drag(point.y as f32);
@@ -4722,7 +4848,8 @@ mod native {
                 return;
             }
         }
-        let packed = ((player_local.x as isize) & 0xffff) | (((player_local.y as isize) & 0xffff) << 16);
+        let packed =
+            ((player_local.x as isize) & 0xffff) | (((player_local.y as isize) & 0xffff) << 16);
         unsafe {
             PostMessageW(player, 0x0200, 0, packed);
         }
@@ -5129,6 +5256,7 @@ mod native {
         // polled from this same thread: RegisterHotKey posts WM_HOTKEY to the
         // calling thread's queue.
         let mut global_hotkeys = crate::hotkeys::GlobalHotkeys::new();
+        let mut configured_active = false;
         let mut applied_hotkey_version = u64::MAX;
         let mut last_hotkey_retry = Instant::now();
         let mut last_fixed_active = false;
@@ -5241,9 +5369,11 @@ mod native {
                 }
             };
             live_options = options;
-            if version != applied_hotkey_version {
+            let owns_hotkeys = live_options.behavior.hotkeys_enabled && foreground_pid == process.pid;
+            if version != applied_hotkey_version || configured_active != owns_hotkeys {
                 applied_hotkey_version = version;
-                if live_options.behavior.hotkeys_enabled {
+                configured_active = owns_hotkeys;
+                if owns_hotkeys {
                     let errors = global_hotkeys.apply(&live_options.hotkeys);
                     for error in errors {
                         let line = format!("global hotkey: {error}");
@@ -5257,7 +5387,7 @@ mod native {
             // A registration can fail transiently (another program holds the
             // combo during a fullscreen transition). Retry instead of leaving the
             // hotkeys dead for the whole session.
-            if live_options.behavior.hotkeys_enabled
+            if owns_hotkeys
                 && !global_hotkeys.errors().is_empty()
                 && last_hotkey_retry.elapsed() >= Duration::from_secs(2)
             {
@@ -5294,9 +5424,8 @@ mod native {
                 global_hotkeys.fixed_registered(FixedOverlayAction::ToggleSuperChat),
             ];
             for event in global_hotkeys.poll_events() {
-                let mapped = match event {
-                    HotkeyEvent::Action(action) => super::overlay_hotkey_for(action),
-                    HotkeyEvent::Fixed(action) => super::fixed_overlay_hotkey_for(action),
+                let Some(mapped) = super::active_overlay_hotkey(event, owns_hotkeys) else {
+                    continue;
                 };
                 if hotkey_sender.try_send(mapped).is_err() {
                     break;
@@ -5582,7 +5711,10 @@ mod tests {
         assert_eq!(step_font_size(27.0, 1.0), 29.0);
         assert_eq!(step_font_size(27.0, -1.0), 25.0);
         assert_eq!(step_font_size(27.0, f32::NAN), 27.0);
-        assert_eq!(step_font_size(f32::INFINITY, -1.0), DEFAULT_FONT_SIZE - FONT_STEP);
+        assert_eq!(
+            step_font_size(f32::INFINITY, -1.0),
+            DEFAULT_FONT_SIZE - FONT_STEP
+        );
         assert_eq!(step_font_size(18.0, 0.5), 19.0);
     }
 
@@ -6057,10 +6189,7 @@ mod tests {
 
         // The outline is a pen around the glyphs: 8 directions, radius bounded
         // by the font size (penWidth = strokeWidth * max(1, fontSize*0.05)).
-        assert_eq!(
-            stroke_offsets(TextBorderStyle::Outline, 1.0, 25.0).len(),
-            8
-        );
+        assert_eq!(stroke_offsets(TextBorderStyle::Outline, 1.0, 25.0).len(), 8);
         assert_eq!(stroke_offsets(TextBorderStyle::Heavy, 1.0, 25.0).len(), 8);
         assert_eq!(
             stroke_offsets(TextBorderStyle::Shadow, 1.0, 25.0),
@@ -6089,6 +6218,59 @@ mod tests {
         assert!(wide <= 20.0 * 4.0);
         let (_, large_height) = emoticon_size(20.0, EmoteSizeMode::Large, 0, 0);
         assert!((large_height - 36.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn platform_large_marker_never_overrides_a_small_emote_choice() {
+        // Legacy: large = mode==large || (mode==platform && platform large).
+        assert_eq!(
+            effective_emote_size(EmoteSizeMode::Small, true),
+            EmoteSizeMode::Small
+        );
+        assert_eq!(
+            effective_emote_size(EmoteSizeMode::Small, false),
+            EmoteSizeMode::Small
+        );
+        assert_eq!(
+            effective_emote_size(EmoteSizeMode::Platform, true),
+            EmoteSizeMode::Large
+        );
+        assert_eq!(
+            effective_emote_size(EmoteSizeMode::Platform, false),
+            EmoteSizeMode::Platform
+        );
+        assert_eq!(
+            effective_emote_size(EmoteSizeMode::Large, false),
+            EmoteSizeMode::Large
+        );
+        // Reserved rows follow the same effective size as the painter.
+        assert_eq!(emote_rows(true, true, EmoteSizeMode::Small, true), 1);
+        assert_eq!(emote_rows(true, true, EmoteSizeMode::Platform, true), 2);
+        assert_eq!(emote_rows(true, true, EmoteSizeMode::Platform, false), 1);
+        assert_eq!(emote_rows(true, true, EmoteSizeMode::Large, false), 2);
+        assert_eq!(emote_rows(false, true, EmoteSizeMode::Large, true), 1);
+        assert_eq!(emote_rows(true, false, EmoteSizeMode::Large, true), 1);
+    }
+
+    #[test]
+    fn highlight_survives_the_duplicate_merge_id_rewrite() {
+        // R08 regression: the pipeline rewrites ids to local-merge-N; storing the
+        // wire id made the painter's lookup miss and dropped the highlight colour.
+        let mut pipeline =
+            crate::chat_pipeline::ChatPipeline::new(crate::core::DanmakuBehavior::default());
+        let wire = rich_message();
+        let first = pipeline.admit(wire.clone(), 0.0).expect("first admitted");
+        assert_ne!(first.message.id, wire.id);
+        assert!(first.message.id.starts_with("local-merge-"));
+        let mut highlighted = std::collections::BTreeSet::new();
+        remember_highlight(&mut highlighted, true, &first.message.id);
+        // The painter resolves the colour on the scheduled item, i.e. this id.
+        assert!(highlighted.contains(&first.message.id));
+        assert!(!highlighted.contains(&wire.id));
+        // A repeat merges into the same group: no new item, same highlighted id.
+        assert!(pipeline.admit(wire.clone(), 0.1).is_none());
+        assert_eq!(pipeline.count(&first.message.id), 2);
+        assert!(highlighted.contains(&first.message.id));
     }
 
     #[test]
@@ -6559,14 +6741,20 @@ VS=2764-2764
         // travel = 200-60 = 140; y=170 is half way -> half of max_scroll.
         assert!((sc_bar_scroll_for(170.0, 0.0, 100.0, 200.0, 60.0, 240.0) - 120.0).abs() < 1e-3);
         assert_eq!(sc_bar_scroll_for(0.0, 0.0, 100.0, 200.0, 60.0, 240.0), 0.0);
-        assert_eq!(sc_bar_scroll_for(9999.0, 0.0, 100.0, 200.0, 60.0, 240.0), 240.0);
+        assert_eq!(
+            sc_bar_scroll_for(9999.0, 0.0, 100.0, 200.0, 60.0, 240.0),
+            240.0
+        );
         // Grab offset keeps the thumb from jumping on mouse-down.
         // Grabbing 40 px below the thumb top keeps the thumb from jumping.
         assert!(
             (sc_bar_scroll_for(180.0, 40.0, 100.0, 200.0, 60.0, 240.0) - 68.571_43).abs() < 1e-2
         );
         assert_eq!(sc_bar_scroll_for(120.0, 0.0, 100.0, 60.0, 60.0, 240.0), 0.0);
-        assert_eq!(sc_bar_scroll_for(f32::NAN, 0.0, 100.0, 200.0, 60.0, 240.0), 0.0);
+        assert_eq!(
+            sc_bar_scroll_for(f32::NAN, 0.0, 100.0, 200.0, 60.0, 240.0),
+            0.0
+        );
     }
 
     #[test]
@@ -6599,6 +6787,21 @@ VS=2764-2764
         // Legacy steps stay sorted so the hotkeys walk them in order.
         assert!(DISPLAY_AREA_STEPS.windows(2).all(|pair| pair[0] > pair[1]));
         assert!(SPEED_STEPS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn queued_hotkeys_from_both_ranges_require_the_current_player() {
+        use crate::hotkeys::{FixedOverlayAction, HotkeyAction, HotkeyEvent};
+        for action in HotkeyAction::ALL {
+            let event = HotkeyEvent::Action(action);
+            assert_eq!(active_overlay_hotkey(event, false), None);
+            assert_eq!(active_overlay_hotkey(event, true), Some(overlay_hotkey_for(action)));
+        }
+        for action in FixedOverlayAction::ALL {
+            let event = HotkeyEvent::Fixed(action);
+            assert_eq!(active_overlay_hotkey(event, false), None);
+            assert_eq!(active_overlay_hotkey(event, true), Some(fixed_overlay_hotkey_for(action)));
+        }
     }
 
     #[test]

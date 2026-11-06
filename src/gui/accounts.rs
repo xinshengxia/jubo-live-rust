@@ -85,6 +85,59 @@ impl Launcher {
             };
             let result = (|| -> Result<String> {
                 let vault = CookieVault::open(root.join("credentials"))?;
+                if kind == 3 {
+                    ensure!(
+                        platform == Platform::Douyin,
+                        "抖音网页验证入口仅支持抖音"
+                    );
+                    // The explicit window and the silent refresh share the same
+                    // dedicated profile; reserve the one in-flight slot so two
+                    // browsers never open it at the same time.
+                    let Some(permit) = crate::douyin_guard::try_begin_user_verification(
+                        crate::douyin_guard::now_ms(),
+                    ) else {
+                        return Err(anyhow!("抖音自动验证正在进行，请稍候再试。"));
+                    };
+                    let profile = crate::douyin_guard::verification_profile(&vault)?;
+                    let mut window =
+                        crate::douyin_guard::DouyinBrowser::new(browser.clone(), profile, true);
+                    let cancel_check = || cancel.is_cancelled();
+                    let mut saved = false;
+                    let outcome = (|| -> Result<String> {
+                        window.open_root_page(&cancel_check)?;
+                        send(LoginUpdate::Progress(
+                            "已打开本程序的抖音专属验证窗口（不会读取日常浏览器资料）；完成滑块或登录后点击“我已登录，检查并保存”。".into(),
+                        ));
+                        while !cancel.is_cancelled() {
+                            if capture.swap(false, Ordering::AcqRel) {
+                                match crate::douyin_guard::capture_visible(
+                                    &mut window,
+                                    &vault,
+                                    &cancel_check,
+                                ) {
+                                    Ok(true) => {
+                                        saved = true;
+                                        send(LoginUpdate::Progress(
+                                            "抖音网页验证已通过，Cookie 已加密保存。".into(),
+                                        ));
+                                        return Ok("抖音网页验证已通过，Cookie 已加密保存；请重新播放当前房间。".into());
+                                    }
+                                    Ok(false) => send(LoginUpdate::Progress(
+                                        "尚未确认验证完成（可能仍是验证码中间页或缺少 ttwid）；请在窗口中完成验证后再次点击。".into(),
+                                    )),
+                                    Err(error) => send(LoginUpdate::Progress(format!(
+                                        "暂未保存：{error}。完成正常验证后可重试。"
+                                    ))),
+                                }
+                            }
+                            thread::sleep(Duration::from_millis(200));
+                        }
+                        Ok("已取消抖音网页验证，原有凭据保持不变。".into())
+                    })();
+                    window.close_now();
+                    permit.finish(saved, crate::douyin_guard::now_ms());
+                    return outcome;
+                }
                 if kind == 2 {
                     let status = login::check_health(platform, &vault, &cancel)?;
                     let message = format!("{}：{}", platform.label(), status.label());

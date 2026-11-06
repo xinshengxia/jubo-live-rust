@@ -1,0 +1,11 @@
+# Initial module contracts
+
+The crate uses blocking I/O on worker threads; UI never performs network calls directly.
+
+`core` exports serde domain types: `Platform` (Bili, Huya, Douyu, Douyin; Display/FromStr), `Quality` (Best, High, Low; Default Best), `Player` (Mpv, PotPlayer), `Target { platform: Platform, room: String, quality: Quality }` with `Target::parse(&str) -> anyhow::Result<Target>`, `Settings { mpv: Option<PathBuf>, potplayer: Option<PathBuf>, yt_dlp: Option<PathBuf>, legacy_exe: Option<PathBuf> }` (Default), `ResolvedStream { url: String, headers: BTreeMap<String,String>, title: String }`. `Store::open(PathBuf)`, `Store::settings()`, `Store::save_settings(Settings)`, `Store::favorites()`, `Store::add_favorite(name:String, target:Target)`, `Store::remove_favorite(platform:Platform, room:&str)`, `Store::history()`, `Store::record_play(name:String,target:Target)` are Result-returning persistence operations except getters. Favorite/History entries expose `name` and `target`. Store owns only its explicit root. Resolve settings from explicit parameters/PATH; do not inspect real legacy configs.
+
+`platforms::resolve(&Target,&Settings) -> anyhow::Result<ResolvedStream>` resolves without launching playback. `platforms::search(Platform,&str) -> anyhow::Result<Vec<LookupCandidate>>`; candidate fields `name:String`, `room:String`, `platform:Platform`, `title:String`. Platform networking uses bounded response sizes/timeouts. No actual credentials bundled. Unsupported auth/verification returns actionable errors.
+
+`relay::RelayConfig { bind:SocketAddr, token:String, max_connections:usize, idle_timeout:Duration }` and `relay::serve(config, resolver:Arc<dyn StreamResolver>) -> anyhow::Result<()>`. `StreamResolver: Send + Sync { fn resolve(&self) -> anyhow::Result<ResolvedStream>; }`. Bind only loopback; stdout READY actual_port after bind, flush. Token must be checked. Relay preserves complete FLV tags and reconnect timeline; tests use local synthetic streams. Config fields additional defaulted fields allowed with Default implementation. `flv` is independent FLV framing/timestamp module.
+
+Root agent owns playback, GUI, main binary, Cargo.toml, documentation and integration. Agents may create core.rs, flv.rs, relay.rs, platforms.rs or submodules under those names. Do not edit other agents' files. Cargo dependency requests go to root.

@@ -16,13 +16,13 @@ use flate2::read::{GzDecoder, ZlibDecoder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io::{ErrorKind, Read, Write},
     net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Condvar,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, SyncSender, TrySendError},
+        mpsc::{self, TrySendError},
     },
     thread,
     time::{Duration, Instant},
@@ -190,19 +190,90 @@ impl Cancellation {
     }
 }
 
-pub fn bounded_channel(capacity: usize) -> (SyncSender<DanmakuEvent>, Receiver<DanmakuEvent>) {
-    mpsc::sync_channel(capacity.clamp(1, MAX_QUEUE_CAPACITY))
+// Preserve arrival order while making room for paid-message/delete/control
+// events under a chat flood. Capacity is hard-bounded and producers never wait.
+struct EventQueueState {
+    queue: VecDeque<DanmakuEvent>, capacity: usize, senders: usize,
+    receiver_alive: bool, dropped: u64,
 }
-
+struct EventQueue { state: Mutex<EventQueueState>, wake: Condvar }
+pub struct EventSender(Arc<EventQueue>);
+pub struct EventReceiver(Arc<EventQueue>);
+impl Clone for EventSender {
+    fn clone(&self) -> Self {
+        if let Ok(mut state) = self.0.state.lock() { state.senders += 1; }
+        Self(self.0.clone())
+    }
+}
+impl Drop for EventSender {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() { state.senders = state.senders.saturating_sub(1); }
+        self.0.wake.notify_all();
+    }
+}
+impl Drop for EventReceiver {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() { state.receiver_alive = false; state.queue.clear(); }
+        self.0.wake.notify_all();
+    }
+}
+fn event_priority(event: &DanmakuEvent) -> u8 {
+    match event { DanmakuEvent::Message(_) => 0, DanmakuEvent::Live(_) => 1,
+        DanmakuEvent::Status(_) => 2, DanmakuEvent::SuperChat(_) => 3,
+        DanmakuEvent::DeleteSuperChat(_) => 4 }
+}
+impl EventSender {
+    pub fn try_send(&self, event: DanmakuEvent) -> std::result::Result<(), mpsc::TrySendError<DanmakuEvent>> {
+        let Ok(mut state) = self.0.state.lock() else { return Err(mpsc::TrySendError::Disconnected(event)); };
+        if !state.receiver_alive { return Err(mpsc::TrySendError::Disconnected(event)); }
+        if state.queue.len() >= state.capacity {
+            let priority = event_priority(&event);
+            // Evict the oldest event of the *lowest* eligible priority. Taking
+            // the first lower-priority event can discard an SC for a delete
+            // while ordinary chat still occupies a later slot.
+            let eviction = state.queue.iter().map(event_priority).enumerate()
+                .filter(|(_, old_priority)| *old_priority < priority)
+                .min_by_key(|(_, old_priority)| *old_priority)
+                .map(|(index, _)| index);
+            if let Some(index) = eviction {
+                state.queue.remove(index); state.dropped = state.dropped.saturating_add(1);
+            } else {
+                state.dropped = state.dropped.saturating_add(1);
+                return Err(mpsc::TrySendError::Full(event));
+            }
+        }
+        state.queue.push_back(event); drop(state); self.0.wake.notify_one(); Ok(())
+    }
+}
+impl EventReceiver {
+    pub fn try_recv(&self) -> std::result::Result<DanmakuEvent, mpsc::TryRecvError> {
+        let mut state = self.0.state.lock().map_err(|_| mpsc::TryRecvError::Disconnected)?;
+        if let Some(event) = state.queue.pop_front() { return Ok(event); }
+        Err(if state.senders == 0 { mpsc::TryRecvError::Disconnected } else { mpsc::TryRecvError::Empty })
+    }
+    pub fn recv_timeout(&self, timeout: Duration) -> std::result::Result<DanmakuEvent, mpsc::RecvTimeoutError> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.0.state.lock().map_err(|_| mpsc::RecvTimeoutError::Disconnected)?;
+        loop {
+            if let Some(event) = state.queue.pop_front() { return Ok(event); }
+            if state.senders == 0 { return Err(mpsc::RecvTimeoutError::Disconnected); }
+            let Some(wait) = deadline.checked_duration_since(Instant::now()) else { return Err(mpsc::RecvTimeoutError::Timeout); };
+            let (next, _) = self.0.wake.wait_timeout(state, wait).map_err(|_| mpsc::RecvTimeoutError::Disconnected)?;
+            state = next;
+        }
+    }
+    pub fn dropped_count(&self) -> u64 { self.0.state.lock().map(|s| s.dropped).unwrap_or(0) }
+}
+pub fn bounded_channel(capacity: usize) -> (EventSender, EventReceiver) {
+    let shared = Arc::new(EventQueue { state: Mutex::new(EventQueueState {
+        queue: VecDeque::new(), capacity: capacity.clamp(1, MAX_QUEUE_CAPACITY),
+        senders: 1, receiver_alive: true, dropped: 0,
+    }), wake: Condvar::new() });
+    (EventSender(shared.clone()), EventReceiver(shared))
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Delivery {
-    Sent,
-    Dropped,
-    Closed,
-}
-
-/// No network worker waits for a slow UI. Queue pressure drops the newest event.
-pub fn emit(sender: &SyncSender<DanmakuEvent>, event: DanmakuEvent) -> Delivery {
+pub enum Delivery { Sent, Dropped, Closed }
+pub fn emit(sender: &EventSender, event: DanmakuEvent) -> Delivery {
     match sender.try_send(event) {
         Ok(()) => Delivery::Sent,
         Err(TrySendError::Full(_)) => Delivery::Dropped,
@@ -613,8 +684,7 @@ pub fn bili_packet(operation: u32, version: u16, body: &[u8]) -> Result<Vec<u8>>
     Ok(packet)
 }
 
-/// Includes concatenated packets and bounded nested zlib packets (protover=2).
-/// Brotli/protover=3 is explicitly rejected: the client requests protover=2.
+/// Includes concatenated packets and bounded nested zlib/Brotli packets.
 pub fn decode_bili(bytes: &[u8]) -> Result<Vec<DanmakuEvent>> {
     ensure!(
         bytes.len() <= MAX_WIRE_BYTES,
@@ -647,6 +717,10 @@ fn bili_packets(
         match (operation, version) {
             (5, 2) => {
                 let decoded = expand(ZlibDecoder::new(payload), budget)?;
+                bili_packets(&decoded, depth + 1, budget, output)?;
+            }
+            (5, 3) => {
+                let decoded = expand(brotli::Decompressor::new(payload, 4096), budget)?;
                 bili_packets(&decoded, depth + 1, budget, output)?;
             }
             (5, 0 | 1) => decode_bili_json(payload, output)?,
@@ -1098,7 +1172,7 @@ pub fn decode_frame(platform: Platform, bytes: &[u8]) -> Result<Vec<DanmakuEvent
 /// and backoff; bounded platform handshakes may finish before cancellation returns.
 pub fn connect(
     target: &Target,
-    sender: SyncSender<DanmakuEvent>,
+    sender: EventSender,
     cancellation: Cancellation,
 ) -> Result<()> {
     connect_inner(target, sender, cancellation, None)
@@ -1108,7 +1182,7 @@ pub fn connect(
 /// cookie for its exact destination. The anonymous entry point remains usable.
 pub fn connect_authenticated(
     target: &Target,
-    sender: SyncSender<DanmakuEvent>,
+    sender: EventSender,
     cancellation: Cancellation,
     vault: &CookieVault,
 ) -> Result<()> {
@@ -1118,7 +1192,7 @@ pub fn connect_authenticated(
 /// Explicit request-scoped source, also usable by offline protocol fixtures.
 pub fn connect_with_cookie_source(
     target: &Target,
-    sender: SyncSender<DanmakuEvent>,
+    sender: EventSender,
     cancellation: Cancellation,
     source: Arc<dyn CookieSource>,
 ) -> Result<()> {
@@ -1127,7 +1201,7 @@ pub fn connect_with_cookie_source(
 
 fn connect_inner(
     target: &Target,
-    sender: SyncSender<DanmakuEvent>,
+    sender: EventSender,
     cancellation: Cancellation,
     source: Option<Arc<dyn CookieSource>>,
 ) -> Result<()> {
@@ -1255,7 +1329,7 @@ fn ws_timeout(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>, timeout: Durati
 
 fn bili_once(
     target: &Target,
-    sender: &SyncSender<DanmakuEvent>,
+    sender: &EventSender,
     cancel: &Cancellation,
     source: Option<Arc<dyn CookieSource>>,
 ) -> Result<()> {
@@ -1604,7 +1678,7 @@ pub fn fetch_douyin_emoticons_anonymous() -> Option<rich::EmoticonDictionary> {
 
 fn douyu_once(
     target: &Target,
-    sender: &SyncSender<DanmakuEvent>,
+    sender: &EventSender,
     cancel: &Cancellation,
 ) -> Result<()> {
     ensure!(
@@ -1707,7 +1781,6 @@ impl FlyingDanmaku {
         };
         (elapsed / duration).clamp(0.0, 1.0) as f32
     }
-
 }
 
 /// Track height for one row, measured the way the legacy renderer measured it:
@@ -1982,7 +2055,11 @@ impl LaneScheduler {
     }
 
     fn speed_for(&self, width: f32) -> f32 {
-        let width = if width.is_finite() { width.max(1.0) } else { 1.0 };
+        let width = if width.is_finite() {
+            width.max(1.0)
+        } else {
+            1.0
+        };
         ((self.width + width) / self.duration.max(0.01) as f32).clamp(1.0, 20_000.0)
     }
 
@@ -2094,13 +2171,18 @@ impl LaneScheduler {
     /// to keep each message on its previous track.
     pub fn refit(&mut self, width: f32, height: f32, now: f64) {
         let previous = std::mem::take(&mut self.active);
-        self.width = if width.is_finite() { width.max(1.0) } else { 1.0 };
-        self.height = if height.is_finite() { height.max(1.0) } else { 1.0 };
+        self.width = if width.is_finite() {
+            width.max(1.0)
+        } else {
+            1.0
+        };
+        self.height = if height.is_finite() {
+            height.max(1.0)
+        } else {
+            1.0
+        };
         for item in previous {
-            let fixed = matches!(
-                item.message.mode,
-                DanmakuMode::Top | DanmakuMode::Bottom
-            );
+            let fixed = matches!(item.message.mode, DanmakuMode::Top | DanmakuMode::Bottom);
             let rows = ((item.height / self.line_height).round() as usize).clamp(1, 8);
             let progress = item.progress(now);
             let start = if fixed {
@@ -2196,7 +2278,11 @@ impl LaneScheduler {
         now: f64,
     ) -> Option<FlyingDanmaku> {
         let fixed = matches!(message.mode, DanmakuMode::Top | DanmakuMode::Bottom);
-        let duration = if fixed { FIXED_LIFETIME_SECS } else { self.duration };
+        let duration = if fixed {
+            FIXED_LIFETIME_SECS
+        } else {
+            self.duration
+        };
         let progress = if progress.is_finite() {
             progress.clamp(0.0, 1.2)
         } else {
@@ -2259,7 +2345,11 @@ impl LaneScheduler {
             start,
             speed,
             viewport_width: self.width,
-            duration: if fixed { FIXED_LIFETIME_SECS } else { self.duration },
+            duration: if fixed {
+                FIXED_LIFETIME_SECS
+            } else {
+                self.duration
+            },
         };
         let lanes = self.zone_lanes(candidate.message.mode);
         if let Some(lane) = preferred_lane {
@@ -2311,5 +2401,129 @@ mod tests {
         cache_emoticons(rich::EmoticonDictionary::new());
         assert_eq!(cached_emoticons_version(), start + 1);
         assert_eq!(cached_emoticons().expect("still cached").len(), 1);
+    }
+
+    fn chat(text: &str) -> DanmakuEvent {
+        DanmakuEvent::Message(DanmakuMessage {
+            image_url: None,
+            id: text.into(),
+            user: "合成观众".into(),
+            text: text.into(),
+            mode: DanmakuMode::Scroll,
+            color: 0xff_ffff,
+            font_size: 25,
+            user_id: 1,
+            user_level: 0,
+            guard_level: 0,
+            medal: None,
+            image_width: 0,
+            image_height: 0,
+            image_large: false,
+        })
+    }
+
+    /// Queue pressure must never sacrifice paid/control events for ordinary
+    /// chat: the overlay's single inbox carries SC cards and deletes too.
+    #[test]
+    fn chat_pressure_drops_newest_chat_but_keeps_control_events() {
+        let (sender, receiver) = bounded_channel(2);
+        assert_eq!(emit(&sender, chat("a")), Delivery::Sent);
+        assert_eq!(emit(&sender, chat("b")), Delivery::Sent);
+        // Full of ordinary chat: another chat message is dropped in arrival order.
+        assert_eq!(emit(&sender, chat("c")), Delivery::Dropped);
+        // A control event makes room by evicting the oldest chat message instead.
+        assert_eq!(
+            emit(&sender, DanmakuEvent::DeleteSuperChat("sc-1".into())),
+            Delivery::Sent
+        );
+        assert_eq!(receiver.dropped_count(), 2);
+        match receiver.try_recv() {
+            Ok(DanmakuEvent::Message(message)) => assert_eq!(message.id, "b"),
+            other => panic!("expected the surviving chat message, got {other:?}"),
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(DanmakuEvent::DeleteSuperChat(id)) if id == "sc-1"
+        ));
+        assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn delete_evicts_chat_before_paid_messages_regardless_of_arrival_order() {
+        let paid: DanmakuEvent = serde_json::from_value(serde_json::json!({
+            "SuperChat": {
+                "id": "sc-keep", "user": "synthetic", "text": "paid",
+                "price_cents": 100, "duration_secs": 60
+            }
+        })).unwrap();
+        for paid_first in [true, false] {
+            let (sender, receiver) = bounded_channel(2);
+            let events = if paid_first {
+                [paid.clone(), chat("discard")]
+            } else {
+                [chat("discard"), paid.clone()]
+            };
+            for event in events { assert_eq!(emit(&sender, event), Delivery::Sent); }
+            assert_eq!(
+                emit(&sender, DanmakuEvent::DeleteSuperChat("sc-other".into())),
+                Delivery::Sent
+            );
+            assert_eq!(receiver.try_recv().unwrap(), paid);
+            assert_eq!(
+                receiver.try_recv().unwrap(),
+                DanmakuEvent::DeleteSuperChat("sc-other".into())
+            );
+            assert_eq!(receiver.dropped_count(), 1);
+        }
+    }
+
+    #[test]
+    fn pressure_preserves_control_before_chat_and_oldest_same_priority_order() {
+        let (sender, receiver) = bounded_channel(3);
+        for event in [DanmakuEvent::Status("keep".into()), chat("old"), chat("new")] {
+            assert_eq!(emit(&sender, event), Delivery::Sent);
+        }
+        assert_eq!(emit(&sender, DanmakuEvent::DeleteSuperChat("sc".into())), Delivery::Sent);
+        assert_eq!(receiver.try_recv().unwrap(), DanmakuEvent::Status("keep".into()));
+        assert_eq!(receiver.try_recv().unwrap(), chat("new"));
+        assert_eq!(receiver.try_recv().unwrap(), DanmakuEvent::DeleteSuperChat("sc".into()));
+    }
+
+    #[test]
+    fn event_channel_closes_only_after_every_sender_and_receiver_drop() {
+        let (sender, receiver) = bounded_channel(4);
+        let clone = sender.clone();
+        drop(sender);
+        // One sender (the clone) is still alive: no data, but not disconnected.
+        assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        drop(clone);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+
+        // Dropping the receiver closes producers immediately, even with room.
+        let (sender, receiver) = bounded_channel(4);
+        drop(receiver);
+        assert_eq!(emit(&sender, chat("x")), Delivery::Closed);
+    }
+
+    #[test]
+    fn recv_timeout_waits_bounded_and_receives_queued_events() {
+        let (sender, receiver) = bounded_channel(4);
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(5)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(emit(&sender, chat("queued")), Delivery::Sent);
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Ok(DanmakuEvent::Message(_))
+        ));
+        drop(sender);
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
     }
 }

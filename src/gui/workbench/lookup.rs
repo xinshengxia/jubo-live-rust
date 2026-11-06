@@ -4,7 +4,8 @@
 
 use super::*;
 use crate::search::{
-    SearchQuery, account_page, candidate_stage, candidate_summary, relevance_label, room_page,
+    SearchQuery, account_page, candidate_room_page, candidate_stage, candidate_summary,
+    relevance_label,
 };
 
 const ROW1_H: f32 = 34.0;
@@ -77,8 +78,17 @@ impl Launcher {
                     .unwrap_or(0)
             };
             let combo = Rect::from_min_size(origin + vec2(12.0, 12.0), vec2(94.0, ROW1_H));
-            if dropdown(ui, combo, "lookup-scope", &mut platform_index, &platform_items, pal).changed()
+            if dropdown(
+                ui,
+                combo,
+                "lookup-scope",
+                &mut platform_index,
+                &platform_items,
+                pal,
+            )
+            .changed()
             {
+                self.cancel_search();
                 if platform_index == 0 {
                     self.search_all = true;
                 } else {
@@ -118,7 +128,7 @@ impl Launcher {
                 "取消",
                 Btn::Secondary,
                 pal,
-                self.searching || self.verification_pending,
+                self.searching || self.verification_pending || self.ai_busy,
             )
             .clicked()
             {
@@ -127,37 +137,70 @@ impl Launcher {
             }
             // ---- row 2: action buttons ----------------------------------
             let row2_top = origin.y + 54.0;
-            let actions: [(&str, f32, bool); 7] = [
+            // AI research actions live in the persistent AI section below (the
+            // production ai_controls() renderer), so this row keeps only the
+            // non-AI actions and fits narrow windows without wrapping.
+            let actions: [(&str, f32, bool); 5] = [
                 ("刷新结果", 80.0, !self.searching),
-                ("AI 优化现有结果", 112.0, !self.ai_busy && !self.search_results.is_empty()),
-                ("AI 重新搜索", 88.0, !self.ai_busy),
                 ("补充线索", 80.0, true),
                 ("抖音网页辅助", 96.0, !self.web_assist_pending),
                 ("平台网页搜索", 96.0, !self.search_input.trim().is_empty()),
                 ("DeepSeek 设置", 111.0, true),
             ];
             let mut x = 12.0_f32;
+            let mut action_top = row2_top;
             for (index, (label, action_width, enabled)) in actions.into_iter().enumerate() {
-                let rect = Rect::from_min_size(
-                    pos2(origin.x + x, row2_top),
-                    vec2(action_width, ROW2_H),
-                );
+                if x > 12.0 && x + action_width > width - 12.0 {
+                    x = 12.0;
+                    action_top += ROW2_H + GAP;
+                }
+                let rect =
+                    Rect::from_min_size(pos2(origin.x + x, action_top), vec2(action_width.min(width - 24.0), ROW2_H));
                 if button(ui, rect, label, Btn::Secondary, pal, enabled).clicked() {
                     match index {
                         0 => self.start_search(context, true),
-                        1 => self.start_ai(context, true),
-                        2 => self.start_ai(context, false),
-                        3 => self.lookup_clues = !self.lookup_clues,
-                        4 => self.start_douyin_web_assist(context),
-                        5 => self.open_platform_search(),
-                        6 => self.lookup_ai_panel = !self.lookup_ai_panel,
+                        1 => self.lookup_clues = !self.lookup_clues,
+                        2 => self.start_douyin_web_assist(context),
+                        3 => self.lookup_web_search_open = !self.lookup_web_search_open,
+                        4 => self.lookup_ai_panel = !self.lookup_ai_panel,
                         _ => {}
                     }
                 }
                 x += action_width + GAP;
             }
             // y is page-relative from here on; row1+row2 occupy their own space.
-            let mut y = 94.0;
+            let mut y = action_top - origin.y + ROW2_H + 12.0;
+            if self.lookup_web_search_open {
+                for (index, platform) in Platform::ALL.into_iter().enumerate() {
+                    let step = (width - 24.0) / 4.0;
+                    let rect = Rect::from_min_size(origin + vec2(12.0 + index as f32 * step, y), vec2(step - GAP, 30.0));
+                    if button(ui, rect, platform.label(), Btn::Secondary, pal, true).clicked() {
+                        self.open_platform_search_for(platform);
+                    }
+                }
+                y += 38.0;
+            }
+            // AI research/summary/usage/cited sources and the per-candidate
+            // verify action are a persistent, scrollable section produced by the
+            // production ai_controls() renderer. It must stay visible after the
+            // result arrives instead of only on the click that started it.
+            let ai_height = if self.ai_result.is_some() || self.ai_busy {
+                320.0
+            } else {
+                104.0
+            };
+            let ai_panel =
+                Rect::from_min_size(origin + vec2(0.0, y), vec2(width, ai_height));
+            rounded(ui.painter(), ai_panel, 8.0, pal.card);
+            rounded_stroke(ui.painter(), ai_panel, 8.0, Stroke::new(1.0, pal.border));
+            let mut ai_ui = child(ui, ai_panel.shrink(10.0));
+            egui::ScrollArea::vertical()
+                .id_salt("lookup-ai-controls")
+                .max_height(ai_height - 20.0)
+                .show(&mut ai_ui, |ui| {
+                    self.ai_controls(ui, context);
+                });
+            y += ai_height + 10.0;
             if self.lookup_clues {
                 let clues = Rect::from_min_size(origin + vec2(0.0, y), vec2(width, 34.0));
                 let field_width = (width - 2.0 * GAP - 120.0) / 3.0;
@@ -170,7 +213,10 @@ impl Launcher {
                 .enumerate()
                 {
                     let rect = Rect::from_min_size(
-                        pos2(clues.left() + index as f32 * (field_width + GAP), clues.top()),
+                        pos2(
+                            clues.left() + index as f32 * (field_width + GAP),
+                            clues.top(),
+                        ),
                         vec2(field_width, 34.0),
                     );
                     input(ui, rect, value, label, pal);
@@ -206,7 +252,7 @@ impl Launcher {
                 ui.painter(),
                 Rect::from_min_size(origin + vec2(0.0, y), vec2(width, 46.0)),
                 if self.search_caption.trim().is_empty() {
-                    "输入昵称、游戏身份、房间链接或分享文案；抖音号可写为“抖音号：123”。选中候选后核验。"
+                    "输入昵称、官方直播间链接、抖音分享文案或账号线索：抖音号写“抖音号：123”，B站 UID 写“uid:123”，纯数字房间号请先选平台。"
                 } else {
                     &self.search_caption
                 },
@@ -233,21 +279,36 @@ impl Launcher {
             };
             let filters = [
                 (None, format!("全部 ({total})")),
-                (Some(Platform::Bili), format!("B站 ({})", counts(Some(Platform::Bili)))),
-                (Some(Platform::Huya), format!("虎牙 ({})", counts(Some(Platform::Huya)))),
-                (Some(Platform::Douyu), format!("斗鱼 ({})", counts(Some(Platform::Douyu)))),
-                (Some(Platform::Douyin), format!("抖音 ({})", counts(Some(Platform::Douyin)))),
+                (
+                    Some(Platform::Bili),
+                    format!("B站 ({})", counts(Some(Platform::Bili))),
+                ),
+                (
+                    Some(Platform::Huya),
+                    format!("虎牙 ({})", counts(Some(Platform::Huya))),
+                ),
+                (
+                    Some(Platform::Douyu),
+                    format!("斗鱼 ({})", counts(Some(Platform::Douyu))),
+                ),
+                (
+                    Some(Platform::Douyin),
+                    format!("抖音 ({})", counts(Some(Platform::Douyin))),
+                ),
             ];
             for (platform, label) in filters.into_iter() {
                 let rect = Rect::from_min_size(origin + vec2(filter_x, y), vec2(80.0, 34.0));
                 if pill(ui, rect, &label, self.lookup_filter == platform, pal, true).clicked() {
                     self.lookup_filter = platform;
+                    self.clear_lookup_selection();
                 }
                 filter_x += 80.0 + GAP;
             }
             y += 34.0 + 12.0;
             // ---- candidates + details / sources --------------------------
-            let list = Rect::from_min_size(origin + vec2(12.0, y), vec2(439.5, 340.0));
+            let side_by_side = width >= 780.0;
+            let list_width = if side_by_side { (width - 36.0) * 0.48 } else { width - 24.0 };
+            let list = Rect::from_min_size(origin + vec2(12.0, y), vec2(list_width.max(80.0), 340.0));
             rounded(ui.painter(), list, 10.0, pal.card);
             rounded_stroke(ui.painter(), list, 10.0, Stroke::new(1.0, pal.border));
             text_in(
@@ -263,56 +324,15 @@ impl Launcher {
                 pos2(list.right() - 4.0, list.bottom() - 4.0),
             );
             self.lookup_candidates(ui, list_area, context, pal);
-            // The right column is a clipped 340px panel like the original: the
-            // details card and the sources card are visible, the excerpt card is
-            // below the fold.
-            let right_panel = Rect::from_min_size(
-                origin + vec2(463.5, y),
-                vec2((width - 463.5 - 12.0).max(240.0), 340.0),
-            );
-            let mut right_ui = child(ui, right_panel);
-            // The original right column is a clipped 340px panel; without this
-            // the excerpt card below the fold would paint over the action row.
-            right_ui.set_clip_rect(right_panel);
-            let details = Rect::from_min_size(right_panel.min, vec2(right_panel.width(), 230.0));
-            let sources = Rect::from_min_size(
-                pos2(right_panel.left(), details.bottom() + 10.0),
-                vec2(right_panel.width(), 105.0),
-            );
-            let preview = Rect::from_min_size(
-                pos2(right_panel.left(), sources.bottom() + 10.0),
-                vec2(right_panel.width(), 105.0),
-            );
-            for (rect, title) in [
-                (details, "账号详情与核验"),
-                (sources, "搜索来源 · 选择可查看摘录"),
-                (preview, "所选来源摘录"),
-            ] {
-                rounded(right_ui.painter(), rect, 10.0, pal.card);
-                rounded_stroke(right_ui.painter(), rect, 10.0, Stroke::new(1.0, pal.border));
-                text_in(
-                    right_ui.painter(),
-                    Rect::from_min_size(rect.min + vec2(12.0, 6.0), vec2(rect.width() - 24.0, 26.0)),
-                    title,
-                    font(12.0),
-                    pal.text_secondary,
-                    Align2::LEFT_CENTER,
-                );
-            }
-            wrap_text(
-                right_ui.painter(),
-                Rect::from_min_size(
-                    details.min + vec2(12.0, 36.0),
-                    vec2(details.width() - 24.0, details.height() - 44.0),
-                ),
-                &self.lookup_details_text(),
-                font(12.0),
-                pal.text_secondary,
-            );
-            self.lookup_sources(&mut right_ui, sources, pal);
+            let right_panel = if side_by_side {
+                Rect::from_min_size(pos2(list.right() + 12.0, list.top()), vec2((width - list_width - 36.0).max(80.0), 340.0))
+            } else {
+                Rect::from_min_size(pos2(list.left(), list.bottom() + 12.0), vec2(list_width.max(80.0), 340.0))
+            };
+            self.lookup_evidence_panel(ui, right_panel);
             // ---- bottom favourite / room row ----------------------------
             // ---- bottom favourite / room row ----------------------------
-            let bottom_y = origin.y + y + 348.0;
+            let bottom_y = right_panel.bottom() + 8.0;
             text_in(
                 ui.painter(),
                 Rect::from_min_size(pos2(origin.x + 12.0, bottom_y), vec2(68.0, 34.0)),
@@ -322,43 +342,44 @@ impl Launcher {
                 Align2::LEFT_CENTER,
             );
             let name_rect = Rect::from_min_size(pos2(origin.x + 86.0, bottom_y), vec2(220.0, 34.0));
-            input(ui, name_rect, &mut self.favorite_name, "留空使用房间号", pal);
+            input(
+                ui,
+                name_rect,
+                &mut self.favorite_name,
+                "留空使用房间号",
+                pal,
+            );
             let buttons = [
                 ("加入收藏", 80.0),
-                ("重新解析房间", 96.0),
+                ("重新核验", 96.0),
                 ("打开直播间", 84.0),
                 ("账号主页", 80.0),
                 ("查看所选来源", 96.0),
             ];
             let mut bx = name_rect.right() + GAP + 6.0;
+            let mut action_y = bottom_y;
             for (index, (label, button_width)) in buttons.into_iter().enumerate() {
-                let selected = self
-                    .lookup_selected
-                    .and_then(|index| self.search_results.get(index))
-                    .cloned();
+                let selected = self.selected_lookup_candidate().cloned();
                 let enabled = match index {
-                    0 => selected
-                        .as_ref()
-                        .map(|candidate| !candidate.room.trim().is_empty())
-                        .unwrap_or(false)
-                        || self.current_target().is_ok(),
+                    // The add gate is the verified-at + target-validity check:
+                    // selecting a row only starts verification, it never enables
+                    // saving an unverified name/room pair.
+                    0 => self.lookup_can_add(),
                     1 => selected.is_some(),
-                    2 => selected
-                        .as_ref()
-                        .and_then(room_page)
-                        .is_some(),
-                    3 => selected
-                        .as_ref()
-                        .and_then(|candidate| candidate.profile_url.clone())
-                        .is_some(),
+                    2 => selected.as_ref().and_then(candidate_room_page).is_some(),
+                    // Only an official account page counts here; a direct room
+                    // candidate stores its room page and must not be mislabeled
+                    // as an account homepage.
+                    3 => selected.as_ref().and_then(account_page).is_some(),
                     _ => self
                         .lookup_source
                         .is_some_and(|index| index < self.lookup_source_items().len()),
                 };
-                let rect = Rect::from_min_size(
-                    pos2(origin.x + bx, bottom_y),
-                    vec2(button_width, 34.0),
-                );
+                if bx + button_width > origin.x + width - 12.0 {
+                    bx = origin.x + 12.0;
+                    action_y += 34.0 + GAP;
+                }
+                let rect = Rect::from_min_size(pos2(bx, action_y), vec2(button_width, 34.0));
                 if button(ui, rect, label, Btn::Secondary, pal, enabled).clicked() {
                     match index {
                         0 => match selected.as_ref() {
@@ -378,7 +399,7 @@ impl Launcher {
                                     }
                                 }
                             }
-                            _ => self.add_current_favorite(),
+                            _ => self.set_status("请先选择并完成平台核验。", true),
                         },
                         1 => {
                             if let Some(candidate) = selected.clone() {
@@ -386,15 +407,12 @@ impl Launcher {
                             }
                         }
                         2 => {
-                            if let Some(url) = selected.as_ref().and_then(room_page) {
+                            if let Some(url) = selected.as_ref().and_then(candidate_room_page) {
                                 self.open_external_url(&url);
                             }
                         }
                         3 => {
-                            if let Some(url) = selected
-                                .as_ref()
-                                .and_then(|candidate| candidate.profile_url.clone())
-                            {
+                            if let Some(url) = selected.as_ref().and_then(account_page) {
                                 self.open_external_url(&url);
                             }
                         }
@@ -411,7 +429,37 @@ impl Launcher {
                 }
                 bx += button_width + GAP;
             }
-            ui.allocate_space(vec2(width, bottom_y + 40.0 - origin.y));
+            let more = Rect::from_min_size(pos2(origin.x + 12.0, action_y + 44.0), vec2(132.0, 32.0));
+            if button(ui, more, "加载下一页", Btn::Secondary, pal, self.search_has_more && !self.searching).clicked() {
+                self.search_next_page(context);
+            }
+            text_in(ui.painter(), Rect::from_min_size(pos2(more.right() + 8.0, more.top()), vec2((width - 172.0).max(80.0), 32.0)),
+                format!("已加载至第{}页；最多400个候选，新页自动去重。", self.search_page), font(11.0), pal.text_secondary, Align2::LEFT_CENTER);
+            ui.allocate_space(vec2(width, action_y + 84.0 - origin.y));
+        });
+    }
+
+    fn lookup_evidence_panel(&mut self, ui: &mut Ui, rect: Rect) {
+        let mut area = child(ui, rect);
+        egui::ScrollArea::vertical().id_salt("lookup-evidence-scroll").max_height(rect.height()).show(&mut area, |ui| {
+            ui.set_width(rect.width().max(80.0) - 12.0);
+            ui.strong("账号详情与核验");
+            ui.label(self.lookup_details_text());
+            ui.separator();
+            ui.strong("搜索来源 · 选择可查看摘录");
+            let sources = self.lookup_source_items();
+            if sources.is_empty() { ui.label("暂无来源。平台核验或AI研究后会显示依据。"); }
+            for (index, (title, _, _)) in sources.iter().enumerate() {
+                if ui.selectable_label(self.lookup_source == Some(index), title).clicked() { self.lookup_source = Some(index); }
+            }
+            if let Some((title, address, excerpt)) = self.lookup_source.and_then(|index| sources.get(index)) {
+                ui.separator();
+                ui.strong("所选来源摘录");
+                ui.label(title);
+                let mut body = if excerpt.is_empty() { address.clone() } else { format!("{excerpt}\n\n{address}") };
+                ui.add(egui::TextEdit::multiline(&mut body).desired_rows(7).desired_width(f32::INFINITY).interactive(false));
+                if ui.button("打开所选来源").clicked() { self.open_external_url(address); }
+            }
         });
     }
 
@@ -507,13 +555,7 @@ impl Launcher {
         }
     }
 
-    fn lookup_candidates(
-        &mut self,
-        ui: &mut Ui,
-        rect: Rect,
-        context: &egui::Context,
-        pal: &Pal,
-    ) {
+    fn lookup_candidates(&mut self, ui: &mut Ui, rect: Rect, context: &egui::Context, pal: &Pal) {
         let filter = self.lookup_filter;
         let query = SearchQuery::from_input(&self.search_input);
         let rows: Vec<(usize, platforms::LookupCandidate)> = self
@@ -567,7 +609,12 @@ impl Launcher {
                     },
                 );
                 if selected {
-                    rounded_stroke(ui.painter(), row, 8.0, Stroke::new(1.5, pal.selection_border));
+                    rounded_stroke(
+                        ui.painter(),
+                        row,
+                        8.0,
+                        Stroke::new(1.5, pal.selection_border),
+                    );
                 }
                 let texture = self.lookup_avatar(ui.ctx(), candidate);
                 avatar(
@@ -636,7 +683,7 @@ impl Launcher {
                     select = Some(*index);
                     // The legacy C# list filled the favourite-name box with the
                     // selected candidate name; keep that behaviour here.
-                    self.favorite_name = display_text(&candidate.name);
+                    self.favorite_name = candidate.name.clone();
                     // Remember the platform avatar URL for this room so favourites
                     // and later launches reuse it instead of re-resolving.
                     self.remember_candidate_avatar(candidate);
@@ -656,7 +703,7 @@ impl Launcher {
             ));
         });
         if let Some(index) = select {
-            self.lookup_selected = Some(index);
+            self.select_lookup_candidate(index);
         }
         if let Some(candidate) = verify {
             self.start_verification(candidate, context);
@@ -673,7 +720,9 @@ impl Launcher {
         if url.trim().is_empty() || room.is_empty() {
             return;
         }
-        let _ = self.avatar_service.remember(candidate.platform, room, url.trim());
+        let _ = self
+            .avatar_service
+            .remember(candidate.platform, room, url.trim());
     }
 
     /// Download completion releases its slot even if the old row is never drawn
@@ -685,7 +734,10 @@ impl Launcher {
     ) {
         self.lookup_avatar_pending.remove(&url);
         match result {
-            Ok(image) if image.dimensions() == (crate::avatars::AVATAR_EDGE, crate::avatars::AVATAR_EDGE) => {
+            Ok(image)
+                if image.dimensions()
+                    == (crate::avatars::AVATAR_EDGE, crate::avatars::AVATAR_EDGE) =>
+            {
                 self.lookup_avatar_retry_at.remove(&url);
                 if self.lookup_avatar_images.len() >= LOOKUP_AVATAR_CACHE_LIMIT {
                     self.lookup_avatar_images.pop_first();
@@ -696,7 +748,8 @@ impl Launcher {
                 if self.lookup_avatar_retry_at.len() >= LOOKUP_AVATAR_CACHE_LIMIT {
                     self.lookup_avatar_retry_at.pop_first();
                 }
-                self.lookup_avatar_retry_at.insert(url, std::time::Instant::now() + LOOKUP_AVATAR_RETRY);
+                self.lookup_avatar_retry_at
+                    .insert(url, std::time::Instant::now() + LOOKUP_AVATAR_RETRY);
             }
         }
     }
@@ -726,8 +779,7 @@ impl Launcher {
         if let Some(decoded) = self.lookup_avatar_images.remove(url) {
             let size = [decoded.width() as usize, decoded.height() as usize];
             let image = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
-            let texture =
-                context.load_texture(url.to_owned(), image, egui::TextureOptions::LINEAR);
+            let texture = context.load_texture(url.to_owned(), image, egui::TextureOptions::LINEAR);
             if self.lookup_avatar_textures.len() >= LOOKUP_AVATAR_CACHE_LIMIT {
                 self.lookup_avatar_textures.pop_first();
             }
@@ -737,7 +789,10 @@ impl Launcher {
         }
         if self.lookup_avatar_pending.contains(url)
             || self.lookup_avatar_pending.len() >= LOOKUP_AVATAR_MAX_REQUESTS
-            || self.lookup_avatar_retry_at.get(url).is_some_and(|retry| *retry > std::time::Instant::now())
+            || self
+                .lookup_avatar_retry_at
+                .get(url)
+                .is_some_and(|retry| *retry > std::time::Instant::now())
             || !self.badge_networking
         {
             return None;
@@ -753,7 +808,10 @@ impl Launcher {
                 &crate::avatars::OfficialTransport,
                 &url,
             )
-            .and_then(|bytes| crate::avatars::decode_avatar(&bytes).ok_or(crate::avatars::AvatarFailure::InvalidImage))
+            .and_then(|bytes| {
+                crate::avatars::decode_avatar(&bytes)
+                    .ok_or(crate::avatars::AvatarFailure::InvalidImage)
+            })
             .map_err(|error| format!("{error:?}"));
             let _ = sender.send(Event::LookupAvatar {
                 url: url.clone(),
@@ -790,127 +848,42 @@ impl Launcher {
         items
     }
 
-    fn lookup_sources(&mut self, ui: &mut Ui, rect: Rect, pal: &Pal) {
-        let sources = self.lookup_source_items();
-        if sources.is_empty() {
-            text_in(
-                ui.painter(),
-                Rect::from_min_size(rect.min + vec2(12.0, 36.0), vec2(rect.width() - 24.0, 20.0)),
-                "AI 搜索完成后，这里列出可追溯的来源。",
-                font(12.0),
-                pal.text_secondary,
-                Align2::LEFT_TOP,
-            );
-            return;
+
+    fn open_platform_search_for(&mut self, platform: Platform) {
+        match crate::search::platform_search_url(platform, self.search_input.trim()) {
+            Ok(url) => self.open_external_url(&url),
+            Err(error) => self.set_status(error.to_string(), true),
         }
-        let mut area = child(
-            ui,
-            Rect::from_min_max(
-                pos2(rect.left() + 8.0, rect.top() + 34.0),
-                pos2(rect.right() - 8.0, rect.bottom() - 6.0),
-            ),
-        );
-        let mut select: Option<usize> = None;
-        scroll_area(&mut area, "lookup-sources", |ui| {
-            let origin = ui.cursor().min;
-            for (index, source) in sources.iter().enumerate() {
-                let row = Rect::from_min_size(
-                    origin + vec2(0.0, index as f32 * 22.0),
-                    vec2(rect.width() - 16.0, 20.0),
-                );
-                let selected = self.lookup_source == Some(index);
-                let response = ui.interact(row, ui.id().with(("lookup-source", index)), Sense::click());
-                if response.hovered() {
-                    rounded(ui.painter(), row, 4.0, pal.hover);
+    }
+
+    /// Opens one already-validated public link through the OS shell entry point
+    /// (never through cmd/start). Exposed to the AI panel so every external link
+    /// in the workbench shares this single validation path.
+    pub(crate) fn open_external_url(&mut self, address: &str) {
+        let result = crate::search::public_external_url(address).and_then(|address| {
+            #[cfg(windows)]
+            {
+                use std::os::windows::ffi::OsStrExt;
+                #[link(name = "shell32")]
+                unsafe extern "system" {
+                    fn ShellExecuteW(hwnd: isize, operation: *const u16, file: *const u16,
+                        parameters: *const u16, directory: *const u16, show: i32) -> isize;
                 }
-                text_in(
-                    ui.painter(),
-                    row,
-                    format!(
-                        "{}  {}",
-                        if selected { "▸" } else { "·" },
-                        source.0
-                    ),
-                    font(11.0),
-                    if selected { pal.text } else { pal.text_secondary },
-                    Align2::LEFT_CENTER,
-                );
-                if response.clicked() {
-                    select = Some(index);
-                }
+                let operation: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+                let target: Vec<u16> = std::ffi::OsStr::new(&address).encode_wide().chain(Some(0)).collect();
+                let result = unsafe { ShellExecuteW(0, operation.as_ptr(), target.as_ptr(), std::ptr::null(), std::ptr::null(), 1) };
+                anyhow::ensure!(result > 32, "系统无法打开此链接（错误码{result}）");
             }
-                ui.allocate_space(vec2(rect.width(), (sources.len() as f32 * 22.0).max(1.0)));
+            #[cfg(not(windows))]
+            {
+                let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+                std::process::Command::new(program).arg(&address).spawn().map_err(|_| anyhow::anyhow!("系统无法打开此链接"))?;
+            }
+            Ok(())
         });
-        if let Some(index) = select {
-            self.lookup_source = Some(index);
-            let preview = Rect::from_min_size(
-                pos2(rect.left(), rect.bottom() + 10.0),
-                vec2(rect.width(), 105.0),
-            );
-            if let Some((title, url, excerpt)) = sources.get(index) {
-                text_in(
-                    ui.painter(),
-                    Rect::from_min_size(preview.min + vec2(12.0, 36.0), vec2(preview.width() - 24.0, 18.0)),
-                    title,
-                    font(12.0),
-                    pal.text,
-                    Align2::LEFT_TOP,
-                );
-                wrap_text(
-                    ui.painter(),
-                    Rect::from_min_size(preview.min + vec2(12.0, 58.0), vec2(preview.width() - 24.0, 40.0)),
-                    if excerpt.is_empty() { url.as_str() } else { excerpt.as_str() },
-                    font(11.0),
-                    pal.text_secondary,
-                );
-                self.set_status(format!("已选择来源：{title} · {url}"), false);
-            }
-        }
+        if let Err(error) = result { self.set_status(error.to_string(), true); }
     }
 
-    fn open_platform_search(&mut self) {
-        let keyword = self.search_input.trim().to_owned();
-        if keyword.is_empty() {
-            self.set_status("先在搜索框输入关键词，再打开平台网页搜索。", true);
-            return;
-        }
-        let encoded = keyword.replace(' ', "%20");
-        let url = if self.search_all {
-            "https://search.bilibili.com/all".to_owned()
-        } else {
-            match self.platform {
-                Platform::Bili => format!("https://search.bilibili.com/all?keyword={encoded}"),
-                Platform::Huya => format!("https://www.huya.com/search/?w={encoded}"),
-                Platform::Douyu => format!("https://www.douyu.com/search?kw={encoded}"),
-                Platform::Douyin => format!("https://www.douyin.com/search/{encoded}"),
-            }
-        };
-        self.open_external_url(&url);
-    }
-
-    fn open_external_url(&mut self, url: &str) {
-        if !(url.starts_with("https://") || url.starts_with("http://")) {
-            self.set_status("只允许打开平台提供的公开 http(s) 链接。", true);
-            return;
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            let spawn = std::process::Command::new("cmd")
-                .args(["/C", "start", "", url])
-                .creation_flags(CREATE_NO_WINDOW)
-                .spawn();
-            match spawn {
-                Ok(_) => self.set_status(format!("已在默认浏览器打开：{url}"), false),
-                Err(error) => self.set_status(format!("无法打开链接：{error}"), true),
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            self.set_status("当前平台不支持直接打开外部链接。", true);
-        }
-    }
 }
 
 /// Shorten one line of text with an ellipsis so it cannot overflow its rect.
@@ -945,7 +918,10 @@ mod tests {
     fn synthetic_launcher() -> (Launcher, tempfile::TempDir, egui::Context) {
         let directory = tempfile::tempdir().unwrap();
         let context = egui::Context::default();
-        let app = Launcher::from_context(&context, Store::open(directory.path().join("synthetic")).unwrap());
+        let app = Launcher::from_context(
+            &context,
+            Store::open(directory.path().join("synthetic")).unwrap(),
+        );
         (app, directory, context)
     }
 
@@ -955,9 +931,12 @@ mod tests {
         for index in 0..64 {
             let url = format!("https://p3.douyinpic.com/synthetic-{index}.png");
             app.lookup_avatar_pending.insert(url.clone());
-            app.event_sender.send(Event::LookupAvatar {
-                url, result: Ok(image::RgbaImage::new(48, 48)),
-            }).unwrap();
+            app.event_sender
+                .send(Event::LookupAvatar {
+                    url,
+                    result: Ok(image::RgbaImage::new(48, 48)),
+                })
+                .unwrap();
         }
         app.poll_events();
         assert!(app.lookup_avatar_pending.is_empty());
@@ -976,14 +955,22 @@ mod tests {
         app.apply_lookup_avatar(oversized.clone(), Ok(image::RgbaImage::new(4096, 1)));
         assert!(!app.lookup_avatar_images.contains_key(&oversized));
         for index in 0..256 {
-            app.apply_lookup_avatar(format!("https://p3.douyinpic.com/queued-{index}.png"), Ok(image::RgbaImage::new(48, 48)));
+            app.apply_lookup_avatar(
+                format!("https://p3.douyinpic.com/queued-{index}.png"),
+                Ok(image::RgbaImage::new(48, 48)),
+            );
         }
         assert_eq!(app.lookup_avatar_images.len(), LOOKUP_AVATAR_CACHE_LIMIT);
         for index in 0..256 {
             let url = format!("https://p3.douyinpic.com/visible-{index}.png");
             app.apply_lookup_avatar(url.clone(), Ok(image::RgbaImage::new(48, 48)));
-            let candidate = platforms::LookupCandidate {avatar_url: Some(url), ..Default::default()};
-            let texture = app.lookup_avatar(&context, &candidate).expect("small thumbnail texture");
+            let candidate = platforms::LookupCandidate {
+                avatar_url: Some(url),
+                ..Default::default()
+            };
+            let texture = app
+                .lookup_avatar(&context, &candidate)
+                .expect("small thumbnail texture");
             assert_eq!(texture.size(), [48, 48]);
         }
         assert_eq!(app.lookup_avatar_textures.len(), LOOKUP_AVATAR_CACHE_LIMIT);
@@ -1003,27 +990,151 @@ mod tests {
         let pos = egui::pos2(1150.0, 29.0);
         for (time, events) in [
             (0.0, vec![]),
-            (0.1, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {pos, button:egui::PointerButton::Primary, pressed:true, modifiers:Default::default()}]),
-            (0.2, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {pos, button:egui::PointerButton::Primary, pressed:false, modifiers:Default::default()}]),
+            (
+                0.1,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ],
+            ),
+            (
+                0.2,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ],
+            ),
         ] {
-            let _ = context.run(egui::RawInput {screen_rect:Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0,700.0))), time:Some(time), events, ..Default::default()}, |ctx| {
-                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
-                    app.lookup_page(ui, Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0,700.0)), ctx, &Pal::of(theme::ThemeMode::Dark));
-                });
-            });
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 700.0))),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            app.lookup_page(
+                                ui,
+                                Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 700.0)),
+                                ctx,
+                                &Pal::of(theme::ThemeMode::Dark),
+                            );
+                        });
+                },
+            );
         }
-        assert!(app.search_generation != old_id, "production cancel button must have been clicked");
+        assert!(
+            app.search_generation != old_id,
+            "production cancel button must have been clicked"
+        );
         assert!(cancel.is_cancelled());
         assert!(app.ai_cancel.is_none());
         assert!(!app.searching && !app.verification_pending && !app.ai_busy);
-        app.event_sender.send(Event::Ai {id:old_id, optimize:false, result:Err("stale completion".into())}).unwrap();
+        app.event_sender
+            .send(Event::Ai {
+                id: old_id,
+                optimize: false,
+                result: Err("stale completion".into()),
+            })
+            .unwrap();
+        app.poll_events();
+        assert!(!app.ai_busy);
+    }
+
+
+    #[test]
+    fn regression_cancel_button_cancels_ai_when_only_ai_is_busy() {
+        let (mut app, _directory, context) = synthetic_launcher();
+        app.search_input = "synthetic".into();
+        app.ai_busy = true;
+        let cancel = login::Cancellation::new();
+        app.ai_cancel = Some(cancel.clone());
+        let old_id = app.search_generation;
+        let pos = egui::pos2(1150.0, 29.0);
+        for (time, events) in [
+            (0.0, vec![]),
+            (
+                0.1,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ],
+            ),
+            (
+                0.2,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ],
+            ),
+        ] {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 700.0))),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            app.lookup_page(
+                                ui,
+                                Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 700.0)),
+                                ctx,
+                                &Pal::of(theme::ThemeMode::Dark),
+                            );
+                        });
+                },
+            );
+        }
+        assert!(
+            app.search_generation != old_id,
+            "the production cancel button must work while only AI is busy"
+        );
+        assert!(cancel.is_cancelled());
+        assert!(app.ai_cancel.is_none() && !app.ai_busy);
+        app.event_sender
+            .send(Event::Ai {
+                id: old_id,
+                optimize: false,
+                result: Err("stale completion".into()),
+            })
+            .unwrap();
         app.poll_events();
         assert!(!app.ai_busy);
     }
 
     #[test]
     fn display_text_drops_emoji_but_keeps_cjk_and_punctuation() {
-        assert_eq!(display_text("coke老师 🧣 直播：很不蒋道理"), "coke老师  直播：很不蒋道理");
+        assert_eq!(
+            display_text("coke老师 🧣 直播：很不蒋道理"),
+            "coke老师  直播：很不蒋道理"
+        );
         assert_eq!(display_text("🛰️商务：cokey886"), "商务：cokey886");
         assert_eq!(display_text("普通昵称·B站"), "普通昵称·B站");
     }

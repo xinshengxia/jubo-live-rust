@@ -118,6 +118,36 @@ pub struct RelayTelemetry {
     /// probed the same metadata before launch; the relay already owns that tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_bitrate_kbps: Option<u32>,
+    // ---- Read-only synchronization diagnostics (see docs/relay-playback.md) ----
+    // These are populated from the bounded relay counters and are safe to show in
+    // the session page: they carry no media URL, query, Cookie or room id.
+    /// In-response media clock discontinuities that were rebased.
+    #[serde(default)]
+    pub timeline_jumps: u64,
+    /// Media clock generations (epoch transitions, including reconnect resets).
+    #[serde(default)]
+    pub timeline_epochs: u64,
+    /// Tags dropped because they belonged to an older media clock generation.
+    #[serde(default)]
+    pub timeline_discarded_tags: u64,
+    /// Current common affine clock correction in milliseconds (output - input).
+    #[serde(default)]
+    pub clock_shift_ms: i64,
+    /// Latest forwarded video-minus-audio delta in the input clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub av_delta_in_ms: Option<i64>,
+    /// Latest forwarded video-minus-audio delta in the output clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub av_delta_out_ms: Option<i64>,
+    /// The 32-bit FLV output clock was exhausted; the session must be reopened.
+    #[serde(default)]
+    pub timeline_exhausted: bool,
+    /// Media URL policy rejections (CDN/redirect policy) in this relay process.
+    #[serde(default)]
+    pub policy_rejections: u64,
+    /// Redacted rule/stage/host/status of the most recent policy rejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_policy_reject: Option<crate::relay::PolicyRejectDiagnostics>,
 }
 
 impl RelayTelemetry {
@@ -184,6 +214,18 @@ impl RelayTelemetry {
                 .as_ref()
                 .map(|info| info.video_kbps)
                 .filter(|kbps| *kbps > 0),
+            timeline_jumps: statistics.timeline_jumps,
+            timeline_epochs: statistics.timeline_epochs,
+            timeline_discarded_tags: statistics.timeline_discarded_tags,
+            clock_shift_ms: selected.map_or(0, |connection| connection.clock_shift_ms),
+            av_delta_in_ms: selected.and_then(|connection| connection.av_delta_in_ms),
+            av_delta_out_ms: selected.and_then(|connection| connection.av_delta_out_ms),
+            timeline_exhausted: selected.is_some_and(|connection| connection.timeline_exhausted),
+            policy_rejections: statistics.policy_rejections,
+            last_policy_reject: statistics
+                .last_policy_reject
+                .clone()
+                .or_else(|| selected.and_then(|connection| connection.last_policy_reject.clone())),
         }
     }
 }
@@ -219,6 +261,9 @@ impl PlaybackControl {
     pub fn is_running(&self) -> bool {
         self.0.lifecycle.load(Ordering::Acquire) == 1
     }
+    pub fn has_finished(&self) -> bool {
+        self.0.lifecycle.load(Ordering::Acquire) == 3
+    }
     fn check_start(&self) -> Result<()> {
         if self.is_start_cancelled() || self.is_stop_requested() {
             return Err(LaunchCancelled.into());
@@ -233,7 +278,10 @@ impl PlaybackControl {
             .map_err(|_| anyhow::anyhow!(LaunchCancelled))?;
         Ok(())
     }
-    fn finish(&self) {
+    /// Complete the owned launch only after every player/relay handle has been
+    /// reaped. Custom SessionLauncher implementations use this same handshake
+    /// before publishing Stopped/Ended, so resync never guesses from a PID.
+    pub fn finish(&self) {
         if !self.is_start_cancelled() {
             self.0.lifecycle.store(3, Ordering::Release);
         }
@@ -315,6 +363,62 @@ fn cancellable_delay(control: &PlaybackControl, duration: Duration) -> Result<()
         );
     }
     control.check_start()
+}
+
+/// One bounded recovery attempt for a Douyin room that asks for human
+/// verification. A captcha page is a business result, not a transport failure,
+/// so the platform adapter cannot resolve it alone: the launcher may refresh the
+/// app's own dedicated session cookie once and retry the current room exactly
+/// once. A failed/cancelled refresh never loops and never starts a second player.
+fn resolve_with_recovery<T>(
+    platform: Platform,
+    first: impl FnOnce() -> Result<T>,
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+    refresh: impl FnOnce() -> Result<bool>,
+    retry: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let error = match first() {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+    if platform != Platform::Douyin || !platforms::is_verification_required(&error) {
+        return Err(error);
+    }
+    if cancelled() {
+        return Err(LaunchCancelled.into());
+    }
+    crate::diag::log(
+        "playback",
+        crate::diag::Level::Warn,
+        "douyin resolution reported a verification requirement; attempting one silent refresh",
+    );
+    match refresh() {
+        Ok(true) => {
+            if cancelled() {
+                return Err(LaunchCancelled.into());
+            }
+            match retry() {
+                Ok(value) => Ok(value),
+                Err(retry_error) if platforms::is_verification_required(&retry_error) => Err(
+                    retry_error.context("静默刷新后抖音仍要求网页验证：请在「账号与登录」页完成「抖音网页验证」后重新播放当前房间"),
+                ),
+                Err(retry_error) => Err(retry_error),
+            }
+        }
+        Ok(false) => Err(error.context(
+            "抖音要求网页验证，自动静默刷新未成功（可能处于冷却、未找到可用浏览器或已被取消）：请在「账号与登录」页完成「抖音网页验证」后重新播放当前房间",
+        )),
+        Err(refresh_error) => {
+            crate::diag::log(
+                "playback",
+                crate::diag::Level::Warn,
+                &format!("douyin silent refresh failed: {refresh_error:#}"),
+            );
+            Err(error.context(
+                "抖音要求网页验证，自动刷新未成功：请在「账号与登录」页完成「抖音网页验证」后重新播放当前房间",
+            ))
+        }
+    }
 }
 
 type StreamLookup =
@@ -1239,10 +1343,8 @@ impl SessionHints {
             arguments.push(format!("--script-opts-append=live_title_relay_file={relay}").into());
             arguments.push("--script-opts-append=live_title_autoreplay=yes".into());
             if let Some(bitrate) = mpv_option_path(&self.0.paths.bitrate) {
-                arguments.push(format!(
-                    "--script-opts-append=live_title_bitrate_file={bitrate}"
-                )
-                .into());
+                arguments
+                    .push(format!("--script-opts-append=live_title_bitrate_file={bitrate}").into());
             }
         }
         if let Some(resync) = resync.and_then(mpv_option_path) {
@@ -1585,7 +1687,10 @@ fn relay_hint(telemetry: &RelayTelemetry) -> Option<&'static str> {
 
 /// Keeps the Lua title script's hint files current without changing the event
 /// stream the launcher UI already consumes.
-fn observer_with_hints(observer: PlaybackObserver, hints: Option<SessionHints>) -> PlaybackObserver {
+fn observer_with_hints(
+    observer: PlaybackObserver,
+    hints: Option<SessionHints>,
+) -> PlaybackObserver {
     let Some(hints) = hints else {
         return observer;
     };
@@ -1926,13 +2031,31 @@ pub fn launch_controlled(
     let worker_target = target.clone();
     let worker_settings = settings.clone();
     let worker_vault = vault.cloned();
-    let lookup: StreamLookup = Arc::new(move || match worker_vault.as_ref() {
-        Some(vault) => platforms::resolve_authenticated_with_hints(
-            &worker_target,
-            &worker_settings,
-            vault,
-        ),
-        None => platforms::resolve_with_hints(&worker_target, &worker_settings, None),
+    let recovery_vault = vault.cloned();
+    let recovery_control = control.clone();
+    let lookup: StreamLookup = Arc::new(move || {
+        let attempt = || match worker_vault.as_ref() {
+            Some(vault) => {
+                platforms::resolve_authenticated_with_hints(&worker_target, &worker_settings, vault)
+            }
+            None => platforms::resolve_with_hints(&worker_target, &worker_settings, None),
+        };
+        let cancel_control = recovery_control.clone();
+        let cancelled = move || {
+            cancel_control.is_start_cancelled() || cancel_control.is_stop_requested()
+        };
+        resolve_with_recovery(
+            worker_target.platform,
+            attempt,
+            &cancelled,
+            || match recovery_vault.as_ref() {
+                Some(vault) => {
+                    crate::douyin_guard::try_silent_refresh(vault, &worker_target.room, &cancelled)
+                }
+                None => Ok(false),
+            },
+            attempt,
+        )
     });
     let worker_target = target.clone();
     let worker_vault = vault.cloned();
@@ -2041,10 +2164,7 @@ mod tests {
             "主播 - 标题  ·  1920x1080 60fps h264 4000kbps"
         );
         assert_eq!(
-            compose_potplayer_title(
-                "只有标题",
-                &crate::flv::StreamInfo::default()
-            ),
+            compose_potplayer_title("只有标题", &crate::flv::StreamInfo::default()),
             "只有标题"
         );
     }
@@ -2321,10 +2441,7 @@ mod tests {
         assert!(text.chars().count() <= TITLE_HINT_MAX_CHARS);
         assert!(!text.contains('\n') && !text.contains('\r'));
         // Without a relay the mpv command line must not receive relay hints.
-        let options = hints.script_opts(
-            Path::new("C:/package/assets/lua/live-title.lua"),
-            None,
-        );
+        let options = hints.script_opts(Path::new("C:/package/assets/lua/live-title.lua"), None);
         assert!(
             !options
                 .iter()
@@ -2875,5 +2992,155 @@ mod tests {
         assert!(error.downcast_ref::<LaunchCancelled>().is_some());
         assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(room_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::platforms::AdapterError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn verification_error() -> anyhow::Error {
+        AdapterError::VerificationRequired.into()
+    }
+
+    #[test]
+    fn douyin_verification_refresh_retries_the_current_room_exactly_once() {
+        let refresh = AtomicUsize::new(0);
+        let retry = AtomicUsize::new(0);
+        let value = resolve_with_recovery(
+            Platform::Douyin,
+            || Err(verification_error()),
+            &|| false,
+            || {
+                refresh.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            },
+            || {
+                retry.fetch_add(1, Ordering::SeqCst);
+                Ok(7u32)
+            },
+        )
+        .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(refresh.load(Ordering::SeqCst), 1);
+        assert_eq!(retry.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn other_errors_and_platforms_never_trigger_recovery() {
+        let refresh = AtomicUsize::new(0);
+        let error = resolve_with_recovery(
+            Platform::Douyin,
+            || Err(AdapterError::Offline.into()),
+            &|| false,
+            || {
+                refresh.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            },
+            || Ok(1u32),
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<AdapterError>() == Some(&AdapterError::Offline));
+        assert_eq!(refresh.load(Ordering::SeqCst), 0);
+
+        let error = resolve_with_recovery::<u32>(
+            Platform::Bili,
+            || Err(verification_error()),
+            &|| false,
+            || {
+                refresh.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            },
+            || Ok(1),
+        )
+        .unwrap_err();
+        assert!(crate::platforms::is_verification_required(&error));
+        assert_eq!(refresh.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_failed_refresh_reports_guidance_without_retrying() {
+        let retry = AtomicUsize::new(0);
+        let error = resolve_with_recovery::<u32>(
+            Platform::Douyin,
+            || Err(verification_error()),
+            &|| false,
+            || Ok(false),
+            || {
+                retry.fetch_add(1, Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("抖音网页验证"), "{error}");
+        assert_eq!(retry.load(Ordering::SeqCst), 0);
+
+        let error = resolve_with_recovery::<u32>(
+            Platform::Douyin,
+            || Err(verification_error()),
+            &|| false,
+            || bail!("synthetic refresh failure"),
+            || {
+                retry.fetch_add(1, Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("自动刷新未成功"), "{error}");
+        assert_eq!(retry.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cancellation_never_opens_a_second_attempt() {
+        let refresh = AtomicUsize::new(0);
+        let error = resolve_with_recovery::<u32>(
+            Platform::Douyin,
+            || Err(verification_error()),
+            &|| true,
+            || {
+                refresh.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            },
+            || Ok(1),
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<LaunchCancelled>().is_some());
+        assert_eq!(refresh.load(Ordering::SeqCst), 0);
+
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let retry = AtomicUsize::new(0);
+        let error = resolve_with_recovery::<u32>(
+            Platform::Douyin,
+            || Err(verification_error()),
+            &|| cancelled.load(Ordering::SeqCst),
+            || {
+                refresh.fetch_add(1, Ordering::SeqCst);
+                cancelled.store(true, Ordering::SeqCst);
+                Ok(true)
+            },
+            || {
+                retry.fetch_add(1, Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<LaunchCancelled>().is_some());
+        assert_eq!(retry.load(Ordering::SeqCst), 0);
+        assert_eq!(refresh.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_second_verification_after_refresh_keeps_the_guidance_message() {
+        let error = resolve_with_recovery::<u32>(
+            Platform::Douyin,
+            || Err(verification_error()),
+            &|| false,
+            || Ok(true),
+            || Err(verification_error()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("静默刷新后抖音仍要求网页验证"), "{error}");
     }
 }

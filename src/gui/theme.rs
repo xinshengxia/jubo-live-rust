@@ -1023,11 +1023,7 @@ pub fn apply_fonts(context: &egui::Context, options: FontOptions) -> FontReport 
 }
 
 /// [apply_fonts] 的显式主题版本（启动时已知 dark_mode，避免依赖默认样式）。
-pub fn apply_fonts_themed(
-    context: &egui::Context,
-    options: FontOptions,
-    dark: bool,
-) -> FontReport {
+pub fn apply_fonts_themed(context: &egui::Context, options: FontOptions, dark: bool) -> FontReport {
     let report = install_fonts_with(context, options);
     // 字体装好后重建 text_styles：字号百分比会同时作用到固定 TextStyle 上。
     apply(context, dark);
@@ -2142,7 +2138,9 @@ mod tests {
         let options = FontOptions::from_settings("system", 115);
         // 纯函数层先把设置映射锁死（确定性）。
         assert!((options.scale_percent - 115.0).abs() < f32::EPSILON);
-        assert!((scale_font_size(ts::TITLE, options.scale_percent) - ts::TITLE * 1.15).abs() < 1e-3);
+        assert!(
+            (scale_font_size(ts::TITLE, options.scale_percent) - ts::TITLE * 1.15).abs() < 1e-3
+        );
         let report = apply_fonts_themed(&context, options, true);
         assert!(
             report.system_ui() || report.bundled_fallback,
@@ -2191,7 +2189,10 @@ mod tests {
         let _ = apply_fonts_themed(&context, FontOptions::from_settings("auto", 85), false);
         assert!(!context.style().visuals.dark_mode);
         let report = apply_fonts(&context, FontOptions::from_settings("auto", 100));
-        assert!(!context.style().visuals.dark_mode, "apply_fonts must keep light");
+        assert!(
+            !context.style().visuals.dark_mode,
+            "apply_fonts must keep light"
+        );
         assert!(!report.notes.is_empty() || report.system_ui() || report.bundled_fallback);
         set_ui_font_scale(100.0);
     }

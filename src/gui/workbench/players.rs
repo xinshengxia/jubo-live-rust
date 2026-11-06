@@ -44,9 +44,21 @@ impl Launcher {
                 Player::Mpv => 0,
                 Player::PotPlayer => 1,
             };
-            if dropdown(ui, combo, "player-edit", &mut selected, &["mpv", "PotPlayer"], pal).changed()
+            if dropdown(
+                ui,
+                combo,
+                "player-edit",
+                &mut selected,
+                &["mpv", "PotPlayer"],
+                pal,
+            )
+            .changed()
             {
-                self.player_edit = if selected == 0 { Player::Mpv } else { Player::PotPlayer };
+                self.player_edit = if selected == 0 {
+                    Player::Mpv
+                } else {
+                    Player::PotPlayer
+                };
             }
             let pick = Rect::from_min_size(
                 pos2(combo.right() + 10.0, card.top() + 44.0),
@@ -78,16 +90,30 @@ impl Launcher {
             }
             let (path, ready) = match self.player_edit {
                 Player::Mpv => (self.mpv_path.clone(), !self.mpv_path.trim().is_empty()),
-                Player::PotPlayer => (self.potplayer_path.clone(), !self.potplayer_path.trim().is_empty()),
+                Player::PotPlayer => (
+                    self.potplayer_path.clone(),
+                    !self.potplayer_path.trim().is_empty(),
+                ),
             };
             let path_text = if path.trim().is_empty() {
                 format!(
                     "当前：未指定 {} 路径　·　点「选择程序…」指向你自己的 {}",
                     self.player_edit,
-                    if self.player_edit == Player::Mpv { "mpv.exe" } else { "PotPlayerMini64.exe" }
+                    if self.player_edit == Player::Mpv {
+                        "mpv.exe"
+                    } else {
+                        "PotPlayerMini64.exe"
+                    }
                 )
             } else {
-                format!("当前：{path}　·　{}", if ready { "已就绪" } else { "路径不可用" })
+                format!(
+                    "当前：{path}　·　{}",
+                    if ready {
+                        "已就绪"
+                    } else {
+                        "路径不可用"
+                    }
+                )
             };
             let path_color = if path.trim().is_empty() {
                 pal.danger
@@ -151,14 +177,32 @@ impl Launcher {
                 Quality::High => 1,
                 Quality::Low => 2,
             };
-            if dropdown(ui, boxes[0], "players-quality", &mut quality, &QUALITY_ITEMS, pal).changed() {
+            if dropdown(
+                ui,
+                boxes[0],
+                "players-quality",
+                &mut quality,
+                &QUALITY_ITEMS,
+                pal,
+            )
+            .changed()
+            {
                 self.quality = [Quality::Best, Quality::High, Quality::Low][quality];
             }
             let mut buffer = match self.playback_draft.buffer_mode {
                 BufferMode::LowLatency => 0,
                 BufferMode::Stable => 1,
             };
-            if dropdown(ui, boxes[1], "players-buffer", &mut buffer, &BUFFER_ITEMS, pal).changed() {
+            if dropdown(
+                ui,
+                boxes[1],
+                "players-buffer",
+                &mut buffer,
+                &BUFFER_ITEMS,
+                pal,
+            )
+            .changed()
+            {
                 let mode = [BufferMode::LowLatency, BufferMode::Stable][buffer];
                 if mode != self.playback_draft.buffer_mode {
                     self.playback_draft.buffer_mode = mode;
@@ -167,7 +211,15 @@ impl Launcher {
                 }
             }
             let mut danmaku = self.launch_danmaku as usize;
-            if dropdown(ui, boxes[2], "players-danmaku", &mut danmaku, &DANMAKU_ITEMS, pal).changed()
+            if dropdown(
+                ui,
+                boxes[2],
+                "players-danmaku",
+                &mut danmaku,
+                &DANMAKU_ITEMS,
+                pal,
+            )
+            .changed()
             {
                 self.launch_danmaku = danmaku.min(2) as u8;
             }
@@ -176,7 +228,16 @@ impl Launcher {
                 Enhancement::Light => 1,
                 Enhancement::High => 2,
             };
-            if dropdown(ui, boxes[3], "players-enhance", &mut enhance, &ENHANCE_ITEMS, pal).changed() {
+            if dropdown(
+                ui,
+                boxes[3],
+                "players-enhance",
+                &mut enhance,
+                &ENHANCE_ITEMS,
+                pal,
+            )
+            .changed()
+            {
                 let value = [Enhancement::Off, Enhancement::Light, Enhancement::High][enhance];
                 if value != self.playback_draft.enhancement {
                     self.playback_draft.enhancement = value;
@@ -246,7 +307,11 @@ impl Launcher {
                     pal.text_secondary,
                     Align2::LEFT_CENTER,
                 );
-                let actions = if kind.is_some() { 88.0 + 8.0 + 96.0 + 16.0 } else { 0.0 };
+                let actions = if kind.is_some() {
+                    88.0 + 8.0 + 96.0 + 16.0
+                } else {
+                    0.0
+                };
                 let input_rect = Rect::from_min_size(
                     pos2(field.left() + 160.0, field.top()),
                     vec2((inner - 160.0 - actions).max(60.0), 34.0),
@@ -259,7 +324,8 @@ impl Launcher {
                             pos2(input_rect.right() + 8.0, field.top()),
                             vec2(88.0, 34.0),
                         );
-                        if button(ui, browse, "选择程序…", Btn::Secondary, pal, true).clicked() {
+                        if button(ui, browse, "选择程序…", Btn::Secondary, pal, true).clicked()
+                        {
                             match crate::gui::file_dialog::pick_executable(
                                 ToolKind::YtDlp,
                                 &self.ytdlp_path.clone(),
@@ -269,9 +335,10 @@ impl Launcher {
                                     self.ytdlp_path = display.clone();
                                     self.set_status(format!("已选择 yt-dlp：{display}"), false);
                                 }
-                                None => {
-                                    self.set_status("未选择文件（原生对话框取消或当前系统不支持）", false)
-                                }
+                                None => self.set_status(
+                                    "未选择文件（原生对话框取消或当前系统不支持）",
+                                    false,
+                                ),
                             }
                         }
                         let detect = Rect::from_min_size(
@@ -285,21 +352,35 @@ impl Launcher {
                                     self.ytdlp_path = display.clone();
                                     self.set_status(format!("已找到 yt-dlp：{display}"), false);
                                 }
-                                None => self.set_status(
-                                    "未自动找到 yt-dlp；请用“选择程序…”指定",
-                                    true,
-                                ),
+                                None => {
+                                    self.set_status("未自动找到 yt-dlp；请用“选择程序…”指定", true)
+                                }
                             }
                         }
                     }
                     None => {
-                        input(ui, input_rect, &mut self.browser_path, "自动查找 Edge / Chrome", pal);
+                        input(
+                            ui,
+                            input_rect,
+                            &mut self.browser_path,
+                            "自动查找 Edge / Chrome",
+                            pal,
+                        );
                     }
                 }
                 y += 40.0;
             }
             let save = Rect::from_min_size(tools_card.min + vec2(pad, 146.0), vec2(120.0, 32.0));
-            if button(ui, save, "保存路径", Btn::Primary, pal, self.storage_pending == 0).clicked() {
+            if button(
+                ui,
+                save,
+                "保存路径",
+                Btn::Primary,
+                pal,
+                self.storage_pending == 0,
+            )
+            .clicked()
+            {
                 match crate::gui::file_dialog::validate_tool_paths(
                     &self.mpv_path,
                     &self.potplayer_path,

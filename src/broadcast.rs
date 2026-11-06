@@ -13,6 +13,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// A verification failure after one failed silent refresh is a known room state,
+/// not a media retry failure: the relay keeps the player connection waiting and
+/// does not consume the reconnect budget while the shared gate cools down. The
+/// state string is recognised by the relay pump alongside offline/replay.
+fn verification_wait(_original: anyhow::Error) -> anyhow::Error {
+    ResolveWaiting {
+        state: "verification".into(),
+        retry_after: Duration::from_secs(60),
+    }
+    .into()
+}
+
 pub trait BroadcastBackend: Send + Sync {
     fn resolve(&self) -> Result<ResolvedStream>;
     fn observe(&self) -> Result<RoomObservation>;
@@ -24,7 +36,41 @@ struct OfficialBackend {
 }
 impl BroadcastBackend for OfficialBackend {
     fn resolve(&self) -> Result<ResolvedStream> {
-        platforms::resolve_authenticated(&self.target, &self.settings, &self.vault)
+        let first = match platforms::resolve_authenticated(&self.target, &self.settings, &self.vault)
+        {
+            Ok(stream) => return Ok(stream),
+            Err(error) => error,
+        };
+        if self.target.platform != Platform::Douyin || !platforms::is_verification_required(&first) {
+            return Err(first);
+        }
+        // A long-lived relay may reconnect into Douyin's verification page: allow
+        // one silent refresh of this application's own session, then retry the
+        // current room once. The shared single-flight/cooldown gate keeps a
+        // reconnect loop from launching browsers repeatedly.
+        crate::diag::log(
+            "relay",
+            crate::diag::Level::Warn,
+            "douyin relay resolve reported a verification requirement; attempting one silent refresh",
+        );
+        let cancelled = || false;
+        let refreshed = crate::douyin_guard::try_silent_refresh(
+            &self.vault,
+            &self.target.room,
+            &cancelled,
+        );
+        match refreshed {
+            Ok(true) => platforms::resolve_authenticated(&self.target, &self.settings, &self.vault),
+            Ok(false) => Err(verification_wait(first)),
+            Err(error) => {
+                crate::diag::log(
+                    "relay",
+                    crate::diag::Level::Warn,
+                    &format!("douyin relay silent refresh failed: {error:#}"),
+                );
+                Err(verification_wait(first))
+            }
+        }
     }
     fn observe(&self) -> Result<RoomObservation> {
         room_state::check(&self.target, Some(&self.vault))
@@ -98,6 +144,11 @@ impl StreamResolver for BroadcastResolver {
                 Ok(stream)
             }
             Err(error) => {
+                // A backend that already classified the wait (offline, replay
+                // unavailable, verification) must not trigger a second room probe.
+                if error.downcast_ref::<ResolveWaiting>().is_some() {
+                    return Err(error);
+                }
                 if self.wait {
                     if let Ok(observation) = self.backend.observe() {
                         let state = match observation.state {

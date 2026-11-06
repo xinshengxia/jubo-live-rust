@@ -291,6 +291,7 @@ function Write-ReleaseManifest([string]$PackageRoot, [string]$Version, [string]$
         variant = $PackageVariant
         version = $Version
         target = 'windows-x64'
+        buildTimeUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
         signature = [ordered]@{ status = $Signature.status; verified = $Signature.verified; timestamped = $Signature.timestamped }
         gates = $Gates
         files = $entries

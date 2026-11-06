@@ -580,8 +580,26 @@ fn run_danmaku_probe(target: &str, seconds: u64, vault: CookieVault) -> Result<(
             Ok(danmaku::DanmakuEvent::DeleteSuperChat(_)) => {
                 *counts.entry("delete_super_chat".into()).or_default() += 1
             }
-            Ok(danmaku::DanmakuEvent::Live(_)) => {
-                *counts.entry("live_event".into()).or_default() += 1
+            Ok(danmaku::DanmakuEvent::Live(event)) => {
+                *counts.entry("live_event".into()).or_default() += 1;
+                let kind = match event.kind {
+                    live_hub_rust::danmaku::LiveEventKind::Gift => "live_gift",
+                    live_hub_rust::danmaku::LiveEventKind::Guard => "live_guard",
+                    live_hub_rust::danmaku::LiveEventKind::Enter => "live_enter",
+                    live_hub_rust::danmaku::LiveEventKind::Follow => "live_follow",
+                    live_hub_rust::danmaku::LiveEventKind::Notice => "live_notice",
+                    live_hub_rust::danmaku::LiveEventKind::Status => "live_status",
+                };
+                *counts.entry(kind.into()).or_default() += 1;
+                if samples.len() < 8 && !event.user.is_empty() {
+                    let text: String = event.text.chars().take(40).collect();
+                    samples.push(format!(
+                        "{}: {} x{}",
+                        event.user.chars().take(24).collect::<String>(),
+                        text,
+                        event.count
+                    ));
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
