@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$Exe = '',
     [string]$Mpv = '',
     [string]$EvidenceDir = '',
@@ -114,6 +114,10 @@ foreach ($target in $Targets) {
         $final = @('--vo=null', '--ao=null', '--no-config', '--really-quiet', '--idle=no', ('--input-ipc-server=' + $pipePath))
         for ($i = 0; $i -lt $separator; $i++) {
             $argument = $planArguments[$i]
+            # This acceptance harness owns audio/video output (--ao=null/--vo=null).
+            # Drop the launcher's default audio-output policy so it cannot override
+            # the harness choice; the launcher-only OpenAL env is not set here.
+            if ($argument -like '--ao=*' -or $argument -like '--audio-device=*') { continue }
             if ($argument -eq '--force-window=immediate') { $final += '--force-window=no' } else { $final += $argument }
         }
         if ($resolve.headers.Referer) { $final += ('--referrer=' + $resolve.headers.Referer) }

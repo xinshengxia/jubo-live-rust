@@ -94,8 +94,11 @@ fn plan_arguments(plan: &[std::ffi::OsString], extra: &[String]) -> Vec<String> 
         .iter()
         .position(|argument| argument == "--")
         .expect("plan has a media separator");
-    let mut result: Vec<String> = extra.to_vec();
-    result.extend(arguments.drain(..separator));
+    // Extras come after the planned options so a headless override such as
+    // --ao=null / --vo=null wins over the launcher's audio-output default; the
+    // media URL keeps its place after the separator.
+    let mut result: Vec<String> = arguments.drain(..separator).collect();
+    result.extend(extra.iter().cloned());
     result.extend(arguments);
     result
 }
@@ -174,6 +177,74 @@ fn mpv_accepts_the_playback_plan_flags_without_a_window() -> Result<()> {
         exit_code,
         Some(2),
         "mpv rejected a planned option (exit 2); stderr:\n{text}"
+    );
+    Ok(())
+}
+
+/// The launcher's launch-time capability probe runs exactly this command and
+/// requires a real help-table row. Refusing every launch would be the failure
+/// mode if the table shape changed, so record the contract against the real
+/// player build (no window, no media, no playback).
+#[test]
+#[ignore = "real mpv capability probe; needs LIVE_HUB_MPV, opens no window or playback"]
+fn mpv_audio_help_lists_the_openal_output() -> Result<()> {
+    let Some(executable) = mpv_path() else {
+        return Ok(());
+    };
+    let mut command = Command::new(&executable);
+    command
+        .args(["--no-config", "--load-scripts=no", "--ao=help"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = command.spawn().context("spawn mpv capability probe")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("mpv --ao=help did not exit within 10 seconds");
+            }
+        }
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(stream) = child.stdout.take() {
+        let _ = stream.take(64 * 1024).read_to_string(&mut stdout);
+    }
+    if let Some(stream) = child.stderr.take() {
+        let _ = stream.take(64 * 1024).read_to_string(&mut stderr);
+    }
+    eprintln!(
+        "mpv --ao=help exit={status} stdout_bytes={} stderr_bytes={}",
+        stdout.len(),
+        stderr.len()
+    );
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        combined
+            .lines()
+            .any(|line| line.trim() == "Available audio outputs:"),
+        "mpv --ao=help has no audio-outputs table:\n{combined}"
+    );
+    assert!(
+        combined.lines().any(|line| {
+            line.starts_with([' ', '\t']) && {
+                let mut words = line.split_whitespace();
+                words.next() == Some("openal") && words.next().is_some()
+            }
+        }),
+        "mpv --ao=help does not list an openal output row:\n{combined}"
     );
     Ok(())
 }

@@ -2,6 +2,26 @@
 
 更新：2026-11-07。本报告区分真实验证与合成回归；不包含账号、Cookie、宿主路径或截图。
 
+## 1.0.7 本轮验证（2026-11-07）
+
+### Rust（1.0.7）
+
+- 全量离线测试：**746 passed / 0 failed / 31 ignored**（47 个常规测试目标 + 1 个 doctest 结果，48 条 test result）。命令：
+  `scripts/Invoke-Cargo.ps1 -ToolchainRoot <toolchain> -TargetDirectory <ASCII target> test --locked --offline`；
+  `check --all-targets --offline --locked` 退出 0。相对 1.0.6 基线 730/0/30 新增 16 个通过、1 个 ignored，均为本次新增测试。
+- 新增覆盖（全部离线，不启动真实播放器/网络/用户数据）：
+  - mpv 默认参数只追加 `--ao=openal`，不新增 `--video-sync`/`--framedrop`；显式 `--ao=`/`--audio-device=` 覆盖默认；`--no-audio`/`--audio=no`/`--aid=no` 与 `--` 之后不约束。
+  - 子进程环境仅含 `ALSOFT_DRIVERS=wasapi` 与包内 `ALSOFT_CONF`，父进程环境不变；PotPlayer、非 OpenAL 与禁用音频路径 0 环境覆盖。
+  - 包内 `assets/audio/openal-wasapi.ini` 缺失、超 16 KiB、非 UTF-8、重复/缺失/错误段均拒绝；能力检查要求真实 `Available audio outputs:` 表头 + 缩进 openal 行，缺 OpenAL 时在启动子进程前失败。
+  - PotPlayer 计划不得出现任何 `--ao`/`--audio-device`/同步参数或 ALSOFT 环境（契约测试锁定）。
+- 发布包 lite/source 的构建、manifest、许可与隐私门禁由发布任务单独验收。
+- 未验证：真实 mpv `--ao=help` 的进程级输出与退出码（新增 ignored 验收测试可在发布验收时用真实 mpv 运行）、真实平台长时播放（本次修复依据用户此前两小时实播会话验证，不等于全新启动路径的端到端复测）；PotPlayer 未改动，其长时同步无独立证据。
+
+### C#（1.1.8）
+
+同一音频输出修复同步合入 C# 版；离线回归 231 passed / 0 failed / 12 skipped（243 用例，5919 断言），发布包与隐私验收见该版发布记录。
+
+
 ## 1.0.6 本轮验证（2026-11-07）
 
 ### Rust（1.0.6）

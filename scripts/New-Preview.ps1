@@ -49,7 +49,7 @@ Copy-Item -LiteralPath $binary -Destination (Join-Path $outputPath 'live-hub-rus
 foreach ($name in @('README.md', 'THIRD_PARTY_NOTICES.md', 'LICENSE')) {
     Copy-Item -LiteralPath (Join-Path $repoPath $name) -Destination (Join-Path $outputPath $name)
 }
-foreach ($name in @('licenses', 'assets/fonts', 'assets/lua', 'assets/emoji-sheet.png', 'assets/emoji-sheet.txt', 'docs')) {
+foreach ($name in @('licenses', 'assets/audio', 'assets/fonts', 'assets/lua', 'assets/emoji-sheet.png', 'assets/emoji-sheet.txt', 'docs')) {
     $destination = Join-Path $outputPath $name
     New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $repoPath $name) -Destination $destination -Recurse

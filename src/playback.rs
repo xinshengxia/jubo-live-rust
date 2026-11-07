@@ -605,11 +605,10 @@ pub fn plan_with_preferences(
                     // reports, so do not force it here. Advanced users can still
                     // add it through mpv extra args if their machine needs it.
                     //
-                    // autosync=30 is a targeted safety net for sound drivers
-                    // whose audio-delay measurement is imperfect: at mpv's
-                    // default autosync=0 that error is used directly and a
-                    // growing video offset can accumulate over hours. mpv docs
-                    // say 30 lets large offsets settle in about 1-2 seconds.
+                    // This smooths audio-delay measurements; it does not repair
+                    // an incorrect device clock or establish long-playback sync.
+                    // A biased WASAPI delay can still make audio lead video
+                    // while mpv's internal avsync remains close to zero.
                     "--autosync=30",
                     "--cache=yes",
                     "--network-timeout=15",
@@ -639,6 +638,8 @@ pub fn plan_with_preferences(
                         .map(OsString::from),
                 ),
             }
+            #[cfg(windows)]
+            crate::mpv_audio::append_defaults(&mut args, &preferences.mpv_extra_args);
             args.push(format!("--title={title}").into());
             args.push(format!("--force-media-title={title}").into());
             for (name, value) in &stream.headers {
@@ -685,6 +686,10 @@ pub fn plan_with_preferences(
 
 pub fn spawn_plan(plan: &PlaybackPlan) -> Result<Child> {
     let mut process = command(&plan.executable);
+    // The audio policy applies to the mpv child only; the function itself keeps
+    // the player check so PotPlayer can never receive mpv output settings.
+    #[cfg(windows)]
+    crate::mpv_audio::configure_launch(plan.player, &plan.executable, &plan.arguments, &mut process)?;
     #[cfg(windows)]
     if plan.player == Player::PotPlayer {
         use std::os::windows::process::CommandExt;
@@ -1035,6 +1040,11 @@ where
 {
     let direct_compatibility = PlaybackPreferences {
         relay_bili: false,
+        // The launch-orchestration tests spawn this test binary as a synthetic
+        // player, so they must not run the real mpv audio preflight. An explicit
+        // null output keeps the output-policy path inactive while the rest of
+        // the mpv plan (and the relay/supervisor behaviour) is still exercised.
+        mpv_extra_args: vec!["--ao=null".to_owned()],
         ..Default::default()
     };
     launch_resolved_controlled(
@@ -2844,6 +2854,43 @@ mod tests {
                 .any(|argument| argument == "--profile=high-quality")
         );
         assert_eq!(plan.arguments.last().unwrap(), &OsString::from(stream.url));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn mpv_plan_defaults_openal_without_forcing_a_new_sync_strategy() {
+        let stream = synthetic_stream();
+        let plan = plan(Player::Mpv, "synthetic-mpv.exe".into(), &stream).unwrap();
+        let arguments: Vec<String> = plan
+            .arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert!(arguments.contains(&"--autosync=30".to_owned()));
+        // 1.0.6 deliberately did not force these; mpv already defaults to
+        // video-sync=audio and the compatibility profile drops late frames via
+        // its own vo policy. Only the audio output is added by this fix.
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument.starts_with("--video-sync=")
+                    || argument.starts_with("--framedrop="))
+        );
+        assert_eq!(
+            arguments
+                .iter()
+                .filter(|argument| *argument == "--ao=openal")
+                .count(),
+            1
+        );
+        assert!(arguments.contains(&"--stop-playback-on-init-failure=yes".to_owned()));
+        let separator = arguments.iter().position(|argument| argument == "--").unwrap();
+        let output = arguments
+            .iter()
+            .position(|argument| argument == "--ao=openal")
+            .unwrap();
+        assert!(output < separator);
+        assert_eq!(arguments.last().unwrap(), &stream.url);
     }
 
     #[test]

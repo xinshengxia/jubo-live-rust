@@ -191,6 +191,6 @@
     "system-proxy-mode-real-acceptance"
   ],
   "verification": "See docs/validation.md. 0.3.1 fixes the user-reported dropdown popup, avatar resolution, traffic-dot/chevron/sidebar-glyph polish, and the overlay right-edge viewport sync bug; it wires the 11 configurable global hotkeys and window visibility policy, SC P1 (badge/compact/scale200/face_frame/message_trans), event cards, merged xN scaling, scrollbar drag, re:/uid:/name:/keyword rules, bounded panic/relay/overlay logs, URL grammars, search detail fields, UI font settings, and favorites import/export. Remaining: colour emoji PLAIN sheet cell alignment (inherited asset generation issue, next round); real desktop hotkeys/mouse drag/dropdown clicks/native dialogs, multi-monitor/DPI, real paid SC and real platform logins are user-acceptance only. 1.0.1 adds the Douyin emoji/list dictionary fetch (real anonymous response: 214 entries), VP8L WebP emote decoding through the existing bounded image path, overlay dictionary refresh on cache generation, and renders platform emotes as images in a real live Douyin room. 1.0.3 loads Huya default/supplement emotes before connecting (40 unique codes), with an exact additional asset-host allowance; unknown and unavailable images retain text. Douyu also loads 250 legacy default mappings before connecting. All 40 Huya and 250 Douyu images passed opt-in production ImageLoader download/decode acceptance on 2026-11-02.",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "updated": "2026-11-07"
 }

@@ -18,6 +18,8 @@ pub mod gui;
 pub mod hotkeys;
 pub mod images;
 pub mod login;
+#[cfg(any(windows, test))]
+mod mpv_audio;
 pub mod network;
 #[cfg(feature = "gui")]
 pub mod overlay;
