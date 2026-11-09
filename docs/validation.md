@@ -1,8 +1,29 @@
 # Validation report
 
-更新：2026-11-07。本报告区分真实验证与合成回归；不包含账号、Cookie、宿主路径或截图。
+更新：2026-11-09。本报告区分真实验证与合成回归；不包含账号、Cookie、宿主路径或截图。
 
-## 1.0.7 本轮验证（2026-11-07）
+## 1.0.8 本轮验证（2026-11-09）
+
+### Rust（1.0.8）
+
+- 变更范围：仅界面入口、提示与对话框生命周期；格式说明文案集中在纯函数 `room_format_help_text`，切页统一走 `show_page`。未改 AI 请求协议、密钥存储、平台搜索、播放/中继与弹幕逻辑。
+- 离线全量测试：**754 passed / 0 failed / 32 ignored**（48 条 test result；相对 1.0.7 基线 746/0/31 为 +8 passed；ignored 均为显式 `#[ignore]` 的真实平台/桌面/长时压测或辅助进程入口，不是静默跳过）。命令：
+  `scripts/Invoke-Cargo.ps1 -ToolchainRoot <toolchain> -TargetDirectory <ASCII target> test --locked --offline`；
+  另单独重复 `--lib` 5 次均为 430 passed / 0 failed / 6 ignored。
+- 新增离线回归（headless egui，无窗口、无网络、无用户数据）：
+  - 格式说明：真实点击启动卡片“格式说明”→打开对话框、Esc 关闭；文案契约（三种写法 + 8 个示例全部被 `Target::parse` 接受）。
+  - 入口：真实点击“DeepSeek 设置”→打开 AI 对话框且不进入 busy/不发起请求；未配置时 `start_ai` 只打开对话框。
+  - API Key：对话框字段在真实 egui 帧中接收键入文本；保存/清除结果（含失败）回显到对话框；关闭/切页清空旧结果，迟到 ack 不重播。
+  - 切页：`show_page` 统一关闭两个对话框并清空 AI 结果消息（侧边栏、“弹幕设置…”、“全部会话 →”、“查看诊断日志”、核验完成填入启动卡片）。
+- 同时修掉本机偶发：`labels_produce_expected_heights` 与主题字体缩放测试共用测试锁并按默认字号测量，消除进程级 UI 字号并发导致的偶发失败（仅测试代码，不改生产逻辑；全量首轮曾 1 次失败，互斥后重复稳定）。
+- 离屏渲染证据（**release 1.0.8 包内 exe**，`--ui-shot`，窗口位于 (-30000,-30000) 且 inactive，不占前台）：逻辑 1240x720 @200% → 2480x1440；三份 capture.json 均 ok=true、version=1.0.8、pixels_per_point=2.0：
+  - `output/ui-shot-favorites-help/favorites.png`：完整“房间输入格式说明”对话框；
+  - `output/ui-shot-lookup-ai/lookup.png`：完整“DeepSeek AI 设置”对话框（API Key 标签/整行输入/显示切换/留空说明/保存/清除/打开平台/关闭）；
+  - `output/ui-shot-lookup/lookup.png`：无弹窗查找页，橙色“未配置 API Key”与“填写 API Key”入口可见。
+- 发布包：`artifacts/release-1.0.8`（**472 文件 / 37,540,987 字节**；exe **23,581,684 B**，sha256 `5eeb7e39715dc15a3c2e2b993370c235c59d839585738548af34df005444fbe2`）；Test-Preview：**FilesChecked 472 / Entries 470 / ManifestMatches true / SortedManifest true / RequiredEntries 13 / PrivatePathFindings 0**，EXIT=0；包内 exe `--version` = `live-hub-rust 1.0.8`，`self-test` **7/7 passed**。
+- 入口：`artifacts/current` 由 release-1.0.7 切换到 release-1.0.8，开始菜单「看直播（Rust）」目标解析正常；release-1.0.7 保留回退（release-1.0.6 本轮未清理）。
+- 独立只读复核两轮：入口/状态/文档一致性通过；复核指出的切页遗漏、对话框内保存失败不可见、迟到 ack 重播、诊断模式跨页显示、测试硬编码坐标等问题均已在最终代码处理；未覆盖项见下。
+- 未验证：真实 DeepSeek 计费请求与真实密钥保存（未配置真实密钥、未发起远程请求）；真实前台点击/键盘焦点与混合 DPI/多显示器下的对话框位置（本轮用户正在使用前台，改用离屏渲染与 headless 事件测试）；页面内切页控件（“弹幕设置…”/“全部会话 →”/“查看诊断日志”/核验填卡）未逐一做点击级测试，由 `show_page` 单测与代码核对覆盖。
 
 ### Rust（1.0.7）
 

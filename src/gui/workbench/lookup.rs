@@ -11,10 +11,6 @@ use crate::search::{
 const ROW1_H: f32 = 34.0;
 const ROW2_H: f32 = 34.0;
 const GAP: f32 = 6.0;
-/// Height of the inline DeepSeek settings panel. It is sized for the full
-/// form (title, help text, three path fields, slider, key field, buttons and
-/// the close row) so the content can never spill into the candidates list.
-const AI_SETTINGS_PANEL_H: f32 = 320.0;
 /// Candidate row height and pitch: three text lines (name/platform, summary,
 /// identity/verification) plus the 32px avatar, matching the original card.
 const CANDIDATE_ROW_H: f32 = 64.0;
@@ -162,7 +158,9 @@ impl Launcher {
                         1 => self.lookup_clues = !self.lookup_clues,
                         2 => self.start_douyin_web_assist(context),
                         3 => self.lookup_web_search_open = !self.lookup_web_search_open,
-                        4 => self.lookup_ai_panel = !self.lookup_ai_panel,
+                        // A dialog is used so the API Key field is visible without
+                        // scrolling the page or recognising a bare hint line.
+                        4 => self.ai_settings_open = true,
                         _ => {}
                     }
                 }
@@ -237,15 +235,6 @@ impl Launcher {
                     self.start_search(context, false);
                 }
                 y += 34.0 + 8.0;
-            }
-            if self.lookup_ai_panel {
-                let panel =
-                    Rect::from_min_size(origin + vec2(0.0, y), vec2(width, AI_SETTINGS_PANEL_H));
-                rounded(ui.painter(), panel, 8.0, pal.card);
-                rounded_stroke(ui.painter(), panel, 8.0, Stroke::new(1.0, pal.border));
-                let mut panel_ui = child(ui, panel.shrink(12.0));
-                self.ai_settings(&mut panel_ui);
-                y += AI_SETTINGS_PANEL_H + 10.0;
             }
             // ---- status line --------------------------------------------
             wrap_text(
@@ -392,7 +381,7 @@ impl Launcher {
                                 };
                                 match Target::new(candidate.platform, candidate.room.clone()) {
                                     Ok(target) => {
-                                        self.send_store(StoreAction::AddFavorite(name, target))
+                                        self.send_store(StoreAction::AddFavorite(name, target));
                                     }
                                     Err(error) => {
                                         self.set_status(format!("不能收藏该候选：{error:#}"), true)
@@ -925,6 +914,23 @@ mod tests {
         (app, directory, context)
     }
 
+    fn frame_input(width: f32, height: f32, events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(width, height))),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn frame_input_at(time: f64, events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 700.0))),
+            time: Some(time),
+            events,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn regression_avatar_completions_release_slots_without_redrawing_old_rows() {
         let (mut app, _directory, _context) = synthetic_launcher();
@@ -1127,6 +1133,187 @@ mod tests {
             .unwrap();
         app.poll_events();
         assert!(!app.ai_busy);
+    }
+
+    #[test]
+    fn missing_ai_key_opens_the_settings_dialog_instead_of_only_reporting_status() {
+        let (mut app, _directory, context) = synthetic_launcher();
+        assert!(app.snapshot.ai_config.is_none());
+        app.start_ai(&context, false);
+        assert!(
+            app.ai_settings_open,
+            "a missing key must open a visible place to paste it"
+        );
+        assert!(!app.ai_busy, "no paid request may start without a key");
+        assert!(
+            app.status.contains("API Key"),
+            "unexpected status: {}",
+            app.status
+        );
+        // Render one real egui frame with the dialog open: the form (including
+        // the labelled API Key input) must paint without panicking.
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 700.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        app.lookup_page(
+                            ui,
+                            Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 700.0)),
+                            ctx,
+                            &Pal::of(theme::ThemeMode::Dark),
+                        );
+                    });
+                app.ai_settings_dialog(ctx);
+            },
+        );
+    }
+
+    #[test]
+    fn ai_settings_dialog_api_key_field_accepts_typed_text() {
+        let (mut app, _directory, context) = synthetic_launcher();
+        app.ai_settings_open = true;
+        let key_field = egui::Id::new("lookup-ai-key-input");
+        // Frame 1: build the dialog once, then focus the labelled key field.
+        // Focus is requested after the window is painted: a request made before
+        // the area exists is dropped by egui's per-viewport focus bookkeeping.
+        let _ = context.run(frame_input(1200.0, 700.0, vec![]), |ctx| {
+            app.ai_settings_dialog(ctx);
+            ctx.memory_mut(|memory| memory.request_focus(key_field));
+        });
+        // Frame 2: the focused field consumes text exactly like real typing.
+        let _ = context.run(
+            frame_input(
+                1200.0,
+                700.0,
+                vec![egui::Event::Text("sk-synthetic-key".into())],
+            ),
+            |ctx| app.ai_settings_dialog(ctx),
+        );
+        assert_eq!(app.ai_key_input, "sk-synthetic-key");
+        // Frame 3: Escape closes the dialog instead of leaving hidden state.
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        let _ = context.run(frame_input(1200.0, 700.0, vec![escape]), |ctx| {
+            app.ai_settings_dialog(ctx)
+        });
+        assert!(!app.ai_settings_open);
+    }
+
+    #[test]
+    fn format_help_dialog_renders_and_escape_closes_it() {
+        let (mut app, _directory, context) = synthetic_launcher();
+        app.format_help_open = true;
+        let _ = context.run(frame_input(1240.0, 720.0, vec![]), |ctx| {
+            app.format_help_dialog(ctx)
+        });
+        assert!(app.format_help_open, "opening frame must keep it visible");
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        let _ = context.run(frame_input(1240.0, 720.0, vec![escape]), |ctx| {
+            app.format_help_dialog(ctx)
+        });
+        assert!(!app.format_help_open, "Escape must close the help dialog");
+    }
+
+    #[test]
+    fn deepseek_settings_button_opens_the_ai_dialog() {
+        let (mut app, _directory, context) = synthetic_launcher();
+        // Mirror the action-row maths: 12px start, widths [80,80,96,96,111],
+        // 6px gap, second row at y=54 with a 34px height.
+        let widths = [80.0_f32, 80.0, 96.0, 96.0, 111.0];
+        let gap = 6.0_f32;
+        let button = egui::pos2(
+            12.0 + widths[..4].iter().sum::<f32>() + gap * 4.0 + widths[4] / 2.0,
+            54.0 + 34.0 / 2.0,
+        );
+        let click = |pressed: bool, time: f64| {
+            frame_input_at(
+                time,
+                vec![
+                    egui::Event::PointerMoved(button),
+                    egui::Event::PointerButton {
+                        pos: button,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+            )
+        };
+        for input in [frame_input_at(0.0, vec![]), click(true, 0.1), click(false, 0.2)] {
+            let _ = context.run(input, |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        app.lookup_page(
+                            ui,
+                            Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 700.0)),
+                            ctx,
+                            &Pal::of(theme::ThemeMode::Dark),
+                        );
+                    });
+            });
+        }
+        assert!(
+            app.ai_settings_open,
+            "clicking the DeepSeek 设置 button must open the dialog"
+        );
+        assert!(!app.ai_busy, "the settings action must not start a paid request");
+    }
+
+    #[test]
+    fn ai_storage_result_is_surfaced_inside_the_dialog() {
+        let (mut app, _directory, _context) = synthetic_launcher();
+        app.ai_settings_open = true;
+        app.ai_action_pending = true;
+        let snapshot = app.snapshot.clone();
+        app.event_sender
+            .send(Event::Storage {
+                snapshot,
+                message: Err("合成保存失败".into()),
+                quiet: false,
+            })
+            .unwrap();
+        app.poll_events();
+        assert_eq!(
+            app.ai_dialog_message
+                .as_ref()
+                .map(|(message, error)| (message.as_str(), *error)),
+            Some(("合成保存失败", true)),
+            "AI save failures must be visible inside the dialog, not only in the footer"
+        );
+        assert!(!app.ai_action_pending);
+        assert!(app.status_error);
+    }
+
+    #[test]
+    fn page_switch_closes_both_page_dialogs() {
+        let (mut app, _directory, _context) = synthetic_launcher();
+        app.ai_settings_open = true;
+        app.format_help_open = true;
+        app.ai_dialog_message = Some(("合成结果".into(), false));
+        app.show_page(Page::Data);
+        assert!(!app.ai_settings_open);
+        assert!(!app.format_help_open);
+        assert!(
+            app.ai_dialog_message.is_none(),
+            "navigation must not replay the previous AI result on the next open"
+        );
     }
 
     #[test]

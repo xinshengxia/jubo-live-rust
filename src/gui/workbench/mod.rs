@@ -1028,6 +1028,16 @@ impl Launcher {
                 self.content(ui, content, context, &pal);
                 self.window_edges(ui, full, context);
             });
+        // Page-owned dialogs render above the shell: the help text and the AI
+        // settings both need a visible surface instead of relying on the small
+        // footer status line. They stay bound to their page so an off-screen
+        // ui-shot never captures a dialog on every page.
+        if self.page == Page::Favorites {
+            self.format_help_dialog(context);
+        }
+        if self.page == Page::Lookup {
+            self.ai_settings_dialog(context);
+        }
         // Avatar updates arrive from the background pool; drop the stale texture
         // so the next card paint re-uploads the cached 48px PNG.
         let mut avatar_updates = 0;
@@ -1221,7 +1231,9 @@ impl Launcher {
                 Align2::LEFT_CENTER,
             );
             if response.clicked() {
-                self.page = page;
+                // Overlay dialogs belong to the page that opened them; the
+                // shared switch closes them instead of leaving hidden state.
+                self.show_page(page);
             }
             y += height + NAV_GAP;
         }

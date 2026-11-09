@@ -1178,6 +1178,12 @@ pub fn install_fonts_with(context: &egui::Context, options: FontOptions) -> Font
     report
 }
 
+/// Serializes tests that change the process-wide UI font scale. Geometry tests
+/// that measure font-dependent widths must hold this too: a parallel font
+/// setting test can otherwise shrink their text between layout and assertion.
+#[cfg(test)]
+pub(crate) static UI_FONT_SCALE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 进程内是否已经安装过字体定义（install_fonts / install_preview_fonts）。
 static FONTS_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1748,8 +1754,7 @@ mod tests {
     use super::*;
 
     /// 这两个测试会改进程级 UI 字号倍数；并行跑互相干扰，用一把锁串行化。
-    /// （其它模块的测试不写这个全局值，只可能短暂观察到 1.15，断言都留了余量。）
-    static FONT_SCALE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// 控件几何测试也持有同一把锁，避免测量文字宽度时被这里的 85%/115% 打断。
 
     #[test]
     fn dark_palette_matches_original_modern_theme() {
@@ -2131,7 +2136,7 @@ mod tests {
 
     #[test]
     fn apply_fonts_themed_rebuilds_styles_with_a_valid_scale() {
-        let _guard = FONT_SCALE_TEST_LOCK
+        let _guard = UI_FONT_SCALE_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let context = egui::Context::default();
@@ -2182,7 +2187,7 @@ mod tests {
 
     #[test]
     fn apply_fonts_keeps_the_current_dark_mode() {
-        let _guard = FONT_SCALE_TEST_LOCK
+        let _guard = UI_FONT_SCALE_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let context = egui::Context::default();

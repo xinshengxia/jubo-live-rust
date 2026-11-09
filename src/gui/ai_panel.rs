@@ -1,62 +1,144 @@
 use super::*;
 impl Launcher {
-    pub(super) fn ai_settings(&mut self, ui: &mut egui::Ui) {
-        card(ui, self.dark, |ui| {
-            ui.label(RichText::new("AI 搜索（可选）").size(18.0).strong());
-            ui.label("仅使用你在本程序配置的 DeepSeek API Key，Windows DPAPI 加密保存。不会读取原版、DSH 或浏览器中的密钥。");
-            if let Some(error) = &self.snapshot.ai_error {
-                ui.colored_label(Color32::LIGHT_RED, error);
-            }
-            ui.label(if self.snapshot.ai_config.is_some() {
-                "密钥已保存。只有主动点击 AI 搜索才会发送请求。"
-            } else {
-                "尚未配置，普通平台搜索仍可使用。"
-            });
-            path_field(ui, "模型", &mut self.ai_model, "deepseek-flash");
-            ui.add(
-                egui::Slider::new(&mut self.ai_max_tokens, 512..=8192).text("输出上限（tokens）"),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.ai_key_input)
-                    .password(true)
-                    .hint_text("API Key，留空保留已保存值"),
-            );
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(
-                        self.storage_pending == 0,
-                        primary_button("加密保存 AI 设置"),
+    /// DeepSeek settings dialog, opened by the "DeepSeek 设置" action and by the
+    /// "填写 API Key" hint in the AI research section.
+    ///
+    /// The form is a window instead of an inline block: the API Key input then
+    /// stays visible no matter where the scrollable lookup page currently is,
+    /// and it gets an explicit label instead of a bare hint-text line.
+    pub(super) fn ai_settings_dialog(&mut self, context: &egui::Context) {
+        if !self.ai_settings_open {
+            return;
+        }
+        let mut close = false;
+        let mut open = true;
+        egui::Window::new("DeepSeek AI 设置")
+            .id(egui::Id::new("lookup-ai-settings"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .default_width(600.0)
+            .show(context, |ui| {
+                ui.set_min_width(540.0);
+                ui.label(RichText::new("AI 搜索（可选）").size(18.0).strong());
+                ui.label("仅使用你在本程序配置的 DeepSeek API Key，Windows DPAPI 加密保存。不会读取原版、DSH 或浏览器中的密钥。");
+                if let Some(error) = &self.snapshot.ai_error {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                }
+                if let Some((message, error)) = &self.ai_dialog_message {
+                    ui.colored_label(
+                        if *error {
+                            Color32::LIGHT_RED
+                        } else {
+                            Color32::from_rgb(0x7E, 0xC9, 0x91)
+                        },
+                        message,
+                    );
+                }
+                ui.label(if self.snapshot.ai_config.is_some() {
+                    "密钥已保存。只有主动点击 AI 搜索才会发送请求。"
+                } else {
+                    "尚未配置：在下方填入自己的 API Key；普通平台搜索不受影响。"
+                });
+                ui.add_space(4.0);
+                path_field(ui, "模型", &mut self.ai_model, "deepseek-flash");
+                ui.add(
+                    egui::Slider::new(&mut self.ai_max_tokens, 512..=8192).text("输出上限（tokens）"),
+                );
+                ui.add_space(4.0);
+                ui.label(RichText::new("DeepSeek API Key").strong());
+                ui.horizontal(|ui| {
+                    let width = (ui.available_width() - 64.0).max(200.0);
+                    ui.add_sized(
+                        [width, 36.0],
+                        egui::TextEdit::singleline(&mut self.ai_key_input)
+                            .id(egui::Id::new("lookup-ai-key-input"))
+                            .password(!self.ai_key_visible)
+                            .hint_text("在此粘贴 sk-… 密钥；留空表示保留已保存的密钥"),
+                    );
+                    let toggle = if self.ai_key_visible { "隐藏" } else { "显示" };
+                    if ui
+                        .add_sized([56.0, 36.0], egui::Button::new(toggle))
+                        .clicked()
+                    {
+                        self.ai_key_visible = !self.ai_key_visible;
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "密钥只写入本程序数据目录；留空保存不会覆盖已保存的密钥。获取密钥：https://platform.deepseek.com/api_keys",
                     )
-                    .clicked()
-                {
-                    let config = crate::ai::AiConfig {
-                        model: self.ai_model.trim().into(),
-                        max_tokens: self.ai_max_tokens,
-                    };
-                    let key = std::mem::take(&mut self.ai_key_input);
-                    self.send_store(StoreAction::SaveAi(config, key));
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.storage_pending == 0,
+                            primary_button("加密保存 AI 设置"),
+                        )
+                        .clicked()
+                    {
+                        let config = crate::ai::AiConfig {
+                            model: self.ai_model.trim().into(),
+                            max_tokens: self.ai_max_tokens,
+                        };
+                        let key = std::mem::take(&mut self.ai_key_input);
+                        self.ai_dialog_message = None;
+                        self.ai_action_pending = true;
+                        if !self.send_store(StoreAction::SaveAi(config, key)) {
+                            // The store worker is gone; surface that failure in
+                            // the dialog as well as on the footer.
+                            self.ai_action_pending = false;
+                            self.ai_dialog_message = Some((self.status.clone(), true));
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            self.storage_pending == 0 && self.snapshot.ai_config.is_some(),
+                            egui::Button::new("清除本程序 AI 密钥"),
+                        )
+                        .clicked()
+                    {
+                        self.ai_dialog_message = None;
+                        self.ai_action_pending = true;
+                        if !self.send_store(StoreAction::ClearAi) {
+                            self.ai_action_pending = false;
+                            self.ai_dialog_message = Some((self.status.clone(), true));
+                        }
+                    }
+                    if ui.button("打开 DeepSeek 开放平台").clicked() {
+                        self.open_external_url("https://platform.deepseek.com/api_keys");
+                    }
+                    if ui.button("关闭").clicked() {
+                        close = true;
+                    }
+                });
+                if self.storage_pending > 0 {
+                    ui.label(RichText::new("正在加密保存…").small().weak());
                 }
-                if ui
-                    .add_enabled(
-                        self.storage_pending == 0 && self.snapshot.ai_config.is_some(),
-                        egui::Button::new("清除本程序 AI 密钥"),
-                    )
-                    .clicked()
-                {
-                    self.send_store(StoreAction::ClearAi);
-                }
-                if ui.button("收起设置").clicked() {
-                    self.lookup_ai_panel = false;
+                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    close = true;
                 }
             });
-        });
+        if close || !open {
+            self.ai_settings_open = false;
+            // The result belongs to the visible form; do not replay it on the
+            // next open (a newer status is reported by its own action).
+            self.ai_dialog_message = None;
+        }
     }
     pub(super) fn start_ai(&mut self, context: &egui::Context, optimize: bool) {
         if self.ai_busy {
             return;
         }
         if self.snapshot.ai_config.is_none() {
-            self.set_status("请先点“DeepSeek 设置”配置自己的 API Key。", true);
+            // Opening the dialog is the useful next step; a footer-only error
+            // left the user without a visible place to paste the key.
+            self.ai_settings_open = true;
+            self.set_status("请先在“DeepSeek AI 设置”里填写自己的 API Key。", true);
             return;
         }
         let query = crate::search::SearchQuery::new(&self.search_input, &self.search_game, &self.search_identity, &self.search_alias).text();
@@ -122,6 +204,18 @@ impl Launcher {
                 // while a request is outstanding.
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            if self.snapshot.ai_config.is_none() {
+                // Keep the hint on the action row so the section keeps its
+                // fixed height instead of clipping the disclosure line below.
+                ui.label(
+                    RichText::new("未配置 API Key")
+                        .small()
+                        .color(Color32::from_rgb(0xF4, 0x89, 0x43)),
+                );
+                if ui.button("填写 API Key").clicked() {
+                    self.ai_settings_open = true;
+                }
             }
         });
         ui.label(RichText::new("主动点击 AI 会把当前查询与公开候选信息发送给 DeepSeek，并按你自己的接口账户计费；平台 Cookie 不发送，AI 不自动收藏或播放。").small().weak());

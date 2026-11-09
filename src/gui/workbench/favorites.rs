@@ -69,6 +69,38 @@ impl Launcher {
         }
     }
 
+    /// "格式说明" dialog: the full room-input help, opened from the launch card.
+    /// A centred dialog is used because the footer status line was both far from
+    /// the click target and identical to text the user may already have seen.
+    pub(super) fn format_help_dialog(&mut self, context: &egui::Context) {
+        if !self.format_help_open {
+            return;
+        }
+        let mut close = false;
+        egui::Window::new("房间输入格式说明")
+            .id(egui::Id::new("favorites-format-help"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .default_width(560.0)
+            .show(context, |ui| {
+                ui.set_max_width(560.0);
+                ui.label(RichText::new(room_format_help_text()).size(13.0));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("关闭").clicked() {
+                        close = true;
+                    }
+                });
+                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+            });
+        if close {
+            self.format_help_open = false;
+        }
+    }
+
     pub(super) fn favorites_page(
         &mut self,
         ui: &mut Ui,
@@ -192,11 +224,13 @@ impl Launcher {
             launch_origin + vec2(width - pad - 88.0, y),
             vec2(88.0, 30.0),
         );
-        if link(ui, help_rect, "格式说明", pal).clicked() {
-            self.set_status(
-                "支持：房间号；官方直播间链接（粘贴后自动识别平台）；平台:房间，例如 bili:123。",
-                false,
-            );
+        // The footer status line is easy to miss from the launch card, so a
+        // click opens the full help dialog instead of only writing one line.
+        if link(ui, help_rect, "格式说明", pal)
+            .on_hover_text("查看支持的房间号 / 链接 / 平台:房间写法")
+            .clicked()
+        {
+            self.format_help_open = true;
         }
         y += 30.0 + 8.0;
         let compact = inner < 700.0;
@@ -401,7 +435,7 @@ impl Launcher {
             vec2(104.0, 24.0),
         );
         if link(ui, settings_rect, "弹幕设置…", pal).clicked() {
-            self.page = Page::Danmaku;
+            self.show_page(Page::Danmaku);
         }
         let launch_bottom = y + note_height + 8.0;
         debug_assert!((launch_bottom - launch_height).abs() < 0.5);
@@ -1072,7 +1106,7 @@ impl Launcher {
             vec2(sessions_width, 24.0),
         );
         if link(ui, all_rect, "全部会话 →", pal).clicked() {
-            self.page = Page::Sessions;
+            self.show_page(Page::Sessions);
         }
         let card_top = rect.top() + 25.0;
         let compact_card = rect.width() < 420.0;
@@ -1476,3 +1510,86 @@ impl Launcher {
         }
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::Store;
+
+    fn synthetic_launcher() -> (Launcher, tempfile::TempDir, egui::Context) {
+        let directory = tempfile::tempdir().unwrap();
+        let context = egui::Context::default();
+        let app = Launcher::from_context(
+            &context,
+            Store::open(directory.path().join("synthetic")).unwrap(),
+        );
+        (app, directory, context)
+    }
+
+    fn raw_input(time: f64, events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 700.0))),
+            time: Some(time),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn click(pos: egui::Pos2, pressed: bool, time: f64) -> egui::RawInput {
+        raw_input(
+            time,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        )
+    }
+
+    fn draw(app: &mut Launcher, ctx: &egui::Context) {
+        let host = Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 700.0));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                app.favorites_page(ui, host, ctx, &Pal::of(theme::ThemeMode::Dark));
+            });
+    }
+
+    #[test]
+    fn format_help_link_opens_and_escape_closes_the_dialog() {
+        let (mut app, _directory, context) = synthetic_launcher();
+        // Same maths as the launch card: host width 1200, 16px pad, an 88x30
+        // link at y=8. Keep it derived so a layout change fails loudly here.
+        let host_width = 1200.0_f32;
+        let pad = 16.0_f32;
+        let link = pos2(host_width - pad - 88.0 / 2.0, 8.0 + 30.0 / 2.0);
+        for input in [
+            raw_input(0.0, vec![]),
+            click(link, true, 0.1),
+            click(link, false, 0.2),
+        ] {
+            let _ = context.run(input, |ctx| draw(&mut app, ctx));
+        }
+        assert!(
+            app.format_help_open,
+            "clicking the 格式说明 link must open the visible dialog"
+        );
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        let _ = context.run(raw_input(0.3, vec![escape]), |ctx| {
+            app.format_help_dialog(ctx)
+        });
+        assert!(!app.format_help_open, "Escape must close the help dialog");
+    }
+}
+

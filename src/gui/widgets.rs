@@ -2471,6 +2471,13 @@ mod tests {
 
     #[test]
     fn labels_produce_expected_heights() {
+        // The UI font scale is process-wide: hold the shared font-settings lock
+        // and pin the default scale so a parallel theme test cannot shrink the
+        // measured title between layout and assertion.
+        let _guard = theme::UI_FONT_SCALE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        theme::set_ui_font_scale(100.0);
         let context = test_context();
         let title_slot = std::cell::Cell::new(Rect::ZERO);
         let heading_slot = std::cell::Cell::new(Rect::ZERO);

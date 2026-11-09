@@ -198,7 +198,11 @@ pub fn run_ui_shot(data_root: PathBuf, options: UiShotOptions) -> Result<()> {
             }
             if std::env::var_os("LIVE_HUB_UI_SHOT_LOOKUP_PANEL").is_some() {
                 launcher.page = Page::Lookup;
-                launcher.lookup_ai_panel = true;
+                launcher.ai_settings_open = true;
+            }
+            if std::env::var_os("LIVE_HUB_UI_SHOT_FAVORITES_HELP").is_some() {
+                launcher.page = Page::Favorites;
+                launcher.format_help_open = true;
             }
             if std::env::var_os("LIVE_HUB_UI_SHOT_FAVORITE_SELECTED").is_some()
                 && !launcher.snapshot.favorites.is_empty()
@@ -500,6 +504,31 @@ pub fn detected_platform(input: &str) -> Option<Platform> {
         return None;
     }
     prefix.trim().parse::<Platform>().ok()
+}
+
+/// Help rows for the favourites launch card's "格式说明" dialog.
+///
+/// Kept as one pure string so the dialog body and the contract tests use the
+/// same wording. A click must produce a visible surface: the footer alone is
+/// too far from the launch card to read as a reply.
+pub fn room_format_help_text() -> String {
+    [
+        "支持以下三种房间输入，回车即用当前播放器打开：",
+        "",
+        "1. 房间号：先在左侧选择平台，再输入房间号。",
+        "   例：B站 6732538 · 虎牙 196645 · 斗鱼 93589 · 抖音 46595453118",
+        "",
+        "2. 官方直播间链接：粘贴后自动识别平台（http/https，默认端口）。",
+        "   https://live.bilibili.com/12345",
+        "   https://www.huya.com/12345",
+        "   https://www.douyu.com/12345",
+        "   https://live.douyin.com/12345",
+        "",
+        "3. 平台:房间：bili:123 / huya:123 / douyu:123 / douyin:123",
+        "",
+        "B站、抖音房间号必须是纯数字；虎牙、斗鱼可用字母、数字、下划线和连字符。",
+    ]
+    .join("\n")
 }
 
 /// Localized, actionable replacement for the domain layer's English room errors.
@@ -871,8 +900,19 @@ struct Launcher {
     session_selected: Option<String>,
     /// "查找主播" page: show the extra clue fields (game / identity / alias).
     lookup_clues: bool,
-    /// "查找主播" page: show the DeepSeek configuration panel inline.
-    lookup_ai_panel: bool,
+    /// "查找主播" page: show the DeepSeek configuration dialog. The form lives
+    /// in its own window so the API Key field is visible even when the page is
+    /// scrolled and cannot be mistaken for a static hint line.
+    ai_settings_open: bool,
+    /// Whether the AI settings dialog shows the pasted key in plain text.
+    ai_key_visible: bool,
+    /// Result of the last AI save/clear attempt, shown inside the settings dialog
+    /// instead of only on the far-away footer status line.
+    ai_dialog_message: Option<(String, bool)>,
+    /// True while an AI save/clear store action is outstanding.
+    ai_action_pending: bool,
+    /// "我的收藏" page: show the room-input format help dialog.
+    format_help_open: bool,
     lookup_web_search_open: bool,
     /// Selected AI research source on the "查找主播" page.
     lookup_source: Option<usize>,
@@ -1050,7 +1090,11 @@ impl Launcher {
             player_edit: Player::Mpv,
             session_selected: None,
             lookup_clues: false,
-            lookup_ai_panel: false,
+            ai_settings_open: false,
+            ai_key_visible: false,
+            ai_dialog_message: None,
+            ai_action_pending: false,
+            format_help_open: false,
             lookup_web_search_open: false,
             lookup_source: None,
             players_advanced_open: false,
@@ -1195,6 +1239,20 @@ impl Launcher {
             .spawn()
             .map_err(|error| format!("无法重新启动程序：{error}"))?;
         std::process::exit(0);
+    }
+
+    /// Switch the visible page and close the page-owned overlay dialogs.
+    ///
+    /// Every user-facing page jump goes through here so a dialog cannot survive
+    /// a navigation triggered outside the sidebar ("弹幕设置…", "全部会话 →",
+    /// "查看诊断日志" or a verification result filling the launch card).
+    pub(crate) fn show_page(&mut self, page: Page) {
+        self.page = page;
+        self.format_help_open = false;
+        self.ai_settings_open = false;
+        // The AI result belongs to a visible settings form; navigation must not
+        // replay it when the dialog is opened again later.
+        self.ai_dialog_message = None;
     }
 
     fn set_status(&mut self, text: impl Into<String>, error: bool) {
@@ -1404,9 +1462,24 @@ impl Launcher {
                         }
                     }
                     self.snapshot = snapshot;
+                    let ai_feedback = std::mem::take(&mut self.ai_action_pending);
                     match message {
-                        Ok(message) if !quiet => self.set_status(message, false),
-                        Err(error) => self.set_status(error, true),
+                        Ok(message) if !quiet => {
+                            // Only a visible form consumes the feedback. A late
+                            // acknowledgement after the dialog was closed must
+                            // not be replayed on the next open (the footer still
+                            // gets the message).
+                            if ai_feedback && self.ai_settings_open {
+                                self.ai_dialog_message = Some((message.clone(), false));
+                            }
+                            self.set_status(message, false);
+                        }
+                        Err(error) => {
+                            if ai_feedback && self.ai_settings_open {
+                                self.ai_dialog_message = Some((error.clone(), true));
+                            }
+                            self.set_status(error, true);
+                        }
                         _ => (),
                     }
                 }
@@ -1832,15 +1905,24 @@ impl Launcher {
         self.health_busy = false;
     }
 
-    fn send_store(&mut self, action: StoreAction) {
+    /// Queue one storage action. Returns false when the worker is gone, so a
+    /// caller that owns visible feedback (for example the AI dialog) can show
+    /// the failure instead of only relying on the footer status line.
+    fn send_store(&mut self, action: StoreAction) -> bool {
         if let StoreAction::CredentialImport(platform, _) | StoreAction::CredentialRemove(platform) | StoreAction::ClearBrowserProfiles(platform) = &action {
             self.invalidate_login_health(*platform);
             self.search_cache.clear();
             self.cancel_search();
         }
         match self.store_sender.send(action) {
-            Ok(()) => self.storage_pending += 1,
-            Err(_) => self.set_status("数据工作线程已退出，请重新打开程序后重试。", true),
+            Ok(()) => {
+                self.storage_pending += 1;
+                true
+            }
+            Err(_) => {
+                self.set_status("数据工作线程已退出，请重新打开程序后重试。", true);
+                false
+            }
         }
     }
 
@@ -1922,7 +2004,7 @@ impl Launcher {
         self.room_input = target.room.clone();
         self.quality = target.quality;
         self.favorite_name = name.to_owned();
-        self.page = Page::Favorites;
+        self.show_page(Page::Favorites);
         self.set_status(
             format!(
                 "已填入 {} · {}，点击“打开直播”开始播放。",

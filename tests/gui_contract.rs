@@ -10,7 +10,7 @@ use live_hub_rust::gui::{
     credential_platform_label, detected_platform, health_age_text, implemented_summary,
     next_health_check, overlay_arguments, overlay_platform_supported, overlay_status_text,
     parse_extra_args, parse_reserved_areas, pending_summary, read_credential_text,
-    reserved_areas_text, room_input_hint,
+    reserved_areas_text, room_format_help_text, room_input_hint,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -186,6 +186,47 @@ fn room_errors_become_platform_specific_hints() {
         "Use an official live-room URL or platform:room",
     );
     assert!(link.contains("官方直播间链接"), "unexpected hint: {link}");
+}
+
+#[test]
+fn format_help_dialog_text_documents_every_supported_room_form() {
+    let help = room_format_help_text();
+    for marker in [
+        "房间号",
+        "官方直播间链接",
+        "平台:房间",
+        "bili:123",
+        "huya:123",
+        "douyu:123",
+        "douyin:123",
+        "https://live.bilibili.com/12345",
+        "https://www.huya.com/12345",
+        "https://www.douyu.com/12345",
+        "https://live.douyin.com/12345",
+        "纯数字",
+    ] {
+        assert!(help.contains(marker), "format help misses {marker}: {help}");
+    }
+    assert!(
+        !help.contains("\\n"),
+        "help text must not contain a literal backslash-n: {help}"
+    );
+    // Every concrete example in the dialog must be accepted by the real parser,
+    // so the help cannot drift away from what the launch card accepts.
+    for example in [
+        "bili:123",
+        "huya:196645",
+        "douyu:93589",
+        "douyin:46595453118",
+        "https://live.bilibili.com/12345",
+        "https://www.huya.com/12345",
+        "https://www.douyu.com/12345",
+        "https://live.douyin.com/12345",
+    ] {
+        Target::parse(example).unwrap_or_else(|error| {
+            panic!("documented example must parse, {example}: {error:#}")
+        });
+    }
 }
 
 #[test]

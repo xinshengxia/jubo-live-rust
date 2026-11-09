@@ -47,7 +47,7 @@ impl Launcher {
                         else { "异常标记未保存，请检查日志目录写入权限。" }, !saved);
                 }
                 if ui.button("查看诊断日志").clicked() {
-                    self.page = Page::Data;
+                    self.show_page(Page::Data);
                     self.data_tab = crate::gui::data_page::DataTab::Local;
                     self.data_category = crate::gui::data_page::DataCategory::Logs;
                     self.data_detail = true;
