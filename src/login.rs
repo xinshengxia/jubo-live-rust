@@ -452,6 +452,12 @@ fn evaluate_session_health(
     cookie: Option<&str>,
 ) -> LoginHealth {
     let checked = evaluate_health(platform, reply);
+    if platform == Platform::Douyu && checked.state == HealthState::Invalid {
+        let keys: Vec<_> = cookie.unwrap_or("").split(';').filter_map(|p| p.trim().split_once('=').map(|p| p.0)).collect();
+        if keys.iter().any(|key| matches!(*key, "dy_auth" | "acf_auth" | "acf_stk")) && !keys.contains(&"LTP0") {
+            return health(platform, HealthState::Unknown, "只有网页业务凭据，缺少完整 SSO 登录凭据；请重新同步完整会话，未判定失效");
+        }
+    }
     if platform != Platform::Bili || !checked.is_valid() {
         return checked;
     }

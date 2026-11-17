@@ -8,10 +8,13 @@ use std::{
     fs,
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
     thread,
 };
 use tungstenite::{Message, client::IntoClientRequest};
+
+#[path = "browser_owned.rs"]
+mod owned;
+use owned::OwnedBrowser;
 
 const CDP_LIMIT: usize = 2 * 1024 * 1024;
 /// Default deadline for one DevTools request/response round trip.
@@ -64,10 +67,9 @@ fn validate_browser_executable(browser_executable: &Path) -> Result<()> {
 /// Shared by BrowserLogin (a fresh throw-away profile per login) and
 /// BrowserVerification (one persistent profile reused by silent refreshes).
 struct BrowserProcess {
-    child: Child,
+    child: OwnedBrowser,
     profile: PathBuf,
     endpoint: Option<Url>,
-    started: Instant,
 }
 
 impl BrowserProcess {
@@ -78,24 +80,17 @@ impl BrowserProcess {
         cancel: CancelCheck<'_>,
     ) -> Result<Self> {
         validate_browser_executable(browser_executable)?;
-        let mut command = Command::new(browser_executable);
-        command
-            .args(arguments)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000);
-        }
         cancel.check()?;
-        let child = command.spawn().context("无法启动独立网页登录窗口")?;
+        let child = OwnedBrowser::spawn(browser_executable, &arguments)?;
+        crate::diag::log(
+            "login",
+            crate::diag::Level::Info,
+            &format!("browser stage=opened launch_pid={}", child.id()),
+        );
         let mut process = Self {
             child,
             profile,
             endpoint: None,
-            started: Instant::now(),
         };
         if cancel.is_cancelled() {
             let _ = process.close();
@@ -118,14 +113,7 @@ impl BrowserProcess {
         cancel.check()?;
         ensure!(
             self.child.try_wait()?.is_none(),
-            "独立登录浏览器已退出，请重新打开"
-        );
-        if let Some(endpoint) = &self.endpoint {
-            return Ok(endpoint.clone());
-        }
-        ensure!(
-            self.started.elapsed() <= Duration::from_secs(180),
-            "登录浏览器调试端点等待已超时，请重新打开"
+            "本次专属登录窗口已关闭，请取消后重新打开"
         );
         let active = self.profile.join("DevToolsActivePort");
         reject_profile_link(&active)?;
@@ -147,7 +135,7 @@ impl BrowserProcess {
         let expected =
             validate_browser_endpoint(&format!("ws://127.0.0.1:{port}{path}"), port, path)?;
         ensure!(
-            listener_owned_by(self.child.id(), port)?,
+            self.verified_listener(port)?,
             "浏览器调试端口不属于本次独立进程，已拒绝读取Cookie"
         );
         let client = reqwest::blocking::Client::builder()
@@ -174,8 +162,28 @@ impl BrowserProcess {
         )?;
         ensure!(actual == expected, "浏览器端点身份与专属profile不一致");
         cancel.check()?;
+        ensure!(
+            self.verified_listener(port)?,
+            "浏览器端口所有者在检查期间改变"
+        );
+        crate::diag::log(
+            "login",
+            crate::diag::Level::Info,
+            &format!(
+                "browser stage=connected launch_pid={} owner_pid={} ownership=verified",
+                self.child.id(),
+                listener_owner(port)?.unwrap_or(0)
+            ),
+        );
         self.endpoint = Some(actual.clone());
         Ok(actual)
+    }
+
+    fn verified_listener(&self, port: u16) -> Result<bool> {
+        match listener_owner(port)? {
+            Some(pid) => self.child.owns(pid),
+            None => Ok(false),
+        }
     }
 
     fn connect_debugger(
@@ -188,7 +196,7 @@ impl BrowserProcess {
         cancel.check()?;
         let port = endpoint.port().ok_or_else(|| anyhow!("调试端口缺失"))?;
         ensure!(
-            listener_owned_by(self.child.id(), port)?,
+            self.verified_listener(port)?,
             "本次浏览器调试端口所有者已改变"
         );
         let address: SocketAddr = format!("127.0.0.1:{port}").parse()?;
@@ -256,6 +264,200 @@ impl BrowserProcess {
     }
 }
 
+fn scoped_capture(
+    process: &BrowserProcess,
+    platform: Platform,
+    endpoint: &Url,
+    cancel: CancelCheck<'_>,
+    check_in_page: bool,
+) -> Result<(Value, Option<LoginHealth>)> {
+    let mut websocket = process.open_debugger(endpoint, cancel)?;
+    let targets = rpc(
+        &mut websocket,
+        1,
+        "Target.getTargets",
+        serde_json::json!({}),
+        None,
+        cancel,
+        CDP_TIMEOUT,
+    )?;
+    let selected = targets["targetInfos"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|target| {
+            target["type"] == "page"
+                && target["url"]
+                    .as_str()
+                    .and_then(|a| Url::parse(a).ok())
+                    .is_some_and(|url| {
+                        url.scheme() == "https"
+                            && url
+                                .host_str()
+                                .is_some_and(|host| platform_contains_host(platform, host))
+                    })
+        })
+        .ok_or_else(|| anyhow!("请先完成登录，并回到该平台页面"))?;
+    let target = selected["targetId"]
+        .as_str()
+        .ok_or_else(|| anyhow!("平台页面身份缺失"))?;
+    let attached = rpc(
+        &mut websocket,
+        2,
+        "Target.attachToTarget",
+        serde_json::json!({"targetId":target,"flatten":true}),
+        None,
+        cancel,
+        CDP_TIMEOUT,
+    )?;
+    let session = attached["sessionId"]
+        .as_str()
+        .ok_or_else(|| anyhow!("无法绑定本次平台页面"))?;
+    // Request only selected-platform URL scopes, never the whole browser's
+    // storage (which can also hold third-party OAuth session cookies).
+    let mut cookies = rpc(
+        &mut websocket,
+        3,
+        "Network.getCookies",
+        serde_json::json!({"urls":capture_urls(platform)}),
+        Some(session),
+        cancel,
+        CDP_TIMEOUT,
+    )?;
+    let mut browser_health = None;
+    if check_in_page
+        && platform == Platform::Douyin
+        && cookies["cookies"].as_array().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row["name"]
+                    .as_str()
+                    .is_some_and(|name| crate::auth::is_login_key(platform, name))
+            })
+        })
+        && selected["url"]
+            .as_str()
+            .and_then(|a| Url::parse(a).ok())
+            .is_some_and(|url| {
+                url.host_str() == Some("www.douyin.com") && !url.path().contains("login")
+            })
+    {
+        let endpoint = serde_json::to_string(health_endpoint(platform).as_str())?;
+        let expression = format!(
+            "(async()=>{{const c=new AbortController();const t=setTimeout(()=>c.abort(),8000);try{{const r=await fetch({endpoint},{{credentials:'include',signal:c.signal}});const d=await r.json();const u=d.user||d.data?.user;return{{status:r.status,body:{{status_code:d.status_code,status_msg:d.status_msg,user:u?{{uid:String(u.uid||u.uid_str||'')}}:null}}}};}}catch(e){{return{{status:0,body:{{}}}}}}finally{{clearTimeout(t)}}}})()"
+        );
+        if let Ok(result) = rpc(
+            &mut websocket,
+            4,
+            "Runtime.evaluate",
+            serde_json::json!({"expression":expression,"awaitPromise":true,"returnByValue":true}),
+            Some(session),
+            cancel,
+            CDP_TIMEOUT,
+        ) {
+            let value = &result["result"]["value"];
+            if let Some(status) = value["status"].as_u64().filter(|n| *n > 0 && *n <= 599) {
+                browser_health = Some(evaluate_health(
+                    platform,
+                    &LoginReply {
+                        status: status as u16,
+                        body: serde_json::to_string(&value["body"])?,
+                        set_cookies: Vec::new(),
+                        location: None,
+                    },
+                ));
+            }
+        }
+    }
+    if browser_health.is_some() {
+        let before = decode_browser_cookies(platform, &cookies)?;
+        let current = rpc(
+            &mut websocket,
+            5,
+            "Network.getCookies",
+            serde_json::json!({"urls":capture_urls(platform)}),
+            Some(session),
+            cancel,
+            CDP_TIMEOUT,
+        )?;
+        if !same_candidate(&before, &decode_browser_cookies(platform, &current)?) {
+            browser_health = None;
+        }
+        cookies = current;
+    }
+    Ok((cookies, browser_health))
+}
+
+fn same_candidate(before: &[CapturedCookie], after: &[CapturedCookie]) -> bool {
+    let key = |c: &CapturedCookie| format!("{}\n{}\n{}", c.domain, c.path, c.name);
+    let mut before: Vec<_> = before.iter().collect();
+    let mut after: Vec<_> = after.iter().collect();
+    before.sort_by_key(|c| key(c));
+    after.sort_by_key(|c| key(c));
+    before == after
+}
+
+fn capture_verified(
+    process: &mut BrowserProcess,
+    platform: Platform,
+    vault: &CookieVault,
+    cancellation: &Cancellation,
+) -> Result<LoginHealth> {
+    let started = Instant::now();
+    let cancel = CancelCheck::Token(cancellation);
+    let endpoint = process.endpoint(cancel)?;
+    let (result, browser_health) = scoped_capture(process, platform, &endpoint, cancel, true)?;
+    let cookies = decode_browser_cookies(platform, &result)?;
+    if !cookies
+        .iter()
+        .any(|c| crate::auth::is_login_key(platform, &c.name) && !c.value.is_empty())
+    {
+        return Ok(health(
+            platform,
+            HealthState::AuxiliaryOnly,
+            "已连接专属窗口，等待官网扫码或登录；辅助 Cookie 不代表账号已登录",
+        ));
+    }
+    let mut checked = verify_captured(platform, &cookies, cancellation, &OfficialTransport)?;
+    if !checked.is_valid()
+        && let Some(status) = browser_health
+        && status.is_valid()
+    {
+        checked = status;
+    }
+    crate::diag::log(
+        "login",
+        crate::diag::Level::Info,
+        &format!(
+            "browser stage=verified platform={platform} verdict={:?} duration_ms={}",
+            checked.state,
+            started.elapsed().as_millis()
+        ),
+    );
+    cancellation.check()?;
+    if checked.is_valid() {
+        // Like the reference login flow, reject an account/cookie change that
+        // happened while the server check was in flight. Never persist stale work.
+        let endpoint = process.endpoint(cancel)?;
+        let (current, _) = scoped_capture(process, platform, &endpoint, cancel, false)?;
+        let current = decode_browser_cookies(platform, &current)?;
+        if !same_candidate(&cookies, &current) {
+            return Ok(health(
+                platform,
+                HealthState::Unknown,
+                "登录信息在核验期间发生变化，请重新核验；原凭据保持不变",
+            ));
+        }
+        cancellation.check()?;
+        vault.import_captured(platform, &current)?;
+        crate::diag::log(
+            "login",
+            crate::diag::Level::Info,
+            "browser stage=saved platform_health=valid",
+        );
+    }
+    Ok(checked)
+}
+
 pub struct BrowserLogin {
     platform: Platform,
     process: BrowserProcess,
@@ -272,7 +474,7 @@ impl std::fmt::Debug for BrowserLogin {
 pub fn login_url(platform: Platform) -> &'static str {
     match platform {
         Platform::Bili => "https://passport.bilibili.com/login",
-        Platform::Huya => "https://www.huya.com/",
+        Platform::Huya => "https://www.huya.com/login",
         Platform::Douyu => "https://www.douyu.com/",
         Platform::Douyin => "https://www.douyin.com/",
     }
@@ -349,133 +551,9 @@ impl BrowserLogin {
         vault: &CookieVault,
         cancellation: &Cancellation,
     ) -> Result<LoginHealth> {
-        let cancel = CancelCheck::Token(cancellation);
-        let endpoint = self.process.endpoint(cancel)?;
-        let (result, browser_health) = self.scoped_capture(&endpoint, cancel)?;
-        let cookies = decode_browser_cookies(self.platform, &result)?;
-        let mut checked =
-            verify_captured(self.platform, &cookies, cancellation, &OfficialTransport)?;
-        if !checked.is_valid() {
-            if let Some(status) = browser_health {
-                if status.is_valid() {
-                    checked = status;
-                }
-            }
-        }
-        cancellation.check()?;
-        if checked.is_valid() {
-            vault.import_captured(self.platform, &cookies)?;
-        }
-        Ok(checked)
+        capture_verified(&mut self.process, self.platform, vault, cancellation)
     }
 
-    fn scoped_capture(
-        &self,
-        endpoint: &Url,
-        cancel: CancelCheck<'_>,
-    ) -> Result<(Value, Option<LoginHealth>)> {
-        let mut websocket = self.process.open_debugger(endpoint, cancel)?;
-        let targets = rpc(
-            &mut websocket,
-            1,
-            "Target.getTargets",
-            serde_json::json!({}),
-            None,
-            cancel,
-            CDP_TIMEOUT,
-        )?;
-        let selected = targets["targetInfos"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|target| {
-                target["type"] == "page"
-                    && target["url"]
-                        .as_str()
-                        .and_then(|a| Url::parse(a).ok())
-                        .is_some_and(|url| {
-                            url.scheme() == "https"
-                                && url
-                                    .host_str()
-                                    .is_some_and(|host| platform_contains_host(self.platform, host))
-                        })
-            })
-            .ok_or_else(|| anyhow!("请先完成登录，并回到该平台页面"))?;
-        let target = selected["targetId"]
-            .as_str()
-            .ok_or_else(|| anyhow!("平台页面身份缺失"))?;
-        let attached = rpc(
-            &mut websocket,
-            2,
-            "Target.attachToTarget",
-            serde_json::json!({"targetId":target,"flatten":true}),
-            None,
-            cancel,
-            CDP_TIMEOUT,
-        )?;
-        let session = attached["sessionId"]
-            .as_str()
-            .ok_or_else(|| anyhow!("无法绑定本次平台页面"))?;
-        // Request only selected-platform URL scopes, never the whole browser's
-        // storage (which can also hold third-party OAuth session cookies).
-        let mut cookies = rpc(
-            &mut websocket,
-            3,
-            "Network.getCookies",
-            serde_json::json!({"urls":capture_urls(self.platform)}),
-            Some(session),
-            cancel,
-            CDP_TIMEOUT,
-        )?;
-        let mut browser_health = None;
-        if self.platform == Platform::Douyin
-            && selected["url"]
-                .as_str()
-                .and_then(|a| Url::parse(a).ok())
-                .is_some_and(|url| {
-                    url.host_str() == Some("www.douyin.com") && !url.path().contains("login")
-                })
-        {
-            let endpoint = serde_json::to_string(health_endpoint(self.platform).as_str())?;
-            let expression = format!(
-                "(async()=>{{const c=new AbortController();const t=setTimeout(()=>c.abort(),8000);try{{const r=await fetch({endpoint},{{credentials:'include',signal:c.signal}});const d=await r.json();const u=d.user||d.data?.user;return{{status:r.status,body:{{status_code:d.status_code,status_msg:d.status_msg,user:u?{{uid:String(u.uid||u.uid_str||'')}}:null}}}};}}catch(e){{return{{status:0,body:{{}}}}}}finally{{clearTimeout(t)}}}})()"
-            );
-            if let Ok(result) = rpc(
-                &mut websocket,
-                4,
-                "Runtime.evaluate",
-                serde_json::json!({"expression":expression,"awaitPromise":true,"returnByValue":true}),
-                Some(session),
-                cancel,
-                CDP_TIMEOUT,
-            ) {
-                let value = &result["result"]["value"];
-                if let Some(status) = value["status"].as_u64().filter(|n| *n > 0 && *n <= 599) {
-                    browser_health = Some(evaluate_health(
-                        self.platform,
-                        &LoginReply {
-                            status: status as u16,
-                            body: serde_json::to_string(&value["body"])?,
-                            set_cookies: Vec::new(),
-                            location: None,
-                        },
-                    ));
-                }
-            }
-        }
-        if browser_health.is_some() {
-            cookies = rpc(
-                &mut websocket,
-                5,
-                "Network.getCookies",
-                serde_json::json!({"urls":capture_urls(self.platform)}),
-                Some(session),
-                cancel,
-                CDP_TIMEOUT,
-            )?;
-        }
-        Ok((cookies, browser_health))
-    }
     /// Close only the process and profile created by this object. Profile data
     /// is deliberately retained; clearing it requires a separate user operation.
     pub fn close(&mut self) -> Result<()> {
@@ -639,6 +717,15 @@ impl BrowserVerification {
         // usable"; during polling that simply means "not yet", not an error.
         let cookies = decode_browser_cookies(self.platform, &captured).unwrap_or_default();
         Ok(Some(VerificationSnapshot { title, cookies }))
+    }
+
+    /// Account login capture stays separate from anonymous page verification.
+    pub fn capture_and_verify(
+        &mut self,
+        vault: &CookieVault,
+        cancellation: &Cancellation,
+    ) -> Result<LoginHealth> {
+        capture_verified(&mut self.process, self.platform, vault, cancellation)
     }
 
     /// Close only the process this object started. The persistent profile is
@@ -883,7 +970,17 @@ pub fn remove_platform_profiles(profile_root: &Path, platform: Platform) -> Resu
 
 fn reject_profile_link(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) => ensure!(!metadata.file_type().is_symlink(), "登录资料路径不能是链接"),
+        Ok(metadata) => {
+            ensure!(!metadata.file_type().is_symlink(), "登录资料路径不能是链接");
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                ensure!(
+                    metadata.file_attributes() & 0x400 == 0,
+                    "登录资料路径不能是重解析点"
+                );
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
         Err(error) => return Err(error).context("无法检查登录资料路径"),
     }
@@ -891,7 +988,7 @@ fn reject_profile_link(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn listener_owned_by(pid: u32, port: u16) -> Result<bool> {
+fn listener_owner(port: u16) -> Result<Option<u32>> {
     #[link(name = "iphlpapi")]
     unsafe extern "system" {
         fn GetExtendedTcpTable(
@@ -920,14 +1017,14 @@ fn listener_owned_by(pid: u32, port: u16) -> Result<bool> {
         let address = u32::from_ne_bytes(row[4..8].try_into().unwrap());
         let local = u32::from_ne_bytes(row[8..12].try_into().unwrap());
         let owner = u32::from_ne_bytes(row[20..24].try_into().unwrap());
-        if address == 0x0100_007f && u16::from_be(local as u16) == port && owner == pid {
-            return Ok(true);
+        if address == 0x0100_007f && u16::from_be(local as u16) == port {
+            return Ok(Some(owner));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 #[cfg(not(windows))]
-fn listener_owned_by(_pid: u32, _port: u16) -> Result<bool> {
+fn listener_owner(_port: u16) -> Result<Option<u32>> {
     bail!("网页登录端口所有权验证当前仅支持Windows")
 }
 
@@ -1026,6 +1123,17 @@ fn verification_browser_arguments(
 mod tests {
     use super::*;
     #[test]
+    fn changed_cookie_candidates_are_never_the_same_session() {
+        let value = serde_json::json!({"cookies":[{"name":"sessionid","value":"synthetic-one","domain":".douyin.com","path":"/","session":true}]});
+        let first = decode_browser_cookies(Platform::Douyin, &value).unwrap();
+        let mut changed = first.clone();
+        changed[0].value = "synthetic-two".into();
+        assert!(same_candidate(&first, &first));
+        assert!(!same_candidate(&first, &changed));
+        assert!(!same_candidate(&first, &[]));
+    }
+
+    #[test]
     fn login_browser_never_signs_into_the_user_account() {
         let profile = PathBuf::from(r"C:\private-login-profile");
         let chrome = login_browser_arguments(
@@ -1094,7 +1202,9 @@ mod tests {
         let visible =
             verification_browser_arguments(chrome, &profile, "https://live.douyin.com/", true);
         assert!(
-            !visible.iter().any(|arg| arg.starts_with("--window-position=")),
+            !visible
+                .iter()
+                .any(|arg| arg.starts_with("--window-position=")),
             "the user window must not be moved off-screen"
         );
         assert!(
@@ -1158,7 +1268,6 @@ mod tests {
     fn devtools_listener_requires_the_actual_owning_process() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        assert!(listener_owned_by(std::process::id(), port).unwrap());
-        assert!(!listener_owned_by(u32::MAX, port).unwrap());
+        assert_eq!(listener_owner(port).unwrap(), Some(std::process::id()));
     }
 }

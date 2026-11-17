@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Instant;
 
 pub(super) fn qr_image(payload: &str) -> Result<egui::ColorImage> {
     ensure!(payload.len() <= 4096, "二维码内容过长");
@@ -106,25 +107,25 @@ impl Launcher {
                     let outcome = (|| -> Result<String> {
                         window.open_root_page(&cancel_check)?;
                         send(LoginUpdate::Progress(
-                            "已打开本程序的抖音专属验证窗口（不会读取日常浏览器资料）；完成滑块或登录后点击“我已登录，检查并保存”。".into(),
+                            "已打开本程序的抖音专属验证窗口（不会读取日常浏览器资料）；完成滑块及账号登录后会自动核验并保存，也可点击“我已登录，检查并保存”重试。".into(),
                         ));
+                        let mut next_check = Instant::now() + Duration::from_secs(3);
                         while !cancel.is_cancelled() {
-                            if capture.swap(false, Ordering::AcqRel) {
-                                match crate::douyin_guard::capture_visible(
-                                    &mut window,
-                                    &vault,
-                                    &cancel_check,
-                                ) {
-                                    Ok(true) => {
+                            if capture.swap(false, Ordering::AcqRel) || Instant::now() >= next_check {
+                                next_check = Instant::now() + Duration::from_secs(8);
+                                send(LoginUpdate::Progress("正在连接专属窗口 → 读取抖音会话 → 向平台核验；有效后才加密保存…".into()));
+                                match window.capture_login(&vault, &cancel) {
+                                    Ok(status) if status.is_valid() => {
+                                        send(LoginUpdate::Health(status));
                                         saved = true;
                                         send(LoginUpdate::Progress(
                                             "抖音网页验证已通过，Cookie 已加密保存。".into(),
                                         ));
                                         return Ok("抖音网页验证已通过，Cookie 已加密保存；请重新播放当前房间。".into());
                                     }
-                                    Ok(false) => send(LoginUpdate::Progress(
-                                        "尚未确认验证完成（可能仍是验证码中间页或缺少 ttwid）；请在窗口中完成验证后再次点击。".into(),
-                                    )),
+                                    Ok(status) => send(LoginUpdate::Progress(format!(
+                                        "已连接专属窗口，尚未保存：{}。网页验证与账号登录不同，请完成登录后重试核验；原凭据保持不变。", status.reason
+                                    ))),
                                     Err(error) => send(LoginUpdate::Progress(format!(
                                         "暂未保存：{error}。完成正常验证后可重试。"
                                     ))),
@@ -167,7 +168,9 @@ impl Launcher {
                                 return Ok("B站登录成功，凭据已加密保存。".into());
                             }
                             login::QrStatus::Expired => {
-                                return Ok("二维码已到期，请重新获取。".into());
+                                send(LoginUpdate::Progress("二维码已到期，正在刷新…".into()));
+                                session = login::BiliQrLogin::start(&cancel)?;
+                                send(LoginUpdate::Qr(session.challenge().url));
                             }
                             login::QrStatus::Cancelled => return Ok("已取消登录。".into()),
                         }
@@ -186,10 +189,13 @@ impl Launcher {
                     &root.join("browser-login"),
                     &cancel,
                 )?;
-                send(LoginUpdate::Progress("已打开本程序的独立登录窗口（Edge 隐私模式/Chrome 全新临时资料，不会登录或同步你的 Microsoft/Google 账号）。完成登录后点击“我已登录，检查并保存”。".into()));
+                send(LoginUpdate::Progress("已打开本程序的独立登录窗口（Edge 隐私模式/Chrome 全新临时资料，不会登录或同步你的 Microsoft/Google 账号）。完成登录后会自动检测并保存，也可点击“我已登录，检查并保存”重试。".into()));
                 let result = (|| -> Result<String> {
+                    let mut next_check = Instant::now() + Duration::from_secs(3);
                     while !cancel.is_cancelled() {
-                        if capture.swap(false, Ordering::AcqRel) {
+                        if capture.swap(false, Ordering::AcqRel) || Instant::now() >= next_check {
+                            next_check = Instant::now() + Duration::from_secs(8);
+                            send(LoginUpdate::Progress("正在连接专属窗口 → 读取本平台会话 → 平台核验 → 加密保存…".into()));
                             match session.capture_and_verify(&vault, &cancel) {
                                 Ok(status) => {
                                     let valid = status.is_valid();

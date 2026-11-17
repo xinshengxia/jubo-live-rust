@@ -205,12 +205,12 @@ fn validate_capabilities(success: bool, output: &[u8], truncated: bool) -> Resul
         "mpv 音频能力响应没有音频输出列表，无法确认 OpenAL 支持，请重新选择有效的 mpv.exe"
     );
     bail!(
-        "此 mpv 不支持 OpenAL，无法启用直播音频时钟修复。请使用带 OpenAL 的 mpv 构建，或在高级参数中显式选择其他 --ao= 输出（该覆盖不使用默认修复路径）"
+        "当前 mpv 构建不含本应用默认需要的 OpenAL 音频输出，请获取兼容构建或选择其他播放器"
     )
 }
 
 #[cfg(windows)]
-fn check_capabilities(executable: &Path) -> Result<()> {
+pub(crate) fn check_capabilities(executable: &Path) -> Result<()> {
     use std::os::windows::process::CommandExt;
     use std::process::Stdio;
     use std::sync::mpsc;
@@ -692,7 +692,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(missing.to_string().contains("OpenAL"), "{missing:#}");
-        assert!(missing.to_string().contains("--ao="), "{missing:#}");
+        assert!(missing.to_string().contains("获取兼容"), "{missing:#}");
         assert!(validate_capabilities(true, supported, true).is_err());
         assert!(validate_capabilities(false, b"", false).is_err());
     }

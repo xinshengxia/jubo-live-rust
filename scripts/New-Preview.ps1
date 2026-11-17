@@ -34,6 +34,8 @@ try {
         $flags += ('--remap-path-prefix=\\?\' + $toolPath + '=/toolchain')
     }
     if ($env:USERPROFILE) { $flags += ('--remap-path-prefix=' + $env:USERPROFILE + '=/user') }
+    $flags += ('--remap-path-prefix=' + $targetPath + '=/build')
+    $flags += ('--remap-path-prefix=\\?\' + $targetPath + '=/build')
     $env:RUSTFLAGS = $null
     $env:CARGO_ENCODED_RUSTFLAGS = $flags -join [char]0x1f
     & (Join-Path $PSScriptRoot 'Build.ps1') -ToolchainRoot $ToolchainRoot -TargetDirectory $targetPath -Release

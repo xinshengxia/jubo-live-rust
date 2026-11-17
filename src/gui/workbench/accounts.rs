@@ -185,6 +185,7 @@ impl Launcher {
                     Align2::CENTER_CENTER,
                 );
                 if response.clicked() {
+                    if self.login_busy && self.platform != platform { self.cancel_login(); }
                     self.platform = platform;
                     match action_index {
                         0 => {
@@ -219,7 +220,7 @@ impl Launcher {
         text_in(
             ui.painter(),
             Rect::from_min_size(host.min + vec2(0.0, note_top), vec2(width, 19.0)),
-            "检测超时、网页核验或格式变化不会直接判定登录失效；网页登录使用 Edge 隐私窗口（Chrome 备选），不会登录或同步你的 Microsoft/Google 账号。",
+            "无需预先登录四平台；本地收藏、历史独立保存。网页完成后仍需应用核验并保存；登录不改变平台权限限制。",
             font(11.0),
             pal.text_secondary,
             Align2::LEFT_CENTER,
@@ -264,7 +265,7 @@ impl Launcher {
             y += 56.0;
         }
         // ---- Rust extras: login activity, QR and status details -----------
-        let show_activity = self.login_busy || self.login_qr.is_some();
+        let show_activity = self.login_busy || self.login_qr.is_some() || !self.login_message.is_empty();
         let detail_text = self.account_details.clone();
         if show_activity {
             let panel_height = if self.login_qr.is_some() { 176.0 } else { 88.0 };

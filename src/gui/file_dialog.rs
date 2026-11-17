@@ -26,9 +26,9 @@ impl ToolKind {
 
     pub fn dialog_title(self) -> &'static str {
         match self {
-            Self::Mpv => "选择 mpv 可执行文件",
-            Self::PotPlayer => "选择 PotPlayer 可执行文件",
-            Self::YtDlp => "选择 yt-dlp 可执行文件",
+            Self::Mpv => "选择 mpv 程序或快捷方式",
+            Self::PotPlayer => "选择 PotPlayer 程序或快捷方式",
+            Self::YtDlp => "选择 yt-dlp 程序或快捷方式",
         }
     }
 
@@ -67,23 +67,8 @@ pub fn build_filter(pairs: &[(&str, &str)]) -> Vec<u16> {
 /// The concrete filters shown for one tool. Keeping the specific file first is
 /// friendlier, but any executable remains selectable through the second entry.
 pub fn tool_filter(tool: ToolKind) -> Vec<u16> {
-    match tool {
-        ToolKind::Mpv => build_filter(&[
-            ("mpv (mpv.exe)", "mpv.exe"),
-            ("可执行文件 (*.exe)", "*.exe"),
-        ]),
-        ToolKind::PotPlayer => build_filter(&[
-            (
-                "PotPlayer (PotPlayerMini64.exe; PotPlayerMini.exe)",
-                "PotPlayer*.exe",
-            ),
-            ("可执行文件 (*.exe)", "*.exe"),
-        ]),
-        ToolKind::YtDlp => build_filter(&[
-            ("yt-dlp (yt-dlp.exe)", "yt-dlp.exe"),
-            ("可执行文件 (*.exe)", "*.exe"),
-        ]),
-    }
+    let _ = tool;
+    build_filter(&[("程序或桌面 / 开始菜单快捷方式 (*.exe;*.lnk)", "*.exe;*.lnk")])
 }
 
 /// One tool path from the settings draft:
@@ -95,13 +80,20 @@ pub fn validate_tool_path(tool: ToolKind, value: &str) -> Result<Option<PathBuf>
     if trimmed.is_empty() {
         return Ok(None);
     }
-    let path = PathBuf::from(trimmed);
+    let path = PathBuf::from(trimmed.trim_matches('"'));
     ensure!(
         path.is_absolute(),
         "{} 路径必须是绝对路径（例如 C:\\tools\\{}），或留空自动查找；请使用“浏览…”选择",
         tool.label(),
         tool.names()[0]
     );
+    let path = if path.extension().is_some_and(|s| s.eq_ignore_ascii_case("lnk")) {
+        ensure!(path.is_file(), "快捷方式不存在，请重新选择");
+        super::tool_setup::resolve_shortcut(&path)?
+    } else { path };
+    if path.extension().is_some_and(|s| s.eq_ignore_ascii_case("url")) {
+        bail!("网页快捷方式不能用作播放器，请选择程序文件或直接指向程序的 .lnk");
+    }
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(_) => bail!(
@@ -148,7 +140,7 @@ pub fn path_status(tool: ToolKind, value: &str) -> Option<(bool, String)> {
         return None;
     }
     match validate_tool_path(tool, value) {
-        Ok(Some(_)) => Some((true, "路径有效".to_owned())),
+        Ok(Some(_)) => Some((true, "文件存在，需检测程序版本与能力".to_owned())),
         Ok(None) => None,
         Err(error) => Some((false, format!("{error:#}"))),
     }
@@ -211,7 +203,7 @@ pub fn detect_tool_in(tool: ToolKind, directories: &[PathBuf]) -> Option<PathBuf
 
 /// Auto-detection using the real process environment. Separated from the pure
 /// candidate builder above so tests can stay hermetic.
-pub fn detect_tool(tool: ToolKind) -> Option<PathBuf> {
+pub fn detect_tools(tool: ToolKind) -> Vec<PathBuf> {
     let executable_dir = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf))
@@ -232,9 +224,21 @@ pub fn detect_tool(tool: ToolKind) -> Option<PathBuf> {
             }
         }
     }
-    let directories = tool_candidates(tool, &executable_dir, &path_dirs, &program_files, &[]);
-    detect_tool_in(tool, &directories)
+    let extras = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+        .map(|root| vec![root.join("Programs/mpv"), root.join("Programs/yt-dlp"), root.join("Programs/DAUM/PotPlayer")])
+        .unwrap_or_default();
+    let directories = tool_candidates(tool, &executable_dir, &path_dirs, &program_files, &extras);
+    let mut found = Vec::new();
+    for directory in directories {
+        for name in tool.names() {
+            let path = directory.join(name);
+            if path.is_file() && !found.contains(&path) { found.push(path); }
+        }
+    }
+    found
 }
+
+pub fn detect_tool(tool: ToolKind) -> Option<PathBuf> { detect_tools(tool).into_iter().next() }
 
 /// Opens the native Windows "open file" dialog. Returns None when the user
 /// cancels, the platform is not Windows, or the dialog cannot be shown (the UI
@@ -344,6 +348,7 @@ fn native_pick(filter: &[u16], title: &str, initial_dir: Option<&Path>) -> Optio
         flags: OFN_EXPLORER
             | OFN_PATH_MUST_EXIST
             | OFN_FILE_MUST_EXIST
+            | 0x0010_0000 // OFN_NODEREFERENCELINKS: resolve read-only on worker
             | OFN_NO_CHANGE_DIR
             | OFN_DONT_ADD_TO_RECENT,
         n_file_offset: 0,
@@ -655,7 +660,7 @@ mod tests {
         write_file(&valid, 2048);
         let (ok, text) = path_status(ToolKind::Mpv, valid.to_str().unwrap()).unwrap();
         assert!(ok);
-        assert_eq!(text, "路径有效");
+        assert!(text.contains("需检测"));
     }
 
     #[test]

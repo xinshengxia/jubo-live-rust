@@ -22,7 +22,10 @@ $entries = @(foreach ($relative in $paths) {
 $stable = [version](($Version -split '[-+]')[0]) -ge [version]'1.0.0'
 $schema = if ($stable) { 'livehub-rust-release/1' } else { 'livehub-rust-preview/1' }
 $stage = if ($stable) { 'release' } else { 'migration-preview' }
-$sourceState = if ($stable) { 'local-source-build' } else { 'uncommitted-development-preview' }
+$repoPath = Split-Path -Parent $PSScriptRoot
+$revision = & git -C $repoPath rev-parse --verify HEAD 2>$null
+$changes = & git -C $repoPath status --porcelain 2>$null
+$sourceState = if ($revision -and -not $changes) { 'clean-git:' + $revision } else { 'uncommitted-development-preview' }
 [ordered]@{schema=$schema;version=$Version;stage=$stage;sourceState=$sourceState;target='windows-x64';files=$entries} |
     ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $packagePath 'manifest.json') -Encoding utf8
 $manifestHash = (Get-FileHash -LiteralPath (Join-Path $packagePath 'manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant()

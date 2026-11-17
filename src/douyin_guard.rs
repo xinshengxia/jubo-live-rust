@@ -541,6 +541,7 @@ where
     {
         return Ok(false);
     }
+    if cancel() { return Ok(false); }
     import_verified_cookies(vault, &snapshot.cookies)?;
     note_verification_success();
     crate::diag::log(
@@ -585,6 +586,13 @@ impl DouyinBrowser {
         <Self as VerificationBrowser>::open(self, "", cancel)
     }
 
+    pub(crate) fn capture_login(&mut self, vault: &CookieVault, cancel: &crate::login::Cancellation) -> Result<crate::login::LoginHealth> {
+        let session = self.session.as_mut().ok_or_else(|| anyhow!("专属窗口未打开，请取消后重新打开"))?;
+        let health = session.capture_and_verify(vault, cancel)?;
+        if health.is_valid() { note_verification_success(); }
+        Ok(health)
+    }
+
     pub(crate) fn close_now(&mut self) {
         <Self as VerificationBrowser>::close(self);
     }
@@ -596,7 +604,11 @@ impl VerificationBrowser for DouyinBrowser {
             room.is_empty() || room_is_valid(room),
             "抖音房间号格式无效"
         );
-        let url = douyin_page_url(room);
+        let url = if self.visible && room.is_empty() {
+            // Match the reference account-login entry. The same-origin browser
+            // health check is available here; silent room recovery keeps live.*.
+            crate::login::browser::login_url(Platform::Douyin).to_owned()
+        } else { douyin_page_url(room) };
         if self.visible {
             let data_root = self
                 .profile

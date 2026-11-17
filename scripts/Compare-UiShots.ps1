@@ -70,9 +70,6 @@ function Test-PythonImaging([string]$candidate) {
 $candidates = @()
 if ($PythonExe) { $candidates += $PythonExe }
 $candidates += @(
-    'D:\conda_envs\py313\python.exe',
-    'D:\conda_envs\yolo\python.exe',
-    'C:\Program Files\Inkscape\bin\python.exe',
     (Get-Command python -ErrorAction SilentlyContinue).Source
 ) | Where-Object { $_ }
 $resolved = $null
@@ -80,7 +77,7 @@ foreach ($candidate in $candidates) {
     if (Test-PythonImaging $candidate) { $resolved = $candidate; break }
 }
 if (-not $resolved) {
-    throw '找不到带 Pillow + numpy 的 python。请用 -PythonExe 指定（本机可用 D:\conda_envs\py313\python.exe）。'
+    throw '找不到带 Pillow + numpy 的 Python。请用 -PythonExe 指定已安装所需依赖的解释器。'
 }
 Write-Host ("[ui-compare] python: " + $resolved)
 

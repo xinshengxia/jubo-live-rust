@@ -281,6 +281,7 @@ fn push_unique(pages: &mut Vec<String>, page: &str) {
 
 fn write_png(path: &Path, image: &egui::ColorImage) -> std::io::Result<()> {
     use image::ImageEncoder;
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
     let file = std::fs::File::create(path)?;
     let bytes: Vec<u8> = image
         .pixels

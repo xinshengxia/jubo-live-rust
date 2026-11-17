@@ -42,6 +42,7 @@ mod ai_panel;
 pub mod badges;
 pub mod data_page;
 pub mod file_dialog;
+mod tool_setup;
 pub mod observations;
 mod sessions_page;
 pub mod theme;
@@ -67,6 +68,7 @@ pub const MIN_SIZE: [f32; 2] = [760.0, 520.0];
 const WINDOW_TITLE: &str = "看直播 · Rust";
 
 pub fn run(data_root: PathBuf) -> Result<()> {
+    crate::diag::init(data_root.join("logs"));
     let store = Store::open(data_root)?;
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(DESIGN_SIZE)
@@ -802,6 +804,12 @@ enum ImportKind {
 }
 
 enum Event {
+    ToolSetup {
+        id: u64,
+        tool: file_dialog::ToolKind,
+        original: String,
+        result: std::result::Result<(PathBuf, String), String>,
+    },
     Ai {
         id: u64,
         optimize: bool,
@@ -917,7 +925,6 @@ struct Launcher {
     /// Selected AI research source on the "查找主播" page.
     lookup_source: Option<usize>,
     /// Whether the players page's Rust-only advanced cards are expanded.
-    players_advanced_open: bool,
     /// Result platform filter on the "查找主播" page (None = all platforms).
     lookup_filter: Option<Platform>,
     /// "状态详情" result shown under the account cards (explicit user request).
@@ -960,6 +967,17 @@ struct Launcher {
     favorite_undo: Option<(Favorite, std::time::Instant)>,
     search_results: Vec<platforms::LookupCandidate>,
     verification_pending: bool,
+    tool_feedback_kind: Option<file_dialog::ToolKind>,
+    players_tools_open: bool,
+    players_path_dialog: Option<file_dialog::ToolKind>,
+    players_recovery_open: bool,
+    tool_choices: Vec<(file_dialog::ToolKind, PathBuf)>,
+    tool_setup_generation: u64,
+    tool_setup_busy: bool,
+    tool_cancel: Arc<AtomicBool>,
+    tool_progress: Arc<std::sync::atomic::AtomicU64>,
+    tool_feedback: Option<(String, bool)>,
+    tool_download_confirm: bool,
     mpv_path: String,
     potplayer_path: String,
     ytdlp_path: String,
@@ -1097,7 +1115,6 @@ impl Launcher {
             format_help_open: false,
             lookup_web_search_open: false,
             lookup_source: None,
-            players_advanced_open: false,
             lookup_filter: None,
             account_details: None,
             ui_shot: None,
@@ -1152,6 +1169,17 @@ impl Launcher {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             storage_pending: 0,
+            tool_feedback_kind: None,
+            players_tools_open: false,
+            players_path_dialog: None,
+            players_recovery_open: false,
+            tool_choices: Vec::new(),
+            tool_setup_generation: 0,
+            tool_setup_busy: false,
+            tool_cancel: Arc::new(AtomicBool::new(false)),
+            tool_progress: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            tool_feedback: None,
+            tool_download_confirm: false,
             mpv_path: path_text(&snapshot.settings.mpv),
             potplayer_path: path_text(&snapshot.settings.potplayer),
             ytdlp_path: path_text(&snapshot.settings.yt_dlp),
@@ -1250,6 +1278,9 @@ impl Launcher {
         self.page = page;
         self.format_help_open = false;
         self.ai_settings_open = false;
+        self.players_path_dialog = None;
+        self.tool_download_confirm = false;
+        self.tool_choices.clear();
         // The AI result belongs to a visible settings form; navigation must not
         // replay it when the dialog is opened again later.
         self.ai_dialog_message = None;
@@ -1402,12 +1433,46 @@ impl Launcher {
                         Err(error) => self.set_status(format!("AI线索尚未核验：{error}"), true),
                     }
                 }
+                Event::ToolSetup { id, tool, original, result } => {
+                    if id != self.tool_setup_generation { continue; }
+                    self.tool_setup_busy = false;
+                    let current = match tool { file_dialog::ToolKind::Mpv => &self.mpv_path,
+                        file_dialog::ToolKind::PotPlayer => &self.potplayer_path, file_dialog::ToolKind::YtDlp => &self.ytdlp_path };
+                    if current != &original || self.tool_cancel.load(Ordering::Acquire) {
+                        self.tool_feedback = Some(("操作已取消或路径已修改，旧配置保持不变。".into(), true));
+                        continue;
+                    }
+                    match result {
+                        Ok((path, report)) => {
+                            let mut settings = self.snapshot.settings.clone();
+                            let display = path.display().to_string();
+                            match tool {
+                                file_dialog::ToolKind::Mpv => { settings.mpv = Some(path); self.mpv_path = display; }
+                                file_dialog::ToolKind::PotPlayer => { settings.potplayer = Some(path); self.potplayer_path = display; }
+                                file_dialog::ToolKind::YtDlp => { settings.yt_dlp = Some(path); self.ytdlp_path = display; }
+                            }
+                            self.tool_feedback = Some((format!("{report}；正在保存真实程序路径…"), false));
+                            self.send_store(StoreAction::SaveSettings(settings));
+                        }
+                        Err(error) => self.tool_feedback = Some((format!("未保存：{error}。可重新选择、自动查找或获取兼容版本。"), true)),
+                    }
+                }
                 Event::Storage {
                     snapshot,
                     message,
                     quiet,
                 } => {
                     self.storage_pending = self.storage_pending.saturating_sub(1);
+                    match &message {
+                        Ok(text) if text.starts_with("播放器路径已保存") => {
+                            if let Some((text, false)) = &mut self.tool_feedback {
+                                *text = text.replace("正在保存真实程序路径…", &format!("已保存 {}", chrono::Local::now().format("%H:%M:%S")));
+                            }
+                        }
+                        Err(text) if text.starts_with("保存设置失败") => self.tool_feedback = Some((text.clone(), true)),
+                        _ => (),
+                    }
+
                     if self.overlay_draft == self.snapshot.settings.overlay
                         && self.blocked_keyword_text
                             == self
@@ -3907,6 +3972,22 @@ mod tests {
         let context = egui::Context::default();
         let app = Launcher::from_context(&context, store);
         (app, directory)
+    }
+
+    #[test]
+    fn tool_setup_discards_stale_cancelled_and_edited_results() {
+        use file_dialog::ToolKind;
+        let (mut app, _directory) = synthetic_context_launcher();
+        app.mpv_path = "synthetic-old-selection".into();
+        app.tool_setup_generation = 2;
+        for (id, original, cancelled) in [(1, "synthetic-old-selection", false), (2, "edited-draft", false), (2, "synthetic-old-selection", true)] {
+            app.tool_cancel.store(cancelled, Ordering::Release);
+            app.event_sender.send(Event::ToolSetup { id, tool: ToolKind::Mpv, original: original.into(),
+                result: Ok((PathBuf::from("synthetic-new-executable"), "synthetic capability report".into())) }).unwrap();
+            app.poll_events();
+            assert_eq!(app.mpv_path, "synthetic-old-selection");
+            assert_eq!(app.storage_pending, 0, "stale work must not queue a settings write");
+        }
     }
 
     #[test]

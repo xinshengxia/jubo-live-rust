@@ -488,7 +488,7 @@ pub enum LocalLoginState {
     Ready,
 }
 
-fn is_login_key(platform: Platform, name: &str) -> bool {
+pub(crate) fn is_login_key(platform: Platform, name: &str) -> bool {
     match platform {
         Platform::Bili => name == "SESSDATA",
         Platform::Huya => matches!(name, "udb_biztoken" | "udb_l" | "udb_uid"),
