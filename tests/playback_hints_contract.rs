@@ -384,6 +384,19 @@ fn room_observations_update_state_and_media_hints() {
 }
 
 #[test]
+fn titles_and_reload_work_under_unicode_and_comma_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("中文,路径");
+    let hints = prepare(&root, Platform::Douyin, "1", "主播", "标题", true, None);
+    let arguments = hints.script_opts(&root.join("标题.lua"), Some(&root.join("刷新.lua")));
+    assert!(arguments.iter().any(|s| s.to_string_lossy().ends_with("中文,路径/刷新.lua")));
+    hints.observe(&PlaybackEvent::RelayStatistics {
+        telemetry: RelayTelemetry { waiting_state: Some("verification".into()), ..telemetry("waiting", 0) },
+    });
+    assert_eq!(read(hints.paths().relay.as_ref().unwrap()), "VERIFICATION");
+}
+
+#[test]
 fn a_new_session_never_inherits_previous_hints() {
     let directory = tempfile::tempdir().unwrap();
     let first = prepare(
@@ -450,4 +463,7 @@ fn stale_hint_directories_are_pruned() {
     let fresh_directory = fresh.paths().directory.clone();
     playback::prune_stale_hint_directories(directory.path(), Duration::from_secs(3600));
     assert!(fresh_directory.exists());
+    std::thread::sleep(Duration::from_millis(20));
+    playback::prune_stale_hint_directories(directory.path(), Duration::ZERO);
+    assert!(fresh_directory.exists(), "a live session still holds its lease");
 }

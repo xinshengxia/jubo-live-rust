@@ -890,6 +890,7 @@ fn parse_gift(raw: &[u8], depth: usize, events: &mut Vec<DanmakuEvent>) -> Resul
     let mut msg_id = 0_u64;
     let mut repeat_count = 0_u64;
     let mut combo_count = 0_u64;
+    let mut group_id = 0_u64;
     let mut user = ChatUser::default();
     let mut gift_name = String::new();
     let mut fields = 0_usize;
@@ -904,6 +905,7 @@ fn parse_gift(raw: &[u8], depth: usize, events: &mut Vec<DanmakuEvent>) -> Resul
             (5, 0) => repeat_count = reader.read_varint()?,
             (6, 0) => combo_count = reader.read_varint()?,
             (7, 2) => user = parse_chat_user(reader.read_bytes()?, depth + 1)?,
+            (11, 0) => group_id = reader.read_varint()?,
             (15, 2) => gift_name = parse_gift_struct_name(reader.read_bytes()?, depth + 1)?,
             _ => reader.skip(wire)?,
         }
@@ -933,6 +935,11 @@ fn parse_gift(raw: &[u8], depth: usize, events: &mut Vec<DanmakuEvent>) -> Resul
             msg_id.to_string()
         },
         kind: LiveEventKind::Gift,
+        source: super::danmaku::LiveEventSource {
+            user_id: user.id,
+            combo_id: if group_id == 0 { String::new() } else { group_id.to_string() },
+            cumulative: count > 0,
+        },
         user: limit(&user.nickname),
         text: rich::sanitize_event_text(name, MAX_TEXT_CHARS),
         count: count.clamp(1, 999_999) as u32,
@@ -978,6 +985,7 @@ fn parse_member(raw: &[u8], depth: usize, events: &mut Vec<DanmakuEvent>) -> Res
             msg_id.to_string()
         },
         kind: LiveEventKind::Enter,
+        source: super::danmaku::LiveEventSource { user_id: user.id, ..Default::default() },
         user: limit(&user.nickname),
         text: "进入直播间".to_owned(),
         count: 1,
@@ -1021,6 +1029,7 @@ fn parse_like(raw: &[u8], depth: usize, events: &mut Vec<DanmakuEvent>) -> Resul
     events.push(DanmakuEvent::Live(LiveEvent {
         id: String::new(),
         kind: LiveEventKind::Status,
+        source: Default::default(),
         user: String::new(),
         text: rich::sanitize_event_text(&format!("点赞 {likes}"), MAX_TEXT_CHARS),
         count: 1,

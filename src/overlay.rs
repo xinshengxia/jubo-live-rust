@@ -2139,6 +2139,44 @@ fn emoticons_refresh_due(current_version: u64, cache_version: u64) -> bool {
     cache_version != current_version
 }
 
+struct ActiveLiveEvent {
+    event: LiveEvent,
+    created: f64,
+    expires: f64,
+    incremental_count: u32,
+    reported_total: u32,
+}
+
+impl ActiveLiveEvent {
+    fn new(event: LiveEvent, now: f64, lifetime: f64) -> Self {
+        let (incremental_count, reported_total) = if event.source.cumulative {
+            (0, event.count)
+        } else {
+            (event.count, 0)
+        };
+        Self { event, created: now, expires: now + lifetime, incremental_count, reported_total }
+    }
+
+    fn matches(&self, next: &LiveEvent) -> bool {
+        let current = &self.event;
+        current.kind == next.kind && current.source.user_id == next.source.user_id
+            && current.user == next.user && current.text == next.text
+            && current.source.combo_id == next.source.combo_id
+    }
+
+    fn merge(&mut self, next: &LiveEvent, now: f64, lifetime: f64) {
+        if next.kind == LiveEventKind::Gift {
+            if next.source.cumulative {
+                self.reported_total = self.reported_total.max(next.count);
+            } else {
+                self.incremental_count = self.incremental_count.saturating_add(next.count).min(999999);
+            }
+            self.event.count = self.incremental_count.max(self.reported_total);
+            self.expires = (now + lifetime).min(self.created + lifetime.max(10.0));
+        }
+    }
+}
+
 struct Overlay {
     receiver: crate::danmaku::EventReceiver,
     cancellation: Cancellation,
@@ -2158,7 +2196,7 @@ struct Overlay {
     /// Cache generation of `emoticons`; the receiver thread bumps it whenever it
     /// publishes a new room/platform dictionary, and a change re-reads the cache.
     emoticons_version: u64,
-    live_events: std::collections::VecDeque<(f64, LiveEvent)>,
+    live_events: std::collections::VecDeque<ActiveLiveEvent>,
     native_hotkeys: Receiver<OverlayHotkey>,
     status: String,
     status_at: Instant,
@@ -2668,13 +2706,7 @@ impl Overlay {
             }
         }
         self.super_chats.prune(now);
-        while self
-            .live_events
-            .front()
-            .is_some_and(|(until, _)| *until <= now)
-        {
-            self.live_events.pop_front();
-        }
+        self.live_events.retain(|row| row.expires > now);
         self.live_status.retain(|_, (_, until)| *until > now);
     }
 
@@ -2685,10 +2717,7 @@ impl Overlay {
     fn admit_live_event(&mut self, event: LiveEvent, now: f64) {
         self.stats_live_events = self.stats_live_events.saturating_add(1);
         if !live_event_visible(&event, &self.options.behavior)
-            || !self.pipeline.allows(&event.user, &event.text)
-            || self
-                .rules
-                .is_blocked(&rule_probe_message(&event.user, &event.text, 0))
+            || !self.pipeline.allows_event(event.source.user_id, &event.user, &event.text)
         {
             return;
         }
@@ -2727,27 +2756,10 @@ impl Overlay {
         }
         let priority = matches!(event.kind, LiveEventKind::Guard | LiveEventKind::Notice);
         // Merge repeated gift/combo events into the visible row.
-        let key = (
-            event.kind,
-            truncate_chars(&event.user, 32),
-            truncate_chars(&event.text, 64),
-        );
-        for (until, existing) in self.live_events.iter_mut() {
-            if (
-                existing.kind,
-                truncate_chars(&existing.user, 32),
-                truncate_chars(&existing.text, 64),
-            ) == key
-                && *until > now
-            {
-                existing.count = existing.count.max(event.count);
-                if event.count > 1 {
-                    existing.count = existing.count.max(event.count);
-                }
-                let extended = (now + lifetime).min(*until + lifetime);
-                *until = extended;
-                return;
-            }
+        self.live_events.retain(|row| row.expires > now);
+        if let Some(row) = self.live_events.iter_mut().find(|row| row.matches(&event)) {
+            row.merge(&event, now, lifetime);
+            return;
         }
         // Per-second rate limit: the legacy renderer drops excess events.
         if now - self.event_window.0 >= 1.0 {
@@ -2766,7 +2778,7 @@ impl Overlay {
             }
             self.live_events.pop_front();
         }
-        self.live_events.push_back((now + lifetime, event));
+        self.live_events.push_back(ActiveLiveEvent::new(event, now, lifetime));
     }
 
     /// Update lane geometry when the window size, DPI or font size changes.
@@ -4014,7 +4026,8 @@ impl Overlay {
         let row_gap = 2.0 * ui;
         let font = FontId::proportional((13.0 * ui).max(8.0));
         let mut y = band.top();
-        for (_, event) in self.live_events.iter() {
+        for row_data in &self.live_events {
+            let event = &row_data.event;
             let row = Rect::from_min_size(
                 Pos2::new(band.left(), y),
                 Vec2::new(band.width(), row_height),
@@ -7048,6 +7061,7 @@ VS=2764-2764
     #[test]
     fn live_event_labels_match_the_legacy_wording_and_settings_gate_them() {
         let event = |kind, user: &str, text: &str, count| LiveEvent {
+            source: Default::default(),
             id: String::new(),
             kind,
             user: user.into(),
@@ -7125,5 +7139,42 @@ VS=2764-2764
                 "{kind:?}"
             );
         }
+    }
+
+    #[test]
+    fn gift_rows_respect_uid_merge_delta_and_total_and_free_expired_slots() {
+        let mut options = OverlaySettings::default();
+        options.behavior.show_gifts = true;
+        options.behavior.blocked_users = vec!["uid:42".into()];
+        options.behavior.event_duration_secs = 4;
+        options.behavior.event_max_visible = 2;
+        let (_, events) = danmaku::bounded_channel(16);
+        let (_, keys) = std::sync::mpsc::channel();
+        let mut overlay = Overlay::new(
+            &eframe::CreationContext::_new_kittest(egui::Context::default()),
+            events, Cancellation::new(), Default::default(), options.clone(),
+            true, keys, shared_options(options), None,
+        );
+        let gift = |command, uid, tx, count| {
+            let json = serde_json::json!({"cmd":command, "data":{
+                "uid":uid, "uname":"guest", "tid":tx, "giftName":"flower", "num":count
+            }});
+            let packet = danmaku::bili_packet(5, 0, json.to_string().as_bytes()).unwrap();
+            let decoded = danmaku::decode_bili(&packet).unwrap();
+            let [DanmakuEvent::Live(event)] = decoded.as_slice() else { panic!("expected gift") };
+            event.clone()
+        };
+        overlay.admit_live_event(gift("SEND_GIFT",42,100,1), 0.0);
+        assert!(overlay.live_events.is_empty());
+        overlay.admit_live_event(gift("SEND_GIFT",1,101,1), 0.0);
+        overlay.admit_live_event(gift("SEND_GIFT",2,102,1), 1.0);
+        overlay.admit_live_event(gift("SEND_GIFT",1,103,1), 3.0);
+        overlay.admit_live_event(gift("SEND_GIFT",1,103,1), 3.1);
+        assert_eq!(overlay.live_events[0].event.count, 2);
+        overlay.admit_live_event(gift("COMBO_SEND",1,0,3), 3.2);
+        assert_eq!(overlay.live_events[0].event.count, 3);
+        overlay.admit_live_event(gift("SEND_GIFT",3,104,1), 6.0);
+        let senders: Vec<_> = overlay.live_events.iter().map(|row| row.event.source.user_id).collect();
+        assert_eq!(senders, vec![1, 3]);
     }
 }

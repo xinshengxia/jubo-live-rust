@@ -361,6 +361,7 @@ pub fn playback_state(phase: SessionPhase) -> ObservationState {
         | SessionPhase::RegisteringPlayer => ObservationState::Waiting,
         SessionPhase::Playing => ObservationState::Playing,
         SessionPhase::WaitingBroadcast => ObservationState::Retrying,
+        SessionPhase::WaitingVerification => ObservationState::AuthRequired,
         SessionPhase::Interrupted => ObservationState::NetworkError,
         SessionPhase::Stopping | SessionPhase::Ended | SessionPhase::Stopped => {
             ObservationState::Stopped

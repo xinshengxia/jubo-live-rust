@@ -80,6 +80,7 @@ impl Launcher {
                         let label = match waiting.as_str() {
                             "offline" => "等待主播重新开播",
                             "replay_unavailable" => "重播暂不可取流",
+                            "verification" => "请到账号页完成抖音网页验证",
                             other => other,
                         };
                         ui.label(format!("中继等待：{label}"));

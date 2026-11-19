@@ -1048,13 +1048,6 @@ impl Launcher {
         if avatar_updates > 0 {
             context.request_repaint();
         }
-        // The 深色模式 checkbox on the danmaku page only flips a runtime flag;
-        // persist it so the choice survives a restart (original DarkMode).
-        if self.dark != self.snapshot.settings.dark_mode && self.storage_pending == 0 {
-            let mut settings = self.snapshot.settings.clone();
-            settings.dark_mode = self.dark;
-            self.send_store(StoreAction::SaveSettings(settings));
-        }
     }
 
     fn apply_visuals(&self, context: &egui::Context, _pal: &Pal) {

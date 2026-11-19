@@ -124,10 +124,11 @@ impl Launcher {
                 "取消",
                 Btn::Secondary,
                 pal,
-                self.searching || self.verification_pending || self.ai_busy,
+                self.searching || self.verification_pending || self.ai_busy || self.web_assist_pending,
             )
             .clicked()
             {
+                if self.web_assist_pending { self.cancel_login(); }
                 self.cancel_search();
                 self.set_status("已取消当前查询；进行中的请求结果会被忽略。", false);
             }
@@ -139,7 +140,8 @@ impl Launcher {
             let actions: [(&str, f32, bool); 5] = [
                 ("刷新结果", 80.0, !self.searching),
                 ("补充线索", 80.0, true),
-                ("抖音网页辅助", 96.0, !self.web_assist_pending),
+                ("抖音网页辅助", 96.0, !self.login_busy && !self.search_input.trim().is_empty()
+                    && (self.search_all || self.platform == Platform::Douyin)),
                 ("平台网页搜索", 96.0, !self.search_input.trim().is_empty()),
                 ("DeepSeek 设置", 111.0, true),
             ];

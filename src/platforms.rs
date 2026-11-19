@@ -320,14 +320,11 @@ pub fn candidate_live_status(platform: Platform, row: &Value) -> Option<String> 
             },
         },
         Platform::Douyu => {
-            if number(&["videoLoop"]) == Some(1) {
-                "replay"
-            } else {
-                match number(&["show_status", "isLive", "roomStatus"]) {
-                    Some(1) => "live",
-                    Some(0) => "offline",
-                    _ => return None,
-                }
+            match number(&["show_status", "isLive", "roomStatus"]) {
+                Some(1) => "live",
+                Some(0 | 2) if number(&["videoLoop"]) == Some(1) => "replay",
+                Some(0 | 2) => "offline",
+                _ => return None,
             }
         }
         Platform::Douyin => match number(&["live_status", "status"]) {
@@ -484,7 +481,22 @@ pub fn is_replay_error(message: &str) -> bool {
 /// Huya room page replay marker. Only the unambiguous replay marker is used: the
 /// page's liveStatus-on also appears on replay pages (C# 2026-10-16 observation).
 pub fn huya_page_replay(page: &str) -> bool {
-    page.contains("liveStatus-replay")
+    huya_page_state(page) == crate::room_state::RoomState::Replay
+}
+
+pub(crate) fn huya_page_state(page: &str) -> crate::room_state::RoomState {
+    use crate::room_state::RoomState;
+    static CLASS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?is)<[a-z][a-z0-9:-]*\b[^<>]*?\sclass\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap()
+    });
+    for found in CLASS.captures_iter(page) {
+        for class in found.get(1).or_else(|| found.get(2)).unwrap().as_str().split_ascii_whitespace() {
+            if class.eq_ignore_ascii_case("liveStatus-replay") { return RoomState::Replay; }
+            if class.eq_ignore_ascii_case("liveStatus-off") { return RoomState::Offline; }
+            if class.eq_ignore_ascii_case("liveStatus-on") { return RoomState::Unknown; }
+        }
+    }
+    RoomState::Unknown
 }
 
 /// Douyu room flags from the official betard JSON: show_status and the loop flag.
@@ -499,7 +511,7 @@ pub fn douyu_room_flags(root: &Value) -> (Option<i64>, i64) {
 /// A recorded/looping Douyu room is a replay only when the room is not reported
 /// live; show_status=1 is never silently reclassified.
 pub fn douyu_replay_from_flags(show_status: Option<i64>, video_loop: i64) -> bool {
-    show_status != Some(1) && video_loop == 1
+    matches!(show_status, Some(0 | 2)) && video_loop == 1
 }
 
 impl std::fmt::Display for AdapterError {
@@ -2475,11 +2487,18 @@ fn resolver_cookie_file(cookie: Option<&str>) -> Result<Option<crate::auth::Temp
 
 fn ytdlp_command(binary: &std::path::Path, target: &Target, cookie_path: Option<&std::path::Path>) -> Command {
     let room_url = format!("https://live.bilibili.com/{}", target.room);
-    let format = match target.quality {
-        Quality::Best => "best[ext=flv][vcodec^=avc]/best[ext=flv]/best",
-        Quality::High => "best[format_id^=400][ext=flv]/best[ext=flv]/best",
-        Quality::Low => "worst[ext=flv]/worst",
+    let tiers = match target.quality {
+        Quality::Best => ["source", "blue_ray", "ultra_high_res"],
+        Quality::High => ["blue_ray", "source", "ultra_high_res"],
+        Quality::Low => ["ultra_high_res", "blue_ray", "source"],
     };
+    let mut selectors = Vec::new();
+    for tier in tiers {
+        for suffix in ["[ext=flv][vcodec^=avc]", "[ext=flv]", ""] {
+            selectors.push(format!("best[format_id^={tier}]{suffix}"));
+        }
+    }
+    let format = format!("{}/best[ext=flv][vcodec^=avc]/best[ext=flv]/best", selectors.join("/"));
     let mut command = Command::new(binary);
     command
         .args([
@@ -2491,7 +2510,7 @@ fn ytdlp_command(binary: &std::path::Path, target: &Target, cookie_path: Option<
             "--socket-timeout",
             "10",
             "-f",
-            format,
+            &format,
             "--get-url",
         ])
         .stdin(Stdio::null())
@@ -4089,10 +4108,15 @@ pub fn verify_candidate(
             if candidate.platform == Platform::Bili {
                 return verify_bili_account(candidate);
             }
-            return Err(anyhow!(
-                "该候选只有账号线索（{}），房间待解析；请粘贴官方直播间链接或房间号后重试",
-                candidate.name
-            ));
+            let owner = candidate.account_id.as_deref().and_then(valid_room)
+                .context("候选缺少稳定账号标识，请提供官方房间链接")?;
+            let rows = search(candidate.platform, &candidate.name)?;
+            let matched = rows.iter().find(|row| row.account_id.as_deref() == Some(&owner)
+                && valid_room(&row.room).is_some())
+                .context("平台搜索尚未返回该账号关联的数字房间，可稍后重试")?;
+            let mut resolved = candidate.clone();
+            resolved.room = matched.room.clone();
+            return verify_native_room(&resolved);
         }
         return verify_native_room(candidate);
     }
@@ -4278,7 +4302,7 @@ fn bili_room_identity(candidate: &LookupCandidate, root: &Value) -> Result<(Stri
 
 fn verify_native_room(candidate: &LookupCandidate) -> Result<LookupCandidate> {
     let target = Target::new(candidate.platform, candidate.room.clone())?;
-    let (root, name) = match target.platform {
+    let (row, name, room, owner) = match target.platform {
         Platform::Bili => {
             let root = json_get(
                 endpoint(
@@ -4287,7 +4311,7 @@ fn verify_native_room(candidate: &LookupCandidate) -> Result<LookupCandidate> {
                 )?,
                 "https://live.bilibili.com/",
             )?;
-            bili_room_identity(candidate, &root)?;
+            let (room, owner) = bili_room_identity(candidate, &root)?;
             let anchor = json_get(
                 endpoint(
                     "https://api.live.bilibili.com/live_user/v1/UserInfo/get_anchor_in_room",
@@ -4296,36 +4320,44 @@ fn verify_native_room(candidate: &LookupCandidate) -> Result<LookupCandidate> {
                 "https://live.bilibili.com/",
             )?;
             let name = str_field(&anchor["data"]["info"], "uname");
-            (root, name)
+            (root["data"].clone(), name, room, owner)
         }
         Platform::Huya => {
-            let root = json_get(
-                endpoint(
-                    "https://mp.huya.com/cache.php",
-                    &[
-                        ("m", "Live".into()),
-                        ("do", "profileRoom".into()),
-                        ("roomid", target.room.clone()),
-                    ],
-                )?,
-                "https://www.huya.com/",
-            )?;
-            ensure!(int_field(&root, "status") == Some(200), "虎牙未确认此房间");
-            let name = root
-                .pointer("/data/profileInfo/nick")
-                .and_then(Value::as_str)
-                .or_else(|| root.pointer("/data/nick").and_then(Value::as_str))
-                .unwrap_or("")
-                .to_owned();
-            (root, name)
+            let page = get(Url::parse(&format!("https://www.huya.com/{}", target.room))?,
+                "https://www.huya.com/", None)?;
+            let (mut profile, details) = huya_identity_objects(&page)?;
+            let value = |first, second| valid_room(&str_field(&profile, first))
+                .or_else(|| valid_room(&str_field(&details, second)));
+            let room = value("profileRoom", "profileRoom").context("虎牙未返回数字房号")?;
+            let owner = value("lp", "id").context("虎牙未返回房主账号")?;
+            if valid_room(&target.room).is_some() {
+                ensure!(target.room == room, "虎牙返回了不同房间");
+            }
+            let name = str_field(&profile, "nick");
+            let mobile = endpoint("https://mp.huya.com/cache.php", &[
+                ("m", "Live".into()), ("do", "profileRoom".into()), ("roomid", room.clone())
+            ])?;
+            if let Ok(reply) = json_get(mobile, "https://www.huya.com/")
+                && int_field(&reply, "status") == Some(200)
+                && let (Some(metadata), Some(extra)) = (profile.as_object_mut(), reply["data"].as_object()) {
+                for (key, value) in extra {
+                    metadata.entry(key).or_insert_with(|| value.clone());
+                }
+            }
+            (profile, name, room, owner)
         }
         Platform::Douyu => {
             let root = json_get(
                 Url::parse(&format!("https://www.douyu.com/betard/{}", target.room))?,
                 "https://www.douyu.com/",
             )?;
-            let name = str_field(&root["room"], "nickname");
-            (root, name)
+            let row = &root["room"];
+            let room = valid_room(&str_field(row, "room_id")).context("斗鱼未返回有效房号")?;
+            ensure!(target.room == room, "斗鱼返回了不同房间");
+            let owner = valid_room(&str_field(row, "owner_uid")).context("斗鱼未返回房主账号")?;
+            let name = row["nickname"].as_str().or_else(|| row["owner_name"].as_str())
+                .unwrap_or_default().to_owned();
+            (row.clone(), name, room, owner)
         }
         Platform::Douyin => unreachable!(),
     };
@@ -4333,25 +4365,23 @@ fn verify_native_room(candidate: &LookupCandidate) -> Result<LookupCandidate> {
         !name.trim().is_empty(),
         "平台没有返回可核验的主播名称，候选未采用"
     );
+    ensure!(candidate.account_id.as_ref().is_none_or(|uid| uid == &owner),
+        "房间所属账号与所选候选不同，未关联直播间");
     ensure!(
-        candidate.provider == "input" || clean_label(&name).trim().to_lowercase()
+        candidate.account_id.is_some() || candidate.provider == "input" || clean_label(&name).trim().to_lowercase()
             == clean_label(&candidate.name).trim().to_lowercase(),
         "平台实际主播名称与候选不同，未自动关联同名或错误账号"
     );
     let mut result = candidate.clone();
     result.name = clean_label(&name);
+    result.room = room;
     if target.platform == Platform::Bili {
-        let (canonical, owner) = bili_room_identity(candidate, &root)?;
-        result.room = canonical;
         result.profile_url = Some(format!("https://space.bilibili.com/{owner}"));
-        result.account_id = Some(owner);
+    } else if result.profile_url.is_none() {
+        result.profile_url = platform_room_page(target.platform, &result.room);
     }
-    let row = match target.platform {
-        Platform::Bili => &root["data"],
-        Platform::Huya => &root["data"],
-        Platform::Douyu => &root["room"],
-        _ => &root,
-    };
+    result.account_id = Some(owner);
+    let row = &row;
     result.follower_count = candidate_followers(target.platform, row).or(result.follower_count);
     result.avatar_url = candidate_avatar(row).or(result.avatar_url);
     if let Some(category) = candidate_category(row) {
@@ -4375,6 +4405,17 @@ fn verify_native_room(candidate: &LookupCandidate) -> Result<LookupCandidate> {
         candidate_live_status(target.platform, row),
         source,
     ))
+}
+
+fn huya_identity_objects(page: &str) -> Result<(Value, Value)> {
+    let assigned = |marker: &str| -> Option<Value> {
+        page.match_indices(marker).find_map(|(index, _)| {
+            let body = page[index + marker.len()..].trim_start().strip_prefix('=')?.trim_start();
+            serde_json::from_str(extract_object(body, 0)?).ok()
+        })
+    };
+    let profile = assigned("TT_PROFILE_INFO").context("虎牙页面未返回可核验的主播资料")?;
+    Ok((profile, assigned("TT_ROOM_DATA").unwrap_or(Value::Null)))
 }
 
 fn verify_douyin_direct_room(candidate: &LookupCandidate, page: &str) -> Result<LookupCandidate> {
@@ -4993,6 +5034,17 @@ mod session_tests {
     }
 
     #[test]
+    fn bili_ytdlp_uses_extractor_quality_names_for_every_tier() {
+        let mut target = Target::new(Platform::Bili, "12345").unwrap();
+        for (quality, prefix) in [(Quality::Best, "source"), (Quality::High, "blue_ray"), (Quality::Low, "ultra_high_res")] {
+            target.quality = quality;
+            let command = ytdlp_command(std::path::Path::new("synthetic-yt-dlp.exe"), &target, None);
+            let selector = command.get_args().skip_while(|arg| *arg != "-f").nth(1).unwrap().to_str().unwrap();
+            assert!(selector.starts_with(&format!("best[format_id^={prefix}][ext=flv][vcodec^=avc]/")));
+        }
+    }
+
+    #[test]
     fn douyin_web_rid_parser_accepts_plain_and_flight_escaped_payloads() {
         assert_eq!(
             extract_douyin_web_rid("{\"web_rid\":\"989125753255\"}").as_deref(),
@@ -5392,6 +5444,9 @@ mod session_tests {
             )
         }
         assert!(douyin_page_missing_room(&page(serde_json::json!({}))));
+        let mixed = page(serde_json::json!({"room":null}))
+            + &page(serde_json::json!({"room":{"status":2,"title":"synthetic"}}));
+        assert_eq!(crate::room_state::parse_douyin_page(&mixed).state, crate::room_state::RoomState::Live);
         assert!(!douyin_page_missing_room(&page(
             serde_json::json!({"room":{"status":2,"title":"synthetic"}})
         )));

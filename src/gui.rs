@@ -34,7 +34,7 @@ use std::time::Duration;
 
 const ACCENT: Color32 = Color32::from_rgb(244, 137, 67);
 const SIDEBAR: Color32 = Color32::from_rgb(20, 23, 31);
-const MAX_IMPORT_BYTES: u64 = 2 * 1024 * 1024;
+use crate::core::MAX_IMPORT_BYTES;
 /// Hard cap for explicitly chosen credential text files, checked before parsing.
 const MAX_CREDENTIAL_BYTES: u64 = 2 * 1024 * 1024;
 mod accounts;
@@ -430,21 +430,22 @@ pub fn apply_verified_candidate(
         selected.platform == verified.platform,
         "核验结果平台与所选账号不一致"
     );
-    let profile = selected
-        .profile_url
-        .as_deref()
-        .context("所选候选没有可核验的账号主页")?;
+    let same_owner = selected.account_id.as_ref().is_some_and(|id| Some(id) == verified.account_id.as_ref());
+    let room_to_bili_owner = selected.platform == Platform::Bili
+        && !selected.room.is_empty()
+        && selected.profile_url.as_deref() == Some(&crate::search::room_input_url(Platform::Bili, &selected.room))
+        && verified.account_id.as_deref().is_some_and(|id| verified.profile_url.as_deref()
+            == Some(&format!("https://space.bilibili.com/{id}")));
     ensure!(
-        verified.profile_url.as_deref() == Some(profile),
+        selected.account_id.as_ref().is_none_or(|_| same_owner)
+            && (selected.profile_url.is_some() && selected.profile_url == verified.profile_url
+                || selected.profile_url.is_none() && same_owner || room_to_bili_owner),
         "核验结果与所选账号主页不一致"
     );
     Target::new(verified.platform, verified.room.clone()).context("核验尚未得到有效网页房间号")?;
     let index = candidates
         .iter()
-        .position(|candidate| {
-            candidate.platform == selected.platform
-                && candidate.profile_url.as_deref() == Some(profile)
-        })
+        .position(|candidate| candidate == selected)
         .context("搜索结果已变化，请重新选择账号")?;
     candidates[index] = verified;
     Ok(())
@@ -785,6 +786,11 @@ enum StoreAction {
     RemoveFavorite(Platform, String),
     RecordPlay(String, Target),
     SaveSettings(Settings),
+    SaveFont(Option<String>, Option<u8>),
+    SaveAutoStart(bool),
+    SaveDarkMode(bool),
+    SaveScMode(ScMode),
+    SaveEnhancement(Enhancement),
     SaveOverlay(OverlaySettings),
     SavePlayback(PlaybackPreferences),
     SaveAi(crate::ai::AiConfig, String),
@@ -886,6 +892,8 @@ enum LoginUpdate {
     Qr(String),
     Progress(String),
     Health(login::LoginHealth),
+    Saved(login::LoginHealth),
+    BrowserRows { search_id: u64, search_text: String, rows: Vec<platforms::LookupCandidate> },
     Done { message: String, error: bool },
 }
 
@@ -894,12 +902,13 @@ struct Launcher {
     /// Selected card in the favourites grid.
     favorite_selected: Option<usize>,
     /// Selected row in the recent-play list.
-    recent_selected: Option<usize>,
+    recent_selected: Option<Target>,
     /// Selected candidate in the lookup result list.
     lookup_selected: Option<usize>,
     /// Launch-card danmaku override: 0 follows the saved setting, 1 forces on,
     /// 2 forces off for this playback only.
     launch_danmaku: u8,
+    launch_buffer: Option<BufferMode>,
     /// Selected category tab on the "弹幕与 SC 设置" page.
     danmaku_tab: usize,
     /// Which player the "播放器与画质" page is configuring.
@@ -962,6 +971,7 @@ struct Launcher {
     search_page_query: Option<(crate::search::SearchQuery, bool, Platform)>,
     /// Pending "delete this favourite?" confirmation (default is cancel).
     favorite_delete_confirm: Option<Favorite>,
+    favorite_editor: Option<Favorite>,
     /// Last removed favourite plus the time it was removed, so the page can
     /// offer a short undo instead of relying on the user re-adding it by hand.
     favorite_undo: Option<(Favorite, std::time::Instant)>,
@@ -1104,6 +1114,7 @@ impl Launcher {
             recent_selected: None,
             lookup_selected: None,
             launch_danmaku: 0,
+            launch_buffer: None,
             danmaku_tab: 0,
             player_edit: Player::Mpv,
             session_selected: None,
@@ -1229,6 +1240,7 @@ impl Launcher {
             search_has_more: false,
             search_page_query: None,
             favorite_delete_confirm: None,
+            favorite_editor: None,
             favorite_undo: None,
             search_results: Vec::new(),
             verification_pending: false,
@@ -1276,6 +1288,7 @@ impl Launcher {
     /// "查看诊断日志" or a verification result filling the launch card).
     pub(crate) fn show_page(&mut self, page: Page) {
         self.page = page;
+        self.favorite_editor = None;
         self.format_help_open = false;
         self.ai_settings_open = false;
         self.players_path_dialog = None;
@@ -1297,6 +1310,17 @@ impl Launcher {
 
     fn poll_events(&mut self) {
         let updates: Vec<_> = self.session_events.try_iter().collect();
+        // A resync creates its replacement inside SessionManager, without a GUI
+        // start callback. Capture the original settings before processing Playing.
+        let current = self.sessions.snapshots();
+        for session in &current {
+            if !self.session_launch.contains_key(&session.id)
+                && let Some(settings) = self.sessions.launch_settings(&session.id)
+            {
+                self.session_overlay.insert(session.id.clone(), settings.overlay.enabled && settings.auto_start);
+                self.session_launch.insert(session.id.clone(), SessionLaunch { player: session.player, settings });
+            }
+        }
         for snapshot in updates {
             self.record_observations_from_snapshot(&snapshot);
             if snapshot.phase == SessionPhase::Playing
@@ -1306,7 +1330,7 @@ impl Launcher {
                     .session_overlay
                     .get(&snapshot.id)
                     .copied()
-                    .unwrap_or(self.snapshot.settings.overlay.enabled);
+                    .unwrap_or(self.snapshot.settings.overlay.enabled && self.snapshot.settings.auto_start);
                 let overlay = if enabled {
                     snapshot
                         .player_pid
@@ -1352,7 +1376,6 @@ impl Launcher {
                 );
             }
         }
-        let current = self.sessions.snapshots();
         self.playing = current.iter().any(|session| session.phase.can_cancel());
         let ids: BTreeSet<_> = current.iter().map(|s| s.id.clone()).collect();
         self.handled_sessions.retain(|id| ids.contains(id));
@@ -1855,9 +1878,26 @@ impl Launcher {
                             }
                         },
                         LoginUpdate::Progress(message) => self.login_message = message,
-                        LoginUpdate::Health(health) => {
+                        LoginUpdate::BrowserRows { search_id, search_text, rows } => {
+                            self.web_assist_pending = false;
+                            if search_id != self.search_generation || self.search_input.trim() != search_text { continue; }
+                            let count = rows.len();
+                            if count > 0 {
+                                self.clear_lookup_selection();
+                                self.search_results.retain(|row| row.platform != Platform::Douyin);
+                                self.search_results.extend(rows);
+                                self.lookup_filter = None;
+                            }
+                            self.search_caption = format!("抖音网页搜索 · {count} 个候选");
+                        }
+                        LoginUpdate::Saved(health) => {
                             self.search_cache.clear();
-                            self.cancel_search();
+                            if self.searching { self.cancel_search(); }
+                            self.login_health.insert(platform, health.clone());
+                            self.health_attempts.insert(platform, health.checked_at);
+                            self.send_store(StoreAction::Refresh);
+                        }
+                        LoginUpdate::Health(health) => {
                             self.login_message =
                                 format!("{}：{}", platform.label(), health.label());
                             self.health_attempts.insert(platform, health.checked_at);
@@ -2020,7 +2060,7 @@ impl Launcher {
         context: &egui::Context,
     ) {
         self.request_room_badge(&target);
-        let overlay_enabled = settings.overlay.enabled;
+        let overlay_enabled = settings.overlay.enabled && settings.auto_start;
         let launch = SessionLaunch {
             player,
             settings: settings.clone(),
@@ -2051,12 +2091,14 @@ impl Launcher {
     fn add_current_favorite(&mut self) {
         match self.current_target() {
             Ok(target) => {
-                let name = if self.favorite_name.trim().is_empty() {
-                    target.to_string()
-                } else {
-                    self.favorite_name.trim().to_owned()
-                };
-                self.send_store(StoreAction::AddFavorite(name, target));
+                let name = self.snapshot.favorites.iter()
+                    .find(|entry| crate::core::same_room(&entry.target, &target))
+                    .map(|entry| entry.name.clone())
+                    .or_else(|| self.snapshot.history.iter()
+                        .find(|entry| crate::core::same_room(&entry.target, &target))
+                        .map(|entry| entry.name.clone()))
+                    .unwrap_or_else(|| target.to_string());
+                self.favorite_editor = Some(Favorite { name, target });
             }
             Err(error) => self.set_status(format!("不能收藏这个输入：{error:#}"), true),
         }
@@ -2467,11 +2509,16 @@ impl Launcher {
 
     fn start_verification(
         &mut self,
-        selected: platforms::LookupCandidate,
+        mut selected: platforms::LookupCandidate,
         context: &egui::Context,
     ) {
         if self.verification_pending {
             return;
+        }
+        if let Some(candidate) = self.search_results.iter_mut().find(|row| **row == selected) {
+            candidate.verified_at = 0;
+            candidate.verification_note.clear();
+            selected = candidate.clone();
         }
         self.verification_pending = true;
         self.set_status(format!("正在核验 {} 的账号与直播间…", selected.name), false);
@@ -2913,7 +2960,7 @@ fn read_import(path: &Path) -> Result<String> {
     ensure!(metadata.is_file(), "请选择普通 JSON 文件");
     ensure!(
         metadata.len() <= MAX_IMPORT_BYTES,
-        "导入文件超过 2 MiB 限额"
+        "导入文件超过 16 MiB 限额"
     );
     let mut bytes = Vec::new();
     file.take(MAX_IMPORT_BYTES + 1)
@@ -2921,7 +2968,7 @@ fn read_import(path: &Path) -> Result<String> {
         .context("读取导入文件失败")?;
     ensure!(
         bytes.len() as u64 <= MAX_IMPORT_BYTES,
-        "导入文件超过 2 MiB 限额"
+        "导入文件超过 16 MiB 限额"
     );
     let text = String::from_utf8(bytes).context("导入文件必须使用 UTF-8 编码")?;
     Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned())
@@ -3059,6 +3106,21 @@ fn spawn_store_worker(
                     .save_player_paths(settings)
                     .map(|_| "播放器路径已保存。下次播放使用新设置。".to_owned())
                     .map_err(|error| format!("保存设置失败：{error:#}")),
+                StoreAction::SaveFont(key, percent) => store.save_launcher_font(key, percent)
+                    .map(|_| "界面字体设置已保存，重启启动器后生效。".to_owned())
+                    .map_err(|error| format!("保存字体失败：{error:#}")),
+                StoreAction::SaveAutoStart(enabled) => store.save_auto_start(enabled)
+                    .map(|_| "自动带起弹幕设置已保存。".to_owned())
+                    .map_err(|error| format!("保存自动弹幕设置失败：{error:#}")),
+                StoreAction::SaveDarkMode(dark) => store.save_dark_mode(dark)
+                    .map(|_| "界面主题已保存。".to_owned())
+                    .map_err(|error| format!("保存界面主题失败：{error:#}")),
+                StoreAction::SaveScMode(mode) => store.save_sc_mode(mode)
+                    .map(|_| "SC 显示模式已保存。".to_owned())
+                    .map_err(|error| format!("保存 SC 显示模式失败：{error:#}")),
+                StoreAction::SaveEnhancement(value) => store.save_enhancement(value)
+                    .map(|_| "mpv 画质增强已保存。".to_owned())
+                    .map_err(|error| format!("保存画质增强失败：{error:#}")),
                 StoreAction::SavePlayback(settings) => store
                     .save_playback_preferences(settings)
                     .map(|()| "播放设置已保存，将用于新会话。".to_owned())
@@ -3074,9 +3136,10 @@ fn spawn_store_worker(
                     })
                     .map(|summary| {
                         format!(
-                            "导入完成：新增收藏 {}，更新收藏 {}，新增历史 {}，跳过历史 {}。",
+                            "导入完成：新增收藏 {}，更新收藏 {}，跳过收藏 {}，新增历史 {}，跳过历史 {}。",
                             summary.favorites_added,
                             summary.favorites_updated,
+                            summary.favorites_skipped,
                             summary.history_added,
                             summary.history_skipped
                         )
@@ -4325,6 +4388,28 @@ mod tests {
     }
 
     #[test]
+    fn browser_search_merges_only_the_matching_query_without_replacing_peer_platforms() {
+        let (mut app, _dir) = synthetic_context_launcher();
+        app.search_input = "合成主播".into();
+        app.search_generation = 7;
+        app.login_generation = 3;
+        app.web_assist_pending = true;
+        let mut peer = synthetic_search_candidate();
+        peer.platform = Platform::Bili;
+        app.search_results.push(peer.clone());
+        let result = synthetic_search_candidate();
+        for (id, text) in [(6, "合成主播"), (7, "旧搜索词"), (7, "合成主播")] {
+            app.event_sender.send(Event::Login { id: 3, platform: Platform::Douyin,
+                update: LoginUpdate::BrowserRows { search_id: id, search_text: text.into(), rows: vec![result.clone()] }
+            }).unwrap();
+            app.poll_events();
+            if id != 7 || text != "合成主播" { assert_eq!(app.search_results, [peer.clone()]); }
+        }
+        assert_eq!(app.search_results, [peer, result]);
+        assert!(!app.search_refresh_after_login);
+    }
+
+    #[test]
     fn clearing_douyin_assist_profiles_only_touches_its_own_directories() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path().join("synthetic-ui")).unwrap();
@@ -4399,6 +4484,38 @@ mod tests {
     }
 
     #[test]
+    fn launcher_settings_worker_persists_each_control_without_other_drafts() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("store");
+        let store = Store::open(root.clone()).unwrap();
+        let expected_buffer = store.settings().playback.buffer_mode;
+        let (actions, receiver) = mpsc::channel();
+        let (events, replies) = mpsc::channel();
+        spawn_store_worker(store, receiver, events, egui::Context::default());
+        for action in [
+            StoreAction::SaveFont(Some("harmony".into()), None),
+            StoreAction::SaveFont(None, Some(115)),
+            StoreAction::SaveAutoStart(false),
+            StoreAction::SaveDarkMode(false),
+            StoreAction::SaveScMode(ScMode::Badge),
+            StoreAction::SaveEnhancement(Enhancement::High),
+        ] {
+            actions.send(action).unwrap();
+            let Event::Storage { message, .. } = replies.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+            else { panic!("missing settings reply") };
+            assert!(message.is_ok(), "{message:?}");
+        }
+        let saved = Store::open(root).unwrap();
+        assert_eq!(saved.settings().ui_font_key, "harmony");
+        assert_eq!(saved.settings().ui_font_percent, 115);
+        assert!(!saved.settings().auto_start);
+        assert!(!saved.settings().dark_mode);
+        assert_eq!(saved.settings().overlay.sc_mode, ScMode::Badge);
+        assert_eq!(saved.settings().playback.enhancement, Enhancement::High);
+        assert_eq!(saved.settings().playback.buffer_mode, expected_buffer);
+    }
+
+    #[test]
     fn launch_overrides_only_touch_this_playback() {
         let (mut app, _directory) = synthetic_context_launcher();
         app.snapshot.settings.playback.buffer_mode = BufferMode::LowLatency;
@@ -4419,9 +4536,12 @@ mod tests {
         // "跟随设置" keeps the saved value, and the force-on override wins.
         app.launch_danmaku = 0;
         assert!(app.launch_settings().overlay.enabled);
+        app.snapshot.settings.auto_start = false;
+        assert!(!app.launch_settings().auto_start);
         app.snapshot.settings.overlay.enabled = false;
         app.launch_danmaku = 1;
         assert!(app.launch_settings().overlay.enabled);
+        assert!(app.launch_settings().auto_start);
     }
 
     /// Drive the production workbench dropdown inside headless egui frames: a

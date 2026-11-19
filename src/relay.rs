@@ -776,7 +776,7 @@ impl PlayerLifetime {
 
 /// An open Windows process handle identifies this process even if its numeric
 /// PID is later reused. No termination or foreground-window rights are granted.
-struct WatchedProcess {
+pub(crate) struct WatchedProcess {
     pid: u32,
     #[cfg(windows)]
     handle: usize,
@@ -791,7 +791,7 @@ unsafe extern "system" {
 }
 
 impl WatchedProcess {
-    fn open(pid: u32) -> Result<Self> {
+    pub(crate) fn open(pid: u32) -> Result<Self> {
         if pid == 0 {
             bail!("player PID must be positive");
         }
@@ -812,7 +812,7 @@ impl WatchedProcess {
         bail!("independent player supervision currently requires Windows")
     }
 
-    fn is_running(&self) -> bool {
+    pub(crate) fn is_running(&self) -> bool {
         #[cfg(windows)]
         {
             unsafe { WaitForSingleObject(self.handle as *mut std::ffi::c_void, 0) == 258 }

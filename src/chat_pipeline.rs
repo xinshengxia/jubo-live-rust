@@ -256,10 +256,14 @@ impl ChatPipeline {
         }
     }
     pub fn allows(&self, user: &str, text: &str) -> bool {
+        self.allows_event(0, user, text)
+    }
+
+    pub fn allows_event(&self, user_id: u64, user: &str, text: &str) -> bool {
         !self.rules.is_blocked(&DanmakuMessage {
             image_url: None, id: String::new(), user: user.into(), text: text.into(),
             mode: DanmakuMode::Scroll, color: 0xffffff, font_size: 25,
-            user_id: 0, user_level: 0, guard_level: 0, medal: None,
+            user_id, user_level: 0, guard_level: 0, medal: None,
             image_width: 0, image_height: 0, image_large: false,
         })
     }

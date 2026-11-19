@@ -40,6 +40,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Private mpv protocol. Input is supplied through the inherited pipe.
+    #[command(hide = true)]
+    MpvHelper {
+        #[arg(long)]
+        refresh_request: Option<String>,
+    },
     /// Open the native desktop launcher.
     Gui,
     /// Parse a room without network or persistent writes.
@@ -701,6 +707,7 @@ fn run() -> Result<()> {
 
 fn action_name(action: &Action) -> &'static str {
     match action {
+        Action::MpvHelper { .. } => "mpv-helper",
         Action::Gui => "gui",
         Action::Parse { .. } => "parse",
         Action::Resolve { .. } => "resolve",
@@ -724,6 +731,7 @@ fn action_writes_data(action: &Action) -> bool {
     !matches!(
         action,
         Action::Parse { .. }
+            | Action::MpvHelper { .. }
             | Action::Plan { .. }
             | Action::Capabilities
             | Action::SelfTest
@@ -733,6 +741,7 @@ fn action_writes_data(action: &Action) -> bool {
 
 fn dispatch(data_dir: Option<PathBuf>, action: Action) -> Result<()> {
     match action {
+        Action::MpvHelper { refresh_request } => playback::run_mpv_helper(refresh_request.as_deref())?,
         Action::Parse { target } => println!(
             "{}",
             serde_json::to_string_pretty(&Target::parse(&target)?)?
@@ -1078,10 +1087,10 @@ fn dispatch(data_dir: Option<PathBuf>, action: Action) -> Result<()> {
             use std::io::Read;
             let mut bytes = Vec::new();
             std::fs::File::open(&file)?
-                .take(2 * 1024 * 1024 + 1)
+                .take(live_hub_rust::core::MAX_IMPORT_BYTES + 1)
                 .read_to_end(&mut bytes)?;
-            if bytes.len() > 2 * 1024 * 1024 {
-                bail!("导入文件超过2MiB");
+            if bytes.len() as u64 > live_hub_rust::core::MAX_IMPORT_BYTES {
+                bail!("导入文件超过 16 MiB");
             }
             let json = std::str::from_utf8(&bytes)?.trim_start_matches('\u{feff}');
             let mut store = Store::open(data_root(data_dir.clone())?)?;

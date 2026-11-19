@@ -690,6 +690,8 @@ fn replay_classification_uses_platform_wording_and_never_claims_offline() {
     };
     assert!(huya_page_replay(r#"<div class="liveStatus-replay">"#));
     assert!(!huya_page_replay(r#"<div class="liveStatus-on">"#));
+    assert!(!huya_page_replay(r#"<style>.liveStatus-replay{color:gray}</style><div class="liveStatus-on">"#));
+    assert!(!huya_page_replay(r#"<div class="other-liveStatus-replay">"#));
     assert_eq!(
         douyu_room_flags(&serde_json::json!({"room":{"show_status":0,"videoLoop":1}})),
         (Some(0), 1)
@@ -699,6 +701,9 @@ fn replay_classification_uses_platform_wording_and_never_claims_offline() {
     // A room the platform reports live is never reclassified as a recording.
     assert!(!douyu_replay_from_flags(Some(1), 1));
     assert!(!douyu_replay_from_flags(Some(0), 0));
+    assert!(!douyu_replay_from_flags(Some(99), 1));
+    assert_eq!(live_hub_rust::platforms::candidate_live_status(Platform::Douyu,
+        &serde_json::json!({"show_status":1,"videoLoop":1})).as_deref(), Some("live"));
     for (platform, expected) in [
         (Platform::Bili, "轮播"),
         (Platform::Huya, "重播"),

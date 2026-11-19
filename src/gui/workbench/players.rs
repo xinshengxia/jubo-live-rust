@@ -592,6 +592,7 @@ impl Launcher {
                         {
                             self.playback_draft.buffer_mode =
                                 [BufferMode::LowLatency, BufferMode::Stable][value];
+                            self.launch_buffer = None;
                         }
                     }
                     2 => {

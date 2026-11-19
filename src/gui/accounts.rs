@@ -62,7 +62,9 @@ impl Launcher {
         }
         self.login_generation = self.login_generation.wrapping_add(1);
         let id = self.login_generation;
-        let platform = self.platform;
+        let platform = if kind == 4 { Platform::Douyin } else { self.platform };
+        let search_id = self.search_generation;
+        let search_text = self.search_input.trim().to_owned();
         let cancel = login::Cancellation::new();
         self.login_cancel = Some(cancel.clone());
         let capture = Arc::new(AtomicBool::new(false));
@@ -116,7 +118,7 @@ impl Launcher {
                                 send(LoginUpdate::Progress("正在连接专属窗口 → 读取抖音会话 → 向平台核验；有效后才加密保存…".into()));
                                 match window.capture_login(&vault, &cancel) {
                                     Ok(status) if status.is_valid() => {
-                                        send(LoginUpdate::Health(status));
+                                        send(LoginUpdate::Saved(status));
                                         saved = true;
                                         send(LoginUpdate::Progress(
                                             "抖音网页验证已通过，Cookie 已加密保存。".into(),
@@ -164,7 +166,7 @@ impl Launcher {
                                 send(LoginUpdate::Progress(status.reason))
                             }
                             login::QrStatus::LoggedIn(status) => {
-                                send(LoginUpdate::Health(status));
+                                send(LoginUpdate::Saved(status));
                                 return Ok("B站登录成功，凭据已加密保存。".into());
                             }
                             login::QrStatus::Expired => {
@@ -189,6 +191,22 @@ impl Launcher {
                     &root.join("browser-login"),
                     &cancel,
                 )?;
+                if kind == 4 {
+                    send(LoginUpdate::Progress("正在抖音专属窗口搜索，网页如有提示，请完成验证或登录。".into()));
+                    let keyword = match crate::search::classify_lookup_input(&search_text, Platform::Douyin, false) {
+                        Ok(Some(crate::search::LookupInput::DouyinHandle(handle))) => handle,
+                        _ => search_text.clone(),
+                    };
+                    let rows = session.search_douyin(&keyword, &cancel)?;
+                    ensure!(!cancel.is_cancelled(), "抖音网页查询已取消");
+                    let count = rows.len();
+                    send(LoginUpdate::BrowserRows { search_id, search_text, rows });
+                    if count > 0 && let Ok(status) = session.capture_and_verify(&vault, &cancel)
+                        && status.is_valid() {
+                        send(LoginUpdate::Saved(status));
+                    }
+                    return Ok(format!("抖音网页搜索返回 {count} 个账号候选。"));
+                }
                 send(LoginUpdate::Progress("已打开本程序的独立登录窗口（Edge 隐私模式/Chrome 全新临时资料，不会登录或同步你的 Microsoft/Google 账号）。完成登录后会自动检测并保存，也可点击“我已登录，检查并保存”重试。".into()));
                 let result = (|| -> Result<String> {
                     let mut next_check = Instant::now() + Duration::from_secs(3);
@@ -200,8 +218,8 @@ impl Launcher {
                                 Ok(status) => {
                                     let valid = status.is_valid();
                                     let reason = status.reason.clone();
-                                    send(LoginUpdate::Health(status));
                                     if valid {
+                                        send(LoginUpdate::Saved(status));
                                         return Ok("网页登录已验证，凭据已加密保存。".into());
                                     }
                                     send(LoginUpdate::Progress(format!(
@@ -259,12 +277,24 @@ impl Launcher {
             self.login_message = "已有登录或网页辅助窗口进行中，请先完成或取消。".into();
             return;
         }
-        self.platform = Platform::Douyin;
+        if self.search_input.trim().is_empty() || self.search_input.trim().chars().count() > 200
+            || (!self.search_all && self.platform != Platform::Douyin) {
+            self.set_status("请在全部平台或抖音输入 1–200 字搜索词。", true);
+            return;
+        }
+        self.cancel_search();
+        let query = crate::search::SearchQuery::new(&self.search_input, &self.search_game, &self.search_identity, &self.search_alias);
+        if self.search_page_query.as_ref().is_none_or(|(previous, all, scope)| {
+            previous != &query || *all != self.search_all || (!all && *scope != self.platform)
+        }) {
+            self.search_results.clear();
+            self.search_outcomes.clear();
+            self.search_next_pages.clear();
+            self.search_has_more = false;
+        }
         self.web_assist_pending = true;
-        self.login_message =
-            "正在打开抖音网页辅助窗口；请在窗口中完成登录或验证，然后点击“我已登录/验证，检查并保存”。"
-                .into();
-        self.start_login(context, 1);
+        self.search_caption = "正在等待抖音网页搜索结果；可在专属窗口完成平台提示的操作。".into();
+        self.start_login(context, 4);
     }
 
     /// Confirms saved logins with the platform's own endpoint, one platform at a

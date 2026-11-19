@@ -220,6 +220,7 @@ fn rich_message_and_super_chat_documents_stay_backward_compatible() {
     ] {
         let event = DanmakuEvent::Live(LiveEvent {
             id: "e".into(),
+            source: Default::default(),
             kind,
             user: "u".into(),
             text: "t".into(),

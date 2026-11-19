@@ -227,7 +227,10 @@ mp.add_periodic_timer(2, function()
     local relay = readText(relayFile, 512) or ""
     local want = ""
     local text = nil
-    if relay:match("^REPLAY%-UNAVAILABLE|") then
+    if relay == "VERIFICATION" then
+        want = "[等待网页验证]"
+        text = "请到启动器账号页完成抖音网页验证，中转会继续重试"
+    elseif relay:match("^REPLAY%-UNAVAILABLE|") then
         local reason = relay:match("^REPLAY%-UNAVAILABLE|(.+)$") or "未解析到可用直链"
         want = "[重播流不可用]"
         text = "重播流取不到（" .. reason .. "）"

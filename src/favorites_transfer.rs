@@ -53,6 +53,7 @@ pub fn export_favorites_json(favorites: &[Favorite]) -> Result<String> {
     }
     let mut text = serde_json::to_string_pretty(favorites).context("无法序列化收藏")?;
     text.push('\n');
+    ensure!(text.len() as u64 <= crate::core::MAX_IMPORT_BYTES, "收藏导出超过 16 MiB");
     Ok(text)
 }
 

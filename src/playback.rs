@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -40,11 +40,10 @@ const SUPERVISE_POLL: Duration = Duration::from_millis(100);
 const TITLE_SCRIPT_RELATIVE: &str = "assets/lua/live-title.lua";
 const RESYNC_SCRIPT_RELATIVE: &str = "assets/lua/live-resync.lua";
 /// Per-session hint files live in the temp root; bound the directory name so a
-/// stale entry is harmless. Lua reads them with Windows path rules, so a
-/// non-ASCII temp root disables the helpers instead of risking a broken title.
+/// stale entry is harmless. mpv receives UTF-8 paths as distinct options.
 const TITLE_HINT_DIR: &str = "live-hub-rust-title";
 const TITLE_HINT_MAX_CHARS: usize = 512;
-/// A hint directory older than this cannot belong to a live player process.
+/// Prune abandoned hint directories once they reach this age.
 const TITLE_HINT_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 /// The legacy launcher's Bilibili --watch child polled the room every 10 seconds.
 const BILI_ROOM_STATE_POLL: Duration = Duration::from_secs(10);
@@ -190,7 +189,7 @@ impl RelayTelemetry {
             .to_owned();
         let waiting_state = selected
             .and_then(|connection| connection.waiting_state.as_deref())
-            .filter(|state| matches!(*state, "offline" | "replay_unavailable"))
+            .filter(|state| matches!(*state, "offline" | "replay_unavailable" | "verification"))
             .map(str::to_owned);
         Self {
             active_streams: statistics.active_streams,
@@ -1202,6 +1201,23 @@ pub struct HintPaths {
     pub relay: Option<PathBuf>,
 }
 
+impl HintPaths {
+    fn for_session(root: &Path, session: uuid::Uuid, platform: Platform, room: &str, relay: bool) -> Self {
+        let session = session.simple().to_string();
+        let directory = root.join(&session);
+        let platform = platform_slug(platform);
+        let room = hint_file_component(room);
+        Self {
+            base: directory.join(format!("{platform}-{room}.anchor.txt")),
+            media: directory.join(format!("session-{session}.media-title.txt")),
+            bitrate: directory.join(format!("{platform}-{room}.bitrate.txt")),
+            state: directory.join(format!("session-{session}.state.txt")),
+            relay: relay.then(|| directory.join(format!("session-{session}.relay.txt"))),
+            directory,
+        }
+    }
+}
+
 /// Inputs for SessionHints::prepare.
 pub struct HintSpec<'a> {
     pub platform: Platform,
@@ -1235,6 +1251,7 @@ impl<'a> HintSpec<'a> {
 
 struct HintState {
     paths: HintPaths,
+    lease: Option<fs::File>,
     platform: Platform,
     media: Mutex<String>,
     state: Mutex<String>,
@@ -1245,6 +1262,7 @@ struct HintState {
 
 impl Drop for HintState {
     fn drop(&mut self) {
+        drop(self.lease.take());
         let _ = fs::remove_dir_all(&self.paths.directory);
     }
 }
@@ -1266,25 +1284,10 @@ impl SessionHints {
 
     /// Prepare hint files in an explicit root (contract tests and diagnostics).
     pub fn prepare_in(root: &Path, spec: HintSpec<'_>) -> Option<Self> {
-        // mpv's script-opts list cannot carry a non-ASCII directory reliably, so a
-        // non-ASCII temp root disables the helpers instead of producing a broken title.
-        root.as_os_str().to_str().filter(|text| text.is_ascii())?;
         prune_stale_hint_directories(root, TITLE_HINT_STALE_AFTER);
-        let session = uuid::Uuid::new_v4().simple().to_string();
-        let directory = root.join(&session);
-        fs::create_dir_all(&directory).ok()?;
-        let platform = platform_slug(spec.platform);
-        let room = hint_file_component(spec.room);
-        let paths = HintPaths {
-            base: directory.join(format!("{platform}-{room}.anchor.txt")),
-            media: directory.join(format!("session-{session}.media-title.txt")),
-            bitrate: directory.join(format!("{platform}-{room}.bitrate.txt")),
-            state: directory.join(format!("session-{session}.state.txt")),
-            relay: spec
-                .relay
-                .then(|| directory.join(format!("session-{session}.relay.txt"))),
-            directory,
-        };
+        let paths = HintPaths::for_session(root, uuid::Uuid::new_v4(), spec.platform, spec.room, spec.relay);
+        fs::create_dir_all(&paths.directory).ok()?;
+        let lease = hint_lease(&paths.directory).ok()?;
         let fallback = title_hint_texts(spec.platform, spec.base);
         let authoritative = spec
             .room_observation
@@ -1321,6 +1324,7 @@ impl SessionHints {
         }
         Some(Self(Arc::new(HintState {
             paths,
+            lease: Some(lease),
             platform: spec.platform,
             media: Mutex::new(media),
             state: Mutex::new(initial_state.unwrap_or_default()),
@@ -1584,9 +1588,21 @@ pub fn prune_stale_hint_directories(root: &Path, max_age: Duration) {
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age > max_age);
         if stale {
+            if let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(entry.path().join("active.lock"))
+                && fs2::FileExt::try_lock_exclusive(&file).is_err()
+            {
+                continue;
+            }
             let _ = fs::remove_dir_all(entry.path());
         }
     }
+}
+
+fn hint_lease(directory: &Path) -> Result<fs::File> {
+    let lease = fs::OpenOptions::new().read(true).write(true).create(true)
+        .truncate(false).open(directory.join("active.lock"))?;
+    fs2::FileExt::lock_shared(&lease)?;
+    Ok(lease)
 }
 
 /// Bilibili has no relay to report the room state, so the legacy launcher ran a
@@ -1596,6 +1612,136 @@ pub fn prune_stale_hint_directories(root: &Path, max_age: Duration) {
 struct RoomWatch {
     target: Target,
     vault: Option<CookieVault>,
+    yt_dlp: Option<PathBuf>,
+    monitor: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DirectRefresh {
+    target: Target,
+    yt_dlp: Option<PathBuf>,
+    vault: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HintFollower {
+    target: Target,
+    session: String,
+    owner_pid: u32,
+    player_pid: u32,
+    relay: Option<String>,
+    monitor: bool,
+    vault: Option<PathBuf>,
+}
+
+impl HintFollower {
+    fn follow(self) -> Result<()> {
+        self.target.validate()?;
+        let player = crate::relay::WatchedProcess::open(self.player_pid)?;
+        // The launcher writes all hints while it is alive. Wait on its exact
+        // process handle before taking over, including after a CLI play returns.
+        let owner = crate::relay::WatchedProcess::open(self.owner_pid)?;
+        let root = std::env::temp_dir().join(TITLE_HINT_DIR);
+        let paths = HintPaths::for_session(&root, uuid::Uuid::parse_str(&self.session)?, self.target.platform, &self.target.room, self.relay.is_some());
+        ensure!(paths.base.is_file(), "播放标题文件已清理");
+        let lease = hint_lease(&paths.directory)?;
+        // Acknowledge both handles while the launcher still holds the player.
+        // A late start can therefore never attach to a reused PID.
+        std::io::stdout().lock().write_all(b"READY\n")?;
+        std::io::stdout().flush()?;
+        while owner.is_running() && player.is_running() {
+            thread::sleep(ROOM_STATE_STOP_CHECK);
+        }
+        if !player.is_running() {
+            drop(lease);
+            let _ = fs::remove_dir_all(paths.directory);
+            return Ok(());
+        }
+        let media = fs::read_to_string(&paths.media).unwrap_or_default();
+        let state = fs::read_to_string(&paths.state).unwrap_or_default();
+        let bitrate = fs::read_to_string(&paths.bitrate).ok().and_then(|v| v.trim().parse().ok());
+        let hints = SessionHints(Arc::new(HintState {
+            paths,
+            lease: Some(lease),
+            platform: self.target.platform,
+            media: Mutex::new(media), state: Mutex::new(state), bitrate: Mutex::new(bitrate),
+            estimator: Mutex::new(BitrateEstimator::default()), last_sample: Mutex::new(None),
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        if self.monitor && self.target.platform == Platform::Bili {
+            let vault = self.vault.map(CookieVault::open).transpose()?;
+            let watch = RoomWatch { target: self.target, vault, yt_dlp: None, monitor: true };
+            spawn_room_state_watcher(hints.clone(), watch, stop.clone());
+        }
+        while player.is_running() {
+            if let Some(url) = &self.relay {
+                match crate::relay::query_statistics(url) {
+                    Ok(stats) => hints.observe_relay(&RelayTelemetry::from_statistics(&stats), Instant::now()),
+                    Err(_) => hints.write_relay("RECONNECTING"),
+                }
+            }
+            let next = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < next && player.is_running() {
+                thread::sleep(ROOM_STATE_STOP_CHECK);
+            }
+        }
+        stop.store(true, Ordering::Release);
+        // The background room monitor can be in a bounded HTTP request as this
+        // process exits. Remove the finished session even if it still holds a clone.
+        let _ = fs::remove_dir_all(&hints.paths().directory);
+        Ok(())
+    }
+
+    fn start(hints: &SessionHints, watch: &RoomWatch, player_pid: u32, relay: Option<String>) -> Result<()> {
+        let name = hints.paths().directory.file_name().and_then(|v| v.to_str()).context("invalid hint directory")?;
+        let request = Self {
+            target: watch.target.clone(), session: name.to_owned(),
+            owner_pid: std::process::id(), player_pid, relay, monitor: watch.monitor,
+            vault: watch.vault.as_ref().map(|v| v.root().to_owned()),
+        };
+        let bytes = serde_json::to_vec(&request)?;
+        let mut child = command(&std::env::current_exe()?).arg("mpv-helper")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+        let registration = (|| -> Result<()> {
+            child.stdin.take().context("missing helper input")?.write_all(&bytes)?;
+            let mut ready = child.stdout.take().context("missing helper output")?;
+            let (tx, rx) = mpsc::channel();
+            thread::Builder::new().name("mpv-hint-registration".into()).spawn(move || {
+                let mut line = [0u8; 6];
+                let _ = tx.send(ready.read_exact(&mut line).is_ok() && line == *b"READY\n");
+            })?;
+            ensure!(rx.recv_timeout(Duration::from_secs(4)) == Ok(true), "mpv 标题辅助进程未就绪");
+            Ok(())
+        })();
+        if let Err(error) = registration {
+            terminate(&mut child);
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+/// The Lua refresh command receives the resolved URL over stdout. Credentials
+/// stay in the selected vault and the short-lived CDN URL is never persisted.
+pub fn run_mpv_helper(refresh_request: Option<&str>) -> Result<()> {
+    let Some(input) = refresh_request else {
+        let mut bytes = Vec::new();
+        std::io::stdin().take(65537).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 65536, "mpv helper input is too large");
+        return serde_json::from_slice::<HintFollower>(&bytes)?.follow();
+    };
+    ensure!(input.len() <= 65536, "mpv refresh request is too large");
+    let request: DirectRefresh = serde_json::from_str(input)?;
+    request.target.validate()?;
+    ensure!(request.target.platform == Platform::Bili, "仅支持刷新 B 站直链");
+    let settings = Settings { yt_dlp: request.yt_dlp, ..Default::default() };
+    let resolved = if let Some(root) = request.vault {
+        platforms::resolve_authenticated(&request.target, &settings, &CookieVault::open(root)?)?
+    } else {
+        platforms::resolve(&request.target, &settings)?
+    };
+    println!("{}", serde_json::to_string(&resolved.url)?);
+    Ok(())
 }
 
 fn spawn_room_state_watcher(hints: SessionHints, watch: RoomWatch, stop: Arc<AtomicBool>) {
@@ -1652,7 +1798,7 @@ fn title_scripts() -> Option<TitleScripts> {
 /// Windows; reject anything that cannot be represented unambiguously.
 fn mpv_option_path(path: &Path) -> Option<String> {
     let text = path.to_str()?;
-    if text.contains([',', '\n', '\r']) {
+    if text.contains(['\n', '\r']) {
         return None;
     }
     Some(text.replace('\\', "/"))
@@ -1685,6 +1831,7 @@ fn write_hint(path: &Path, text: &str) {
 fn relay_hint(telemetry: &RelayTelemetry) -> Option<&'static str> {
     match telemetry.waiting_state.as_deref() {
         Some("offline") => return Some("OFFLINE"),
+        Some("verification") => return Some("VERIFICATION"),
         Some("replay_unavailable") => return Some("REPLAY-UNAVAILABLE|重播流不可用"),
         _ => {}
     }
@@ -1878,6 +2025,22 @@ where
             })
             .map(|hints| {
                 hints.apply_to(&mut plan, &scripts.title, scripts.resync.as_deref());
+                if target.platform == Platform::Bili && !relayed
+                    && let Some(watch) = &room_watch
+                    && let Ok(binary) = std::env::current_exe()
+                {
+                    let refresh = DirectRefresh {
+                        target: target.clone(), yt_dlp: watch.yt_dlp.clone(),
+                        vault: watch.vault.as_ref().map(|v| v.root().to_owned()),
+                    };
+                    if let (Some(binary), Ok(input)) = (binary.to_str(), serde_json::to_string(&refresh)) {
+                        let before_media = plan.arguments.iter().position(|arg| arg == "--").unwrap_or(plan.arguments.len());
+                        plan.arguments.splice(before_media..before_media, [
+                            format!("--script-opts-append=live_resync_binary={binary}").into(),
+                            format!("--script-opts-append=live_resync_request={input}").into()
+                        ]);
+                    }
+                }
                 hints
             })
         }
@@ -1917,6 +2080,12 @@ where
     }
     let title = resolved.title.clone();
     let telemetry_url = relay.is_some().then(|| playable.url.clone());
+    if let (Some(hints), Some(watch)) = (&title_hints, &room_watch)
+        && (telemetry_url.is_some() || (watch.monitor && target.platform == Platform::Bili))
+        && let Err(error) = HintFollower::start(hints, watch, player_pid, telemetry_url.clone())
+    {
+        crate::diag::log("playback", crate::diag::Level::Warn, &format!("mpv hint follower failed to start: {error}"));
+    }
     // The children move into a supervisor thread. The shared slot keeps them
     // recoverable if that thread cannot be created, so no child outlives launch
     // and no process handle is leaked.
@@ -1952,7 +2121,9 @@ where
             // long as this supervisor and stops with the player; no second watcher
             // is ever registered for the same session.
             let room_watch_stop = Arc::new(AtomicBool::new(false));
-            if let (Some(hints), Some(watch)) = (supervisor_hints, room_watch) {
+            if let (Some(hints), Some(watch)) = (supervisor_hints, room_watch)
+                && watch.monitor && watch.target.platform == Platform::Bili
+            {
                 spawn_room_state_watcher(hints, watch, Arc::clone(&room_watch_stop));
             }
             supervise_controlled(
@@ -2101,9 +2272,11 @@ pub fn launch_controlled(
     // Bilibili has no relay, so the legacy launcher relied on its --watch child for
     // the room state hint. Relay platforms report their state through the relay
     // hint file instead.
-    let room_watch = (target.platform == Platform::Bili).then(|| RoomWatch {
+    let room_watch = Some(RoomWatch {
         target: target.clone(),
         vault: vault.cloned(),
+        yt_dlp: settings.yt_dlp.clone(),
+        monitor: settings.playback.monitor_room_state,
     });
     let credential_root = vault.map(|vault| vault.root().to_owned());
     launch_resolved_controlled(

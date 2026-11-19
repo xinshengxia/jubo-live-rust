@@ -15,6 +15,8 @@ use tungstenite::{Message, client::IntoClientRequest};
 #[path = "browser_owned.rs"]
 mod owned;
 use owned::OwnedBrowser;
+#[path = "browser_search.rs"]
+mod search;
 
 const CDP_LIMIT: usize = 2 * 1024 * 1024;
 /// Default deadline for one DevTools request/response round trip.
@@ -264,16 +266,13 @@ impl BrowserProcess {
     }
 }
 
-fn scoped_capture(
-    process: &BrowserProcess,
+fn attach_platform_page(
+    websocket: &mut tungstenite::WebSocket<TcpStream>,
     platform: Platform,
-    endpoint: &Url,
     cancel: CancelCheck<'_>,
-    check_in_page: bool,
-) -> Result<(Value, Option<LoginHealth>)> {
-    let mut websocket = process.open_debugger(endpoint, cancel)?;
+) -> Result<(Value, String)> {
     let targets = rpc(
-        &mut websocket,
+        websocket,
         1,
         "Target.getTargets",
         serde_json::json!({}),
@@ -302,7 +301,7 @@ fn scoped_capture(
         .as_str()
         .ok_or_else(|| anyhow!("平台页面身份缺失"))?;
     let attached = rpc(
-        &mut websocket,
+        websocket,
         2,
         "Target.attachToTarget",
         serde_json::json!({"targetId":target,"flatten":true}),
@@ -313,6 +312,19 @@ fn scoped_capture(
     let session = attached["sessionId"]
         .as_str()
         .ok_or_else(|| anyhow!("无法绑定本次平台页面"))?;
+    Ok((selected.clone(), session.to_owned()))
+}
+
+fn scoped_capture(
+    process: &BrowserProcess,
+    platform: Platform,
+    endpoint: &Url,
+    cancel: CancelCheck<'_>,
+    check_in_page: bool,
+) -> Result<(Value, Option<LoginHealth>)> {
+    let mut websocket = process.open_debugger(endpoint, cancel)?;
+    let (selected, attached) = attach_platform_page(&mut websocket, platform, cancel)?;
+    let session = attached.as_str();
     // Request only selected-platform URL scopes, never the whole browser's
     // storage (which can also hold third-party OAuth session cookies).
     let mut cookies = rpc(

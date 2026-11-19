@@ -27,11 +27,14 @@ impl Launcher {
     /// danmaku on/off) are applied on top of the saved preferences.
     pub(crate) fn launch_settings(&self) -> Settings {
         let mut settings = self.snapshot.settings.clone();
-        settings.playback.buffer_mode = self.playback_draft.buffer_mode;
+        settings.playback.buffer_mode = self.launch_buffer.unwrap_or(self.playback_draft.buffer_mode);
         settings.playback.enhancement = self.playback_draft.enhancement;
         settings.overlay.sc_mode = self.overlay_draft.sc_mode;
         match self.launch_danmaku {
-            1 => settings.overlay.enabled = true,
+            1 => {
+                settings.auto_start = true;
+                settings.overlay.enabled = true;
+            }
             2 => settings.overlay.enabled = false,
             _ => {}
         }
@@ -108,6 +111,32 @@ impl Launcher {
         context: &egui::Context,
         pal: &Pal,
     ) {
+        if let Some(mut entry) = self.favorite_editor.take() {
+            let mut finished = false;
+            egui::Window::new("加入收藏")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(context, |ui| {
+                    ui.label(format!("{} 的收藏名称", entry.target));
+                    ui.text_edit_singleline(&mut entry.name);
+                    let valid = !entry.name.trim().is_empty()
+                        && entry.name.trim().chars().count() <= 256
+                        && !entry.name.trim().chars().any(char::is_control);
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(valid, egui::Button::new("保存")).clicked() {
+                            self.send_store(StoreAction::AddFavorite(entry.name.trim().to_owned(), entry.target.clone()));
+                            finished = true;
+                        }
+                        if ui.button("取消").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            finished = true;
+                        }
+                    });
+                });
+            if !finished {
+                self.favorite_editor = Some(entry);
+            }
+        }
         // Deletion is a two-step action: the dialog defaults to cancel (Escape and
         // the first button both cancel) and a successful delete leaves a short
         // undo entry instead of making the user re-enter the room.
@@ -216,7 +245,11 @@ impl Launcher {
             )
             .clicked()
             {
-                self.platform = platform;
+                if self.platform != platform {
+                    self.favorite_selected = None;
+                    self.favorite_name.clear();
+                    self.platform = platform;
+                }
             }
             tabs_x += tab_width + tab_gap;
         }
@@ -280,10 +313,12 @@ impl Launcher {
             "输入房间号，或粘贴官方直播间链接",
             pal,
         );
-        if input_response.changed()
-            && let Some(platform) = detected_platform(self.room_input.as_str())
-        {
-            self.platform = platform;
+        if input_response.changed() {
+            self.favorite_selected = None;
+            self.favorite_name.clear();
+            if let Some(platform) = detected_platform(self.room_input.as_str()) {
+                self.platform = platform;
+            }
         }
         let labels = ["画质：", "mpv 缓冲：", "弹幕：", "SC：", "画质增强"];
         let scopes = ["本次", "本次", "本次", "保存 / 实时", "保存 / mpv"];
@@ -352,7 +387,7 @@ impl Launcher {
         {
             self.quality = [Quality::Best, Quality::High, Quality::Low][quality];
         }
-        let mut buffer = match self.playback_draft.buffer_mode {
+        let mut buffer = match self.launch_buffer.unwrap_or(self.playback_draft.buffer_mode) {
             BufferMode::LowLatency => 0,
             BufferMode::Stable => 1,
         };
@@ -366,7 +401,7 @@ impl Launcher {
         )
         .changed()
         {
-            self.playback_draft.buffer_mode = [BufferMode::LowLatency, BufferMode::Stable][buffer];
+            self.launch_buffer = Some([BufferMode::LowLatency, BufferMode::Stable][buffer]);
         }
         let launch_danmaku_text = ["跟随设置", "开启", "关闭"];
         let mut danmaku = self.launch_danmaku as usize;
@@ -393,7 +428,7 @@ impl Launcher {
             let mode = [ScMode::Full, ScMode::Compact, ScMode::Badge, ScMode::Off][sc];
             if mode != self.overlay_draft.sc_mode {
                 self.overlay_draft.sc_mode = mode;
-                self.send_store(StoreAction::SaveOverlay(self.overlay_draft.clone()));
+                self.send_store(StoreAction::SaveScMode(mode));
                 self.set_status("SC 显示模式已保存为偏好。", false);
             }
         }
@@ -415,7 +450,7 @@ impl Launcher {
             let value = [Enhancement::Off, Enhancement::Light, Enhancement::High][enhance];
             if value != self.playback_draft.enhancement {
                 self.playback_draft.enhancement = value;
-                self.send_store(StoreAction::SavePlayback(self.playback_draft.clone()));
+                self.send_store(StoreAction::SaveEnhancement(value));
                 self.set_status("mpv 画质增强已保存为偏好。", false);
             }
         }
@@ -573,7 +608,8 @@ impl Launcher {
         );
         let delete_enabled = self
             .favorite_selected
-            .filter(|index| *index < self.snapshot.favorites.len())
+            .and_then(|index| self.snapshot.favorites.get(index))
+            .filter(|entry| entry.target.platform == self.platform)
             .is_some();
         if button(
             ui,
@@ -653,7 +689,7 @@ impl Launcher {
         let popup_open = ui.memory(|memory| memory.any_popup_open());
         // The delete confirmation must swallow Enter/arrow shortcuts: launching a
         // player while answering a destructive dialog is never intended.
-        let confirm_open = self.favorite_delete_confirm.is_some();
+        let confirm_open = self.favorite_delete_confirm.is_some() || self.favorite_editor.is_some() || self.format_help_open;
         if escape && !confirm_open {
             self.favorite_selected = None;
         }
@@ -1461,7 +1497,7 @@ fn launch_card_height(inner: f32, compact: bool) -> f32 {
 
 impl Launcher {
     /// Ask for a JSON file and hand it to the bounded store-worker importer.
-    /// The worker enforces the 2 MiB / UTF-8 / schema limits and reports the
+    /// The worker enforces the import size / UTF-8 / schema limits and reports the
     /// added/updated counts through the normal status line.
     pub(super) fn import_favorites_dialog(&mut self) {
         let filter = crate::gui::file_dialog::build_filter(&[("收藏 JSON (*.json)", "*.json")]);

@@ -210,6 +210,22 @@ fn verified_account_cannot_replace_another_profile_or_an_invalid_room() {
     assert_eq!(candidates[0].profile_url, selected.profile_url);
 }
 
+#[cfg(feature = "gui")]
+#[test]
+fn verified_bili_room_can_gain_its_owner_profile_and_short_id_can_expand() {
+    use live_hub_rust::{gui::apply_verified_candidate, search::{classify_lookup_input, LookupInput}};
+    let Some(LookupInput::Room(selected)) = classify_lookup_input("https://live.bilibili.com/123",
+        Platform::Bili, true).unwrap() else { panic!("expected an official room input") };
+    let mut rows = vec![selected.clone()];
+    let mut verified = selected.clone();
+    verified.room = "123000".into();
+    verified.account_id = Some("456".into());
+    verified.profile_url = Some("https://space.bilibili.com/456".into());
+    apply_verified_candidate(&mut rows, &selected, verified).unwrap();
+    assert_eq!(rows[0].room, "123000");
+    assert_eq!(rows[0].account_id.as_deref(), Some("456"));
+}
+
 #[test]
 fn old_overlay_state_without_rich_media_fields_gets_documented_defaults() {
     let partial: OverlaySettings = serde_json::from_str(

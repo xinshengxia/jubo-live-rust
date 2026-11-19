@@ -8,6 +8,9 @@
 
 local mp = require "mp"
 local msg = require "mp.msg"
+local utils = require "mp.utils"
+local options = mp.get_property_native("options/script-opts") or {}
+local refreshing = false
 
 -- 记录加载时间，用于刷新后给用户一个提示
 local load_count = 0
@@ -36,8 +39,26 @@ mp.add_key_binding(nil, "reload", function()
         mp.osd_message("刷新失败：拿不到直播间地址", 3)
         return
     end
-    mp.osd_message("正在刷新直播流（重新解析地址）...", 2)
-    msg.info("resync reload via path: " .. tostring(path))
+    if options.live_resync_request and options.live_resync_binary then
+        if refreshing then return end
+        refreshing = true
+        mp.osd_message("正在重新获取 B 站直播地址…", 2)
+        mp.command_native_async({
+            name = "subprocess", args = {options.live_resync_binary, "mpv-helper", "--refresh-request", options.live_resync_request},
+            capture_stdout = true,
+            capture_size = 65536, playback_only = false,
+        }, function(ok, result)
+            refreshing = false
+            local url = ok and result and result.status == 0 and utils.parse_json(result.stdout)
+            if type(url) ~= "string" or not url:match("^https?://") then
+                mp.osd_message("直播地址刷新失败，可在启动器中重新同步", 4)
+            elseif mp.get_property("path") == path then
+                mp.commandv("loadfile", url, "replace")
+            end
+        end)
+        return
+    end
+    mp.osd_message("正在重新连接直播流…", 2)
     mp.commandv("loadfile", path, "replace")
 end)
 

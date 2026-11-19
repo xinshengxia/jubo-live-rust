@@ -80,7 +80,8 @@ impl Launcher {
                 )
             })
             .collect();
-        let selected = self.recent_selected.filter(|index| *index < rows.len());
+        let selected = self.recent_selected.as_ref().and_then(|selected| rows.iter()
+            .position(|(_, target, _)| crate::core::same_room(selected, target)));
         let action_enabled = selected.is_some();
         if button(
             ui,
@@ -94,7 +95,6 @@ impl Launcher {
             && let Some(index) = selected
             && let Some((_, target, _)) = rows.get(index).cloned()
         {
-            self.recent_selected = Some(index);
             let settings = self.launch_settings();
             self.start_playback_with(target, Player::Mpv, settings, context);
         }
@@ -110,7 +110,6 @@ impl Launcher {
             && let Some(index) = selected
             && let Some((_, target, _)) = rows.get(index).cloned()
         {
-            self.recent_selected = Some(index);
             let settings = self.launch_settings();
             self.start_playback_with(target, Player::PotPlayer, settings, context);
         }
@@ -148,29 +147,21 @@ impl Launcher {
                 )
             });
             if up {
-                let next = match self.recent_selected {
-                    Some(index) if index > 0 => index - 1,
-                    Some(_) => 0,
-                    None if !rows.is_empty() => 0,
-                    None => 0,
-                };
-                self.recent_selected = Some(next);
+                let next = selected.unwrap_or(0).saturating_sub(1);
                 if let Some((name, target, _)) = rows.get(next) {
                     self.fill_recent(&name.clone(), target);
                 }
             }
             if down && !rows.is_empty() {
-                let next = self
-                    .recent_selected
+                let next = selected
                     .map(|index| (index + 1).min(rows.len() - 1))
                     .unwrap_or(0);
-                self.recent_selected = Some(next);
                 if let Some((name, target, _)) = rows.get(next) {
                     self.fill_recent(&name.clone(), target);
                 }
             }
             if enter
-                && let Some(index) = self.recent_selected
+                && let Some(index) = selected
                 && let Some((_, target, _)) = rows.get(index).cloned()
             {
                 let settings = self.launch_settings();
@@ -189,6 +180,7 @@ impl Launcher {
     }
 
     fn fill_recent(&mut self, name: &str, target: &Target) {
+        self.recent_selected = Some(target.clone());
         self.platform = target.platform;
         self.room_input = target.room.clone();
         self.quality = target.quality;
@@ -236,7 +228,7 @@ impl Launcher {
                 );
                 let id = ui.id().with(("recent-row", index));
                 let response = ui.interact(card, id, Sense::click());
-                let is_selected = self.recent_selected == Some(index);
+                let is_selected = self.recent_selected.as_ref().is_some_and(|selected| crate::core::same_room(selected, target));
                 rounded(
                     ui.painter(),
                     card,
@@ -317,14 +309,16 @@ impl Launcher {
                     pal.text_secondary,
                     Align2::LEFT_CENTER,
                 );
-                if let Some(badge) = self.badge_label(target) {
-                    let live = badge.contains("播") && !badge.contains("休");
+                if let Some(badge) = self.badges.get(&crate::gui::badges::room_key(target)).copied()
+                    && badge != crate::gui::badges::Badge::Unknown
+                {
+                    let live = badge == crate::gui::badges::Badge::Live;
                     let color = if live {
                         pal.success
                     } else {
                         pal.text_secondary
                     };
-                    let label = if live { "直播中" } else { "已下播" };
+                    let label = badge.description();
                     let dot_x = state_right - state_width;
                     ui.painter().circle_filled(
                         pos2(dot_x + 3.0, card.top() + row_height / 2.0),
@@ -358,7 +352,6 @@ impl Launcher {
             ui.allocate_space(vec2(client_width, content));
         });
         if let Some(index) = select {
-            self.recent_selected = Some(index);
             if let Some((name, target, _)) = rows.get(index).cloned() {
                 self.fill_recent(&name, &target);
             }
@@ -366,7 +359,7 @@ impl Launcher {
         if let Some((index, player)) = open
             && let Some((_, target, _)) = rows.get(index).cloned()
         {
-            self.recent_selected = Some(index);
+            self.recent_selected = Some(target.clone());
             let settings = self.launch_settings();
             self.start_playback_with(target, player, settings, context);
         }

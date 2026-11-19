@@ -40,6 +40,7 @@ pub enum SessionPhase {
     RegisteringPlayer,
     Playing,
     WaitingBroadcast,
+    WaitingVerification,
     Interrupted,
     Stopping,
     Failed,
@@ -61,6 +62,7 @@ impl SessionPhase {
             Self::Playing => "播放中",
             Self::Interrupted => "中转已中断",
             Self::WaitingBroadcast => "等待重开",
+            Self::WaitingVerification => "等待网页验证",
             Self::Stopping => "正在停止",
             Self::Failed => "启动失败",
             Self::Cancelled => "已取消",
@@ -89,7 +91,7 @@ impl SessionPhase {
     pub const fn can_stop(self) -> bool {
         matches!(
             self,
-            Self::Playing | Self::WaitingBroadcast | Self::Interrupted
+            Self::Playing | Self::WaitingBroadcast | Self::WaitingVerification | Self::Interrupted
         )
     }
 }
@@ -248,6 +250,11 @@ impl SessionManager {
             .entries
             .get(id)
             .map(|entry| entry.snapshot.clone())
+    }
+
+    pub fn launch_settings(&self, id: &str) -> Option<Settings> {
+        self.inner.state.lock().unwrap_or_else(|e| e.into_inner())
+            .entries.get(id).map(|entry| entry.settings.clone())
     }
 
     /// Return immediately after scheduling a bounded asynchronous launch.
@@ -613,12 +620,20 @@ impl SessionManager {
                     if entry.snapshot.player_pid.is_some()
                         && matches!(
                             entry.snapshot.phase,
-                            SessionPhase::Playing | SessionPhase::WaitingBroadcast
+                            SessionPhase::Playing | SessionPhase::WaitingBroadcast | SessionPhase::WaitingVerification
                         )
                     {
-                        entry.snapshot.phase = SessionPhase::WaitingBroadcast;
+                        entry.snapshot.phase = if telemetry.waiting_state.as_deref() == Some("verification") {
+                            SessionPhase::WaitingVerification
+                        } else {
+                            SessionPhase::WaitingBroadcast
+                        };
                     }
                     match telemetry.waiting_state.as_deref() {
+                        Some("verification") => {
+                            entry.snapshot.room_state = SessionRoomState::Unknown;
+                            entry.snapshot.room_note = "请到账号页完成抖音网页验证，中转会继续重试".into();
+                        }
                         Some("offline") => {
                             entry.snapshot.room_state = SessionRoomState::Offline;
                             entry.snapshot.room_note = "已下播，中转保留连接等待重开".into();
@@ -632,7 +647,7 @@ impl SessionManager {
                     }
                     entry.snapshot.room_observed_at = Some(Utc::now());
                 } else if telemetry.state == "streaming" {
-                    if entry.snapshot.phase == SessionPhase::WaitingBroadcast {
+                    if matches!(entry.snapshot.phase, SessionPhase::WaitingBroadcast | SessionPhase::WaitingVerification) {
                         entry.snapshot.phase = SessionPhase::Playing;
                         entry.snapshot.room_state = SessionRoomState::Unknown;
                         entry.snapshot.room_note = "媒体已恢复，等待确认直播或重播状态".into();
@@ -660,6 +675,7 @@ impl SessionManager {
                         entry.snapshot.phase,
                         SessionPhase::Playing
                             | SessionPhase::WaitingBroadcast
+                            | SessionPhase::WaitingVerification
                             | SessionPhase::Interrupted
                     )
                 {

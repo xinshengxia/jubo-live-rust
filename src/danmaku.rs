@@ -169,11 +169,21 @@ pub enum LiveEventKind {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveEvent {
+    #[serde(default)]
+    pub source: LiveEventSource,
     pub id: String,
     pub kind: LiveEventKind,
     pub user: String,
     pub text: String,
     pub count: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LiveEventSource {
+    pub user_id: u64,
+    pub combo_id: String,
+    pub cumulative: bool,
 }
 
 #[derive(Clone, Default)]
@@ -522,7 +532,12 @@ fn decode_bili_json(bytes: &[u8], output: &mut Vec<DanmakuEvent>) -> Result<()> 
                 number(&data["num"])
             };
             output.push(DanmakuEvent::Live(LiveEvent {
-                id: text(&data["id"]),
+                source: LiveEventSource {
+                    user_id: number(&data["uid"]),
+                    combo_id: first_text(&data["combo_id"], &data["batch_combo_id"]),
+                    cumulative: cmd == "COMBO_SEND",
+                },
+                id: if cmd == "COMBO_SEND" { String::new() } else { first_text(&data["tid"], &data["id"]) },
                 kind,
                 user,
                 text: rich::sanitize_event_text(&event_text, MAX_TEXT_CHARS),
@@ -552,6 +567,7 @@ fn decode_bili_json(bytes: &[u8], output: &mut Vec<DanmakuEvent>) -> Result<()> 
             output.push(DanmakuEvent::Live(LiveEvent {
                 id: String::new(),
                 kind: LiveEventKind::Status,
+                source: Default::default(),
                 user: String::new(),
                 text: rich::sanitize_event_text(&format!("{label} {value_text}"), MAX_TEXT_CHARS),
                 count: 1,
@@ -568,6 +584,7 @@ fn decode_bili_json(bytes: &[u8], output: &mut Vec<DanmakuEvent>) -> Result<()> 
                 output.push(DanmakuEvent::Live(LiveEvent {
                     id: text(&data["id"]),
                     kind: LiveEventKind::Notice,
+                    source: Default::default(),
                     user: String::new(),
                     text: rich::sanitize_event_text(&notice, MAX_TEXT_CHARS),
                     count: 1,
@@ -578,6 +595,7 @@ fn decode_bili_json(bytes: &[u8], output: &mut Vec<DanmakuEvent>) -> Result<()> 
             output.push(DanmakuEvent::Live(LiveEvent {
                 id: text(&value["data"]["lot_id"]),
                 kind: LiveEventKind::Notice,
+                source: Default::default(),
                 user: String::new(),
                 text: "直播间红包活动开始".into(),
                 count: 1,
@@ -600,6 +618,10 @@ fn decode_bili_json(bytes: &[u8], output: &mut Vec<DanmakuEvent>) -> Result<()> 
                             if matches!(kind, Some(1 | 2)) {
                                 output.push(DanmakuEvent::Live(LiveEvent {
                                     id: String::new(),
+                                    source: LiveEventSource {
+                                        user_id: fields.iter().find(|f| f.tag == 1).and_then(|f| f.number).unwrap_or(0),
+                                        ..Default::default()
+                                    },
                                     kind: if kind == Some(1) {
                                         LiveEventKind::Enter
                                     } else {
@@ -629,6 +651,10 @@ fn decode_bili_json(bytes: &[u8], output: &mut Vec<DanmakuEvent>) -> Result<()> 
                                         .unwrap_or_default();
                                     if !name.is_empty() {
                                         output.push(DanmakuEvent::Live(LiveEvent {
+                                            source: LiveEventSource {
+                                                user_id: fields.iter().find(|f| f.tag == 1).and_then(|f| f.number).unwrap_or(0),
+                                                ..Default::default()
+                                            },
                                             id: proto_bytes(&g, 9)
                                                 .and_then(|b| std::str::from_utf8(b).ok())
                                                 .map(limit)
@@ -839,6 +865,10 @@ impl DouyuDecoder {
                     let gift = fields.get("type").is_some_and(|s| s == "dgb");
                     let user = limit(fields.get("nn").map(String::as_str).unwrap_or(""));
                     batch.events.push(DanmakuEvent::Live(LiveEvent {
+                        source: LiveEventSource {
+                            user_id: fields.get("uid").and_then(|s| s.parse().ok()).unwrap_or(0),
+                            ..Default::default()
+                        },
                         id: limit(fields.get("cid").map(String::as_str).unwrap_or("")),
                         kind: if gift {
                             LiveEventKind::Gift

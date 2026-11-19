@@ -293,14 +293,11 @@ fn explicit_legacy_import_is_transactional_and_preserves_unrelated_files() {
     assert_eq!(result.favorites_updated, 1);
     assert_eq!(store.favorites().len(), 1);
     assert_eq!(store.favorites()[0].name, "Updated");
+    let mixed = store.import_json(
+        r#"[{"name":"Valid","room":"bili:123"},{"name":"Invalid","room":"huya:../escape"}]"#
+    ).unwrap();
+    assert_eq!((mixed.favorites_added, mixed.favorites_skipped), (1, 1));
     let committed = fs::read(root.join("state.json")).unwrap();
-    assert!(
-        store
-            .import_json(
-                r#"[{"name":"Valid","room":"bili:123"},{"name":"Invalid","room":"huya:../escape"}]"#
-            )
-            .is_err()
-    );
     assert!(
         store
             .import_json(r#"{"settings":{"mpv":"unexpected.exe"}}"#)
@@ -309,7 +306,7 @@ fn explicit_legacy_import_is_transactional_and_preserves_unrelated_files() {
     assert_eq!(fs::read(root.join("state.json")).unwrap(), committed);
     assert_eq!(fs::read_to_string(unrelated).unwrap(), "synthetic marker");
     store.import_json(r#"{"Synthetic map":"bili:42"}"#).unwrap();
-    assert_eq!(store.favorites().len(), 2);
+    assert_eq!(store.favorites().len(), 3);
 }
 
 #[test]

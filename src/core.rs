@@ -20,7 +20,8 @@ use url::Url;
 
 pub const HISTORY_LIMIT: usize = 100;
 const FAVORITES_LIMIT: usize = 10_000;
-const MAX_STATE_BYTES: u64 = 2 * 1024 * 1024;
+pub const MAX_IMPORT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_STATE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_ROOM_BYTES: usize = 128;
 const MAX_NAME_CHARS: usize = 256;
 const SCHEMA_VERSION: u32 = 1;
@@ -1113,6 +1114,46 @@ impl Store {
         })
     }
 
+    pub fn save_launcher_font(&mut self, key: Option<String>, percent: Option<u8>) -> Result<()> {
+        self.transaction(move |state| {
+            if let Some(key) = key {
+                state.settings.ui_font_key = key;
+            }
+            if let Some(percent) = percent {
+                state.settings.ui_font_percent = percent;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn save_auto_start(&mut self, enabled: bool) -> Result<()> {
+        self.transaction(|state| {
+            state.settings.auto_start = enabled;
+            Ok(())
+        })
+    }
+
+    pub fn save_dark_mode(&mut self, dark: bool) -> Result<()> {
+        self.transaction(|state| {
+            state.settings.dark_mode = dark;
+            Ok(())
+        })
+    }
+
+    pub fn save_sc_mode(&mut self, mode: ScMode) -> Result<()> {
+        self.transaction(|state| {
+            state.settings.overlay.sc_mode = mode;
+            Ok(())
+        })
+    }
+
+    pub fn save_enhancement(&mut self, enhancement: Enhancement) -> Result<()> {
+        self.transaction(|state| {
+            state.settings.playback.enhancement = enhancement;
+            Ok(())
+        })
+    }
+
     /// Update only overlay preferences after reloading under the write lock.
     /// A stale settings editor cannot replace another instance's player paths.
     pub fn save_overlay_settings(&mut self, overlay: OverlaySettings) -> Result<()> {
@@ -1192,23 +1233,32 @@ impl Store {
     /// entries, a legacy `[{"name":"Example","room":"huya:example"}]` list,
     /// or a legacy `{ "Example": "bili:123" }` favorite map.
     pub fn import_json(&mut self, json: &str) -> Result<ImportSummary> {
-        ensure!(json.len() as u64 <= MAX_STATE_BYTES, "Import is too large");
-        let value: serde_json::Value = serde_json::from_str(json).context("Invalid import JSON")?;
+        ensure!(json.len() as u64 <= MAX_IMPORT_BYTES, "Import is too large");
+        let mut value: serde_json::Value = serde_json::from_str(json).context("Invalid import JSON")?;
+        let mut skipped = 0;
         let import = if value.get("favorites").is_some() || value.get("history").is_some() {
-            serde_json::from_value::<ImportData>(value).context("Invalid structured import")?
+            let favorites = value.as_object_mut().and_then(|map| map.remove("favorites"));
+            let mut data = serde_json::from_value::<ImportData>(value).context("Invalid structured import")?;
+            if let Some(favorites) = favorites {
+                ensure!(favorites.is_array(), "Expected a favorites array");
+                data.favorites = parse_legacy_favorites(favorites, &mut skipped)?;
+            }
+            data
         } else {
             ImportData {
-                favorites: parse_legacy_favorites(value)?,
+                favorites: parse_legacy_favorites(value, &mut skipped)?,
                 history: Vec::new(),
             }
         };
-        self.import_data(import)
+        let mut summary = self.import_data(import)?;
+        summary.favorites_skipped = skipped;
+        Ok(summary)
     }
 
     /// Import the legacy platform-keyed history document. Its short display time
     /// is retained as text because the format omits the year and time zone.
     pub fn import_legacy_history_json(&mut self, json: &str) -> Result<ImportSummary> {
-        ensure!(json.len() as u64 <= MAX_STATE_BYTES, "Import is too large");
+        ensure!(json.len() as u64 <= MAX_IMPORT_BYTES, "Import is too large");
         let groups: BTreeMap<String, Vec<LegacyHistory>> =
             serde_json::from_str(json).context("Invalid legacy history JSON")?;
         let mut history = Vec::new();
@@ -1297,6 +1347,7 @@ impl Store {
 pub struct ImportSummary {
     pub favorites_added: usize,
     pub favorites_updated: usize,
+    pub favorites_skipped: usize,
     pub history_added: usize,
     pub history_skipped: usize,
 }
@@ -1326,39 +1377,35 @@ struct LegacyHistory {
     at: Option<String>,
 }
 
-fn parse_legacy_favorites(value: serde_json::Value) -> Result<Vec<Favorite>> {
-    match value {
-        serde_json::Value::Array(values) => values
-            .into_iter()
-            .map(|entry| {
-                // A list may also be a direct export of the new favorite entries.
-                if entry.get("target").is_some() {
-                    Ok(serde_json::from_value::<Favorite>(entry)
-                        .context("Invalid favorite entry")?)
-                } else {
-                    let entry: LegacyFavorite =
-                        serde_json::from_value(entry).context("Invalid legacy favorite entry")?;
-                    Ok(Favorite {
-                        name: normalized_name(entry.name)?,
-                        target: Target::parse(&entry.room)?,
-                    })
-                }
-            })
-            .collect(),
-        serde_json::Value::Object(values) => values
-            .into_iter()
-            .map(|(name, room)| {
-                let room = room
-                    .as_str()
-                    .context("Legacy favorite rooms must be strings")?;
-                Ok(Favorite {
-                    name: normalized_name(name)?,
-                    target: Target::parse(room)?,
-                })
-            })
+fn parse_legacy_favorites(value: serde_json::Value, skipped: &mut usize) -> Result<Vec<Favorite>> {
+    let entries = match value {
+        serde_json::Value::Array(values) => values,
+        serde_json::Value::Object(values) => values.into_iter()
+            .map(|(name, room)| serde_json::json!({"name": name, "room": room}))
             .collect(),
         _ => bail!("Import must contain a favorite list, favorite map, or structured export"),
+    };
+    ensure!(entries.len() <= FAVORITES_LIMIT, "Too many imported favorites");
+    let mut favorites = Vec::new();
+    for item in entries {
+        let parsed = (|| -> Result<Favorite> {
+            let mut entry = if item.get("target").is_some() {
+                serde_json::from_value::<Favorite>(item)?
+            } else {
+                let legacy: LegacyFavorite = serde_json::from_value(item)?;
+                Favorite { name: legacy.name, target: Target::parse(&legacy.room)? }
+            };
+            entry.target.validate()?;
+            entry.name = normalized_name(entry.name)?;
+            Ok(entry)
+        })();
+        match parsed {
+            Ok(entry) => favorites.push(entry),
+            Err(_) => *skipped += 1,
+        }
     }
+    ensure!(*skipped == 0 || !favorites.is_empty(), "收藏文件里没有有效的收藏条目");
+    Ok(favorites)
 }
 
 fn normalized_name(name: String) -> Result<String> {
@@ -1398,7 +1445,7 @@ fn validate_history(entry: &HistoryEntry) -> Result<()> {
 fn identity(target: &Target) -> (Platform, &str) {
     (target.platform, target.room.as_str())
 }
-fn same_room(left: &Target, right: &Target) -> bool {
+pub(crate) fn same_room(left: &Target, right: &Target) -> bool {
     identity(left) == identity(right)
 }
 

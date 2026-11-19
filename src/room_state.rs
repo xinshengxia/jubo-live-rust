@@ -131,7 +131,7 @@ pub fn parse_douyin_page(page: &str) -> RoomObservation {
             .map(|a| a.iter().collect())
             .unwrap_or_else(|| vec![&root]);
         for entry in entries {
-            if let Some(room) = entry.pointer("/state/roomStore/roomInfo/room") {
+            if let Some(room) = entry.pointer("/state/roomStore/roomInfo/room").filter(|value| value.is_object()) {
                 return parse_douyin_room(room);
             }
         }
@@ -204,13 +204,7 @@ fn query(target: &Target) -> Result<RoomObservation> {
             }
             // Only unambiguous replay/off markers may be used as fallback;
             // Huya's web "on" marker also appears on replay pages.
-            let state = if page.contains("liveStatus-replay") {
-                RoomState::Replay
-            } else if page.contains("liveStatus-off") {
-                RoomState::Offline
-            } else {
-                RoomState::Unknown
-            };
+            let state = platforms::huya_page_state(&page);
             Ok(RoomObservation::new(state, observed.title))
         }
         Platform::Douyu => Ok(parse_douyu(&platforms::json_get(

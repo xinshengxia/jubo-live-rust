@@ -309,7 +309,10 @@ fn explicit_resync_waits_for_owned_completion_and_opens_one_replacement() {
     let manager = manager(Mode::DelayedStop);
     let mut original = target();
     original.quality = live_hub_rust::core::Quality::Low;
-    let id = manager.start(original.clone(), Player::PotPlayer, settings(), None).unwrap();
+    let mut original_settings = settings();
+    original_settings.playback.buffer_mode = live_hub_rust::core::BufferMode::Stable;
+    original_settings.overlay.enabled = false;
+    let id = manager.start(original.clone(), Player::PotPlayer, original_settings.clone(), None).unwrap();
     let unrelated = manager.start(target(), Player::Mpv, settings(), None).unwrap();
     wait(&manager, &id, SessionPhase::Playing);
     wait(&manager, &unrelated, SessionPhase::Playing);
@@ -329,6 +332,7 @@ fn explicit_resync_waits_for_owned_completion_and_opens_one_replacement() {
     };
     assert_eq!(replacement.target, original);
     assert_eq!(replacement.player, Player::PotPlayer);
+    assert_eq!(manager.launch_settings(&replacement.id).unwrap(), original_settings);
     assert_eq!(manager.snapshot(&id).unwrap().phase, SessionPhase::Stopped);
     assert_eq!(manager.snapshot(&unrelated).unwrap().phase, SessionPhase::Playing);
     assert_eq!(manager.snapshots().len(), 3);

@@ -20,7 +20,7 @@ Windows 多平台直播工具，支持 B站、虎牙、斗鱼、抖音，使用 
 
 本轮提供 **lite**（不捆绑播放器或 yt-dlp）及源码 ZIP。已有工具可以直接选择，无需重新下载。暂不提供 full 包；不要把历史提到的 full 当成本版可下载的资产。以 Release 的实际附件为准。
 
-当前修复候选为 **1.0.9**：[本版变化与验收边界](docs/release-notes-1.0.9.md)。历史变化见 [旧版本记录](docs/changes-through-1.0.8.md) 与 [Releases](https://github.com/xinshengxia/jubo-live-rust/releases)。
+当前版本为 **1.0.10**。[本版变化](docs/release-notes-1.0.10.md) · [1.0.9 登录和工具设置更新](docs/release-notes-1.0.9.md) · [历史版本](https://github.com/xinshengxia/jubo-live-rust/releases)
 
 ## 主要功能
 

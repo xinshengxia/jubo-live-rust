@@ -753,9 +753,11 @@ impl Launcher {
         if checkbox(ui, rect, "打开直播自动带起弹幕", &mut auto_start, pal).changed()
             && auto_start != self.snapshot.settings.auto_start
         {
-            let mut settings = self.snapshot.settings.clone();
-            settings.auto_start = auto_start;
-            self.send_store(StoreAction::SaveSettings(settings));
+            self.send_store(StoreAction::SaveAutoStart(auto_start));
+        }
+        let theme_rect = check_slot(card, 1, 10);
+        if checkbox(ui, theme_rect, "启动器深色模式", &mut self.dark, pal).changed() {
+            self.send_store(StoreAction::SaveDarkMode(self.dark));
         }
 
         let draft = &mut self.overlay_draft;
@@ -1347,9 +1349,10 @@ impl Launcher {
         {
             return;
         }
-        self.snapshot.settings = settings.clone();
-        self.send_store(StoreAction::SaveSettings(settings));
-        self.set_status("界面字体设置已保存：重启启动器后生效。", false);
+        self.send_store(StoreAction::SaveFont(
+            key.map(str::to_owned),
+            percent.map(|_| settings.ui_font_percent),
+        ));
     }
 }
 
