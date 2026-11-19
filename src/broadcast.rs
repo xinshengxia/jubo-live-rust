@@ -4,7 +4,7 @@ use crate::{
     auth::CookieVault,
     core::{Platform, ResolvedStream, Settings, Target},
     platforms,
-    relay::{ResolveWaiting, StreamResolver},
+    relay::{ResolveUnavailable, ResolveWaiting, StreamResolver},
     room_state::{self, RoomObservation, RoomState},
 };
 use anyhow::Result;
@@ -149,21 +149,22 @@ impl StreamResolver for BroadcastResolver {
                 if error.downcast_ref::<ResolveWaiting>().is_some() {
                     return Err(error);
                 }
-                if self.wait {
-                    if let Ok(observation) = self.backend.observe() {
-                        let state = match observation.state {
-                            RoomState::Offline => Some("offline"),
-                            RoomState::Replay => Some("replay_unavailable"),
-                            _ => None,
-                        };
-                        if let Some(state) = state {
-                            return Err(ResolveWaiting {
-                                state: state.into(),
-                                retry_after: Duration::from_secs(20),
-                            }
-                            .into());
-                        }
-                    }
+                let state = match error.downcast_ref::<platforms::AdapterError>() {
+                    Some(platforms::AdapterError::Offline) => Some("offline"),
+                    Some(platforms::AdapterError::ReplayUnavailable) => Some("replay_unavailable"),
+                    _ if self.wait => self.backend.observe().ok().and_then(|observation| match observation.state {
+                        RoomState::Offline => Some("offline"),
+                        RoomState::Replay => Some("replay_unavailable"),
+                        _ => None,
+                    }),
+                    _ => None,
+                };
+                if let Some(state) = state {
+                    return if self.wait {
+                        Err(ResolveWaiting { state: state.into(), retry_after: Duration::from_secs(20) }.into())
+                    } else {
+                        Err(ResolveUnavailable(state).into())
+                    };
                 }
                 Err(error)
             }
@@ -203,6 +204,18 @@ mod tests {
             headers: Default::default(),
         }
     }
+    #[test]
+    fn explicitly_offline_closes_without_waiting_or_reprobing_when_disabled() {
+        struct Ended;
+        impl BroadcastBackend for Ended {
+            fn resolve(&self) -> Result<ResolvedStream> { Err(platforms::AdapterError::Offline.into()) }
+            fn observe(&self) -> Result<RoomObservation> { panic!("already classified by adapter") }
+        }
+        let resolver = BroadcastResolver::with_backend(Arc::new(Ended), None, Duration::ZERO, false);
+        let error = resolver.resolve().unwrap_err();
+        assert_eq!(error.downcast_ref::<ResolveUnavailable>().unwrap().0, "offline");
+    }
+
     #[test]
     fn known_offline_waits_but_unknown_keeps_error() {
         for state in [RoomState::Offline, RoomState::Replay, RoomState::Unknown] {

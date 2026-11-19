@@ -199,9 +199,9 @@ local last = nil          -- 基础标题（不含状态后缀）
 local suffix = ""         -- 状态后缀：[已下播] / [重连中]
 
 local function applyTitle()
-    if not last then return end
-    local full = last
-    if suffix ~= "" then full = last .. "  " .. suffix end
+    if not last and suffix == "" then return end
+    local full = last or readText(baseFile, 512) or "直播间"
+    if suffix ~= "" then full = full .. "  " .. suffix end
     if mp.get_property("title") ~= full then mp.set_property("title", full) end
 end
 
@@ -258,7 +258,10 @@ mp.add_periodic_timer(2, function()
         applyTitle()
         if text then
             mp.osd_message(text, 8)
-        elseif notice then
+        elseif notice and (room == "LIVE" or relay == "ONLINE")
+                and not mp.get_property_native("core-idle")
+                and not mp.get_property_native("paused-for-cache")
+                and not mp.get_property_native("eof-reached") then
             mp.osd_message("已恢复播放", 4)
         end
         notice = text

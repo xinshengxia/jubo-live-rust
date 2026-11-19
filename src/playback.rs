@@ -45,10 +45,10 @@ const TITLE_HINT_DIR: &str = "live-hub-rust-title";
 const TITLE_HINT_MAX_CHARS: usize = 512;
 /// Prune abandoned hint directories once they reach this age.
 const TITLE_HINT_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
-/// The legacy launcher's Bilibili --watch child polled the room every 10 seconds.
-const BILI_ROOM_STATE_POLL: Duration = Duration::from_secs(10);
+/// Direct streams and relays that have stopped delivering media need room status.
+const ROOM_STATE_POLL: Duration = Duration::from_secs(10);
 /// Failed room checks back off instead of hammering a rate-limited platform.
-const BILI_ROOM_STATE_MAX_BACKOFF: Duration = Duration::from_secs(60);
+const ROOM_STATE_MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// How often the room watcher re-checks its stop flag while sleeping.
 const ROOM_STATE_STOP_CHECK: Duration = Duration::from_millis(250);
 
@@ -500,6 +500,33 @@ fn resolve_until_ready(
                     }
                 }
             }
+            Err(error) if matches!(error.downcast_ref::<platforms::AdapterError>(),
+                None | Some(platforms::AdapterError::InvalidResponse(_) | platforms::AdapterError::Transport)) => {
+                // Some platforms report only "no media" from their playback
+                // endpoint. Only the independent official room status may turn
+                // this into an offline notice; keep unknown and live failures.
+                let worker = room.clone();
+                let checked = cancellable_request(control, move || worker());
+                match checked {
+                    Ok(observation) if observation.state == RoomState::Offline => {
+                        notify(observer, PlaybackEvent::RoomObserved {
+                            state: observation.state, title: observation.title, note: observation.note,
+                        });
+                        if !wait_for_live {
+                            return Err(platforms::AdapterError::Offline.into());
+                        }
+                        notify(observer, PlaybackEvent::WaitingForLive {
+                            note: "平台已确认下播，等待重新开播；可随时取消".into(),
+                        });
+                        cancellable_delay(control, retry)?;
+                    }
+                    Ok(observation) if observation.state == RoomState::Replay => {
+                        return Err(error).context("平台显示重播，暂未取得可播放媒体");
+                    }
+                    Err(cancelled) if cancelled.downcast_ref::<LaunchCancelled>().is_some() => return Err(cancelled),
+                    _ => return Err(error),
+                }
+            }
             Err(error) => return Err(error),
         }
     }
@@ -593,6 +620,7 @@ pub fn plan_with_preferences(
                 [
                     "--force-window=immediate",
                     "--keep-open=yes",
+                    "--keep-open-pause=no",
                     "--load-scripts=no",
                     "--ytdl=no",
                     "--hwdec=auto-safe",
@@ -1228,6 +1256,8 @@ pub struct HintSpec<'a> {
     pub media: &'a str,
     /// True when the player reads from the loopback relay.
     pub relay: bool,
+    /// Whether this relayed session actually waits for the next broadcast.
+    pub wait_for_live: bool,
     /// Nominal bitrate from the platform response (Douyu multirates).
     pub bitrate_kbps: Option<u32>,
     /// Room observation collected while resolving: authoritative media title
@@ -1243,6 +1273,7 @@ impl<'a> HintSpec<'a> {
             base,
             media,
             relay: false,
+            wait_for_live: true,
             bitrate_kbps: None,
             room_observation: None,
         }
@@ -1255,6 +1286,10 @@ struct HintState {
     platform: Platform,
     media: Mutex<String>,
     state: Mutex<String>,
+    wait_for_live: bool,
+    /// Progress, not the mere existence of a stream, suppresses redundant room probes.
+    last_media: Mutex<Option<(u64, Instant)>>,
+    last_relay_hint: Mutex<Option<&'static str>>,
     bitrate: Mutex<Option<u32>>,
     estimator: Mutex<BitrateEstimator>,
     last_sample: Mutex<Option<Instant>>,
@@ -1307,18 +1342,17 @@ impl SessionHints {
         } else {
             fallback.base
         };
-        let initial_state = spec
-            .room_observation
-            .map(|observation| room_state_hint_text(spec.platform, observation.state));
+        let initial_state = room_state_hint_text(
+            spec.platform,
+            spec.room_observation.map_or(RoomState::Unknown, |observation| observation.state),
+        );
         let initial_bitrate = spec.bitrate_kbps.filter(|kbps| *kbps > 0);
         write_hint(&paths.base, &base_title);
         write_hint(&paths.media, &media);
         if let Some(kbps) = initial_bitrate {
             write_hint(&paths.bitrate, &kbps.to_string());
         }
-        if let Some(state) = initial_state.as_deref() {
-            write_hint(&paths.state, state);
-        }
+        write_hint(&paths.state, &initial_state);
         if let Some(relay) = paths.relay.as_deref() {
             write_hint(relay, "");
         }
@@ -1327,7 +1361,10 @@ impl SessionHints {
             lease: Some(lease),
             platform: spec.platform,
             media: Mutex::new(media),
-            state: Mutex::new(initial_state.unwrap_or_default()),
+            state: Mutex::new(initial_state),
+            wait_for_live: spec.wait_for_live,
+            last_media: Mutex::new(None),
+            last_relay_hint: Mutex::new(None),
             bitrate: Mutex::new(initial_bitrate),
             estimator: Mutex::new(BitrateEstimator::default()),
             last_sample: Mutex::new(None),
@@ -1355,7 +1392,9 @@ impl SessionHints {
         arguments.push(format!("--script-opts-append=live_title_state_file={state}").into());
         if let Some(relay) = self.0.paths.relay.as_deref().and_then(mpv_option_path) {
             arguments.push(format!("--script-opts-append=live_title_relay_file={relay}").into());
-            arguments.push("--script-opts-append=live_title_autoreplay=yes".into());
+            if self.0.wait_for_live {
+                arguments.push("--script-opts-append=live_title_autoreplay=yes".into());
+            }
             if let Some(bitrate) = mpv_option_path(&self.0.paths.bitrate) {
                 arguments
                     .push(format!("--script-opts-append=live_title_bitrate_file={bitrate}").into());
@@ -1390,7 +1429,7 @@ impl SessionHints {
     pub fn observe_at(&self, event: &PlaybackEvent, at: Instant) {
         match event {
             PlaybackEvent::RelayStatistics { telemetry } => self.observe_relay(telemetry, at),
-            PlaybackEvent::RelayExited { .. } => self.write_relay("RECONNECTING"),
+            PlaybackEvent::RelayExited { .. } => self.relay_unavailable(),
             PlaybackEvent::RoomObserved { state, title, .. } => {
                 self.write_state(&room_state_hint_text(self.0.platform, *state));
                 if let Some(title) = title {
@@ -1407,6 +1446,15 @@ impl SessionHints {
     /// Write the authoritative room state / title learned by a room observation.
     pub fn observe_room(&self, observation: &RoomObservation) {
         self.write_state(&room_state_hint_text(self.0.platform, observation.state));
+        // Completed connections remain in relay statistics. A newer official
+        // room check must be able to clear their old offline/replay banner.
+        if matches!(observation.state, RoomState::Live | RoomState::Replay) {
+            let previous = self.0.last_relay_hint.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(*previous, Some("OFFLINE")) ||
+                (observation.state == RoomState::Live && previous.is_some_and(|s| s.starts_with("REPLAY-UNAVAILABLE"))) {
+                self.write_relay("RECONNECTING");
+            }
+        }
         if let Some(title) = observation.title.as_deref() {
             let title = sanitize_title_text(title);
             if !title.is_empty() {
@@ -1419,20 +1467,32 @@ impl SessionHints {
         if self.0.paths.relay.is_none() {
             return;
         }
-        if let Some(text) = relay_hint(telemetry) {
-            self.write_relay(text);
-        }
-        // A positively confirmed room state is usable even without a Bili watcher.
-        match telemetry.waiting_state.as_deref() {
-            Some("offline") => {
-                self.write_state(&room_state_hint_text(self.0.platform, RoomState::Offline))
+        {
+            let next = relay_hint(telemetry);
+            let mut previous = self.0.last_relay_hint.lock().unwrap_or_else(|e| e.into_inner());
+            if next != *previous {
+                *previous = next;
+                if let Some(text) = next {
+                    self.write_relay(text);
+                }
+                match telemetry.waiting_state.as_deref() {
+                    Some("offline") => self.write_state(&room_state_hint_text(self.0.platform, RoomState::Offline)),
+                    Some("replay_unavailable") => self.write_state(&room_state_hint_text(self.0.platform, RoomState::Replay)),
+                    _ => {}
+                }
             }
-            Some("replay_unavailable") => {
-                self.write_state(&room_state_hint_text(self.0.platform, RoomState::Replay))
-            }
-            _ => {}
         }
-        if telemetry.state == "streaming" {
+        let progress = if telemetry.state == "streaming" && telemetry.forwarded_bytes > 0 {
+            let mut last = self.0.last_media.lock().unwrap_or_else(|e| e.into_inner());
+            let advances = last.is_none_or(|(bytes, _)| telemetry.forwarded_bytes > bytes);
+            if advances {
+                *last = Some((telemetry.forwarded_bytes, at));
+            }
+            advances
+        } else {
+            false
+        };
+        if progress {
             let resumed = {
                 self.0
                     .state
@@ -1476,6 +1536,11 @@ impl SessionHints {
         if let Some(kbps) = measured {
             self.fill_bitrate(kbps);
         }
+    }
+
+    fn relay_has_recent_media(&self, now: Instant) -> bool {
+        self.0.last_media.lock().unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|(_, at)| now.saturating_duration_since(at) < ROOM_STATE_POLL)
     }
 
     fn write_media(&self, text: &str) {
@@ -1539,6 +1604,11 @@ impl SessionHints {
         if let Some(path) = self.0.paths.relay.as_deref() {
             write_hint(path, text);
         }
+    }
+
+    fn relay_unavailable(&self) {
+        *self.0.last_relay_hint.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.write_relay("RECONNECTING");
     }
 }
 
@@ -1605,10 +1675,8 @@ fn hint_lease(directory: &Path) -> Result<fs::File> {
     Ok(lease)
 }
 
-/// Bilibili has no relay to report the room state, so the legacy launcher ran a
-/// --watch child that polled the room every 10 seconds and wrote the state hint.
-/// The Rust launcher keeps that watcher inside the playback supervisor: one thread
-/// per launch, stopped with the player, with exponential backoff on errors.
+/// One watcher per monitored player. A healthy relay already supplies telemetry;
+/// room checks resume when that relay stops forwarding or when playing directly.
 struct RoomWatch {
     target: Target,
     vault: Option<CookieVault>,
@@ -1631,8 +1699,12 @@ struct HintFollower {
     player_pid: u32,
     relay: Option<String>,
     monitor: bool,
+    #[serde(default = "default_wait_for_live")]
+    wait_for_live: bool,
     vault: Option<PathBuf>,
 }
+
+fn default_wait_for_live() -> bool { true }
 
 impl HintFollower {
     fn follow(self) -> Result<()> {
@@ -1665,10 +1737,11 @@ impl HintFollower {
             lease: Some(lease),
             platform: self.target.platform,
             media: Mutex::new(media), state: Mutex::new(state), bitrate: Mutex::new(bitrate),
+            wait_for_live: self.wait_for_live, last_media: Mutex::new(None), last_relay_hint: Mutex::new(None),
             estimator: Mutex::new(BitrateEstimator::default()), last_sample: Mutex::new(None),
         }));
         let stop = Arc::new(AtomicBool::new(false));
-        if self.monitor && self.target.platform == Platform::Bili {
+        if self.monitor {
             let vault = self.vault.map(CookieVault::open).transpose()?;
             let watch = RoomWatch { target: self.target, vault, yt_dlp: None, monitor: true };
             spawn_room_state_watcher(hints.clone(), watch, stop.clone());
@@ -1677,7 +1750,7 @@ impl HintFollower {
             if let Some(url) = &self.relay {
                 match crate::relay::query_statistics(url) {
                     Ok(stats) => hints.observe_relay(&RelayTelemetry::from_statistics(&stats), Instant::now()),
-                    Err(_) => hints.write_relay("RECONNECTING"),
+                    Err(_) => hints.relay_unavailable(),
                 }
             }
             let next = Instant::now() + Duration::from_secs(2);
@@ -1696,7 +1769,7 @@ impl HintFollower {
         let name = hints.paths().directory.file_name().and_then(|v| v.to_str()).context("invalid hint directory")?;
         let request = Self {
             target: watch.target.clone(), session: name.to_owned(),
-            owner_pid: std::process::id(), player_pid, relay, monitor: watch.monitor,
+            owner_pid: std::process::id(), player_pid, relay, monitor: watch.monitor, wait_for_live: hints.0.wait_for_live,
             vault: watch.vault.as_ref().map(|v| v.root().to_owned()),
         };
         let bytes = serde_json::to_vec(&request)?;
@@ -1748,17 +1821,22 @@ fn spawn_room_state_watcher(hints: SessionHints, watch: RoomWatch, stop: Arc<Ato
     let _ = thread::Builder::new()
         .name("playback-room-state".into())
         .spawn(move || {
-            let mut interval = BILI_ROOM_STATE_POLL;
+            let mut interval = ROOM_STATE_POLL;
             loop {
                 if stop.load(Ordering::Acquire) {
                     return;
                 }
-                match crate::room_state::check(&watch.target, watch.vault.as_ref()) {
-                    Ok(observation) => {
-                        hints.observe_room(&observation);
-                        interval = BILI_ROOM_STATE_POLL;
-                    }
-                    Err(_) => interval = (interval * 2).min(BILI_ROOM_STATE_MAX_BACKOFF),
+                if hints.relay_has_recent_media(Instant::now()) {
+                    interval = ROOM_STATE_POLL;
+                } else {
+                    let observation = crate::room_state::check(&watch.target, watch.vault.as_ref())
+                        .unwrap_or_else(|_| RoomObservation::unknown("房间状态暂未确认"));
+                    hints.observe_room(&observation);
+                    interval = if observation.state == RoomState::Unknown {
+                        (interval * 2).min(ROOM_STATE_MAX_BACKOFF)
+                    } else {
+                        ROOM_STATE_POLL
+                    };
                 }
                 let deadline = Instant::now() + interval;
                 while Instant::now() < deadline {
@@ -2020,6 +2098,7 @@ where
                 base: &base,
                 media: &media,
                 relay: relayed,
+                wait_for_live: preferences.wait_for_live,
                 bitrate_kbps: stream_hints.bitrate_kbps,
                 room_observation: initial_room.as_ref(),
             })
@@ -2081,7 +2160,7 @@ where
     let title = resolved.title.clone();
     let telemetry_url = relay.is_some().then(|| playable.url.clone());
     if let (Some(hints), Some(watch)) = (&title_hints, &room_watch)
-        && (telemetry_url.is_some() || (watch.monitor && target.platform == Platform::Bili))
+        && (telemetry_url.is_some() || watch.monitor)
         && let Err(error) = HintFollower::start(hints, watch, player_pid, telemetry_url.clone())
     {
         crate::diag::log("playback", crate::diag::Level::Warn, &format!("mpv hint follower failed to start: {error}"));
@@ -2116,13 +2195,11 @@ where
                 }
                 return;
             }
-            // Bilibili has no relay, so its state hint comes from a bounded room
-            // watcher (the legacy launcher's --watch child). It lives exactly as
-            // long as this supervisor and stops with the player; no second watcher
-            // is ever registered for the same session.
+            // The helper takes over after this launcher's exit. Until then the
+            // supervisor owns the single room watcher and its stop flag.
             let room_watch_stop = Arc::new(AtomicBool::new(false));
             if let (Some(hints), Some(watch)) = (supervisor_hints, room_watch)
-                && watch.monitor && watch.target.platform == Platform::Bili
+                && watch.monitor
             {
                 spawn_room_state_watcher(hints, watch, Arc::clone(&room_watch_stop));
             }
@@ -2269,9 +2346,7 @@ pub fn launch_controlled(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .take();
-    // Bilibili has no relay, so the legacy launcher relied on its --watch child for
-    // the room state hint. Relay platforms report their state through the relay
-    // hint file instead.
+    // Use the same target and vault when probing the room after a stalled relay.
     let room_watch = Some(RoomWatch {
         target: target.clone(),
         vault: vault.cloned(),
@@ -2533,6 +2608,7 @@ mod tests {
                 base: "主播 \"标题\" & 测试\n尾部 - 直播间",
                 media: "直播间",
                 relay: true,
+                wait_for_live: true,
                 bitrate_kbps: Some(4000),
                 room_observation: None,
             },
@@ -2615,6 +2691,7 @@ mod tests {
                 base: &long,
                 media: &long,
                 relay: false,
+                wait_for_live: true,
                 bitrate_kbps: None,
                 room_observation: None,
             },
@@ -2671,6 +2748,7 @@ mod tests {
                 base: "合成直播",
                 media: "合成直播",
                 relay: true,
+                wait_for_live: true,
                 bitrate_kbps: None,
                 room_observation: None,
             },
@@ -3165,6 +3243,21 @@ mod tests {
             error.downcast_ref::<platforms::AdapterError>(),
             Some(&platforms::AdapterError::VerificationRequired)
         );
+    }
+
+    #[test]
+    fn ambiguous_media_errors_require_independent_offline_confirmation() {
+        for state in [RoomState::Offline, RoomState::Unknown, RoomState::Live, RoomState::Replay] {
+            let lookup: StreamLookup = Arc::new(|| anyhow::bail!("synthetic empty media list"));
+            let room: RoomLookup = Arc::new(move || Ok(RoomObservation {
+                state, title: None, note: String::new(),
+            }));
+            let observer: PlaybackObserver = Arc::new(|_| {});
+            let error = resolve_until_ready(&PlaybackControl::default(), &observer, false, lookup, room, Duration::ZERO)
+                .unwrap_err();
+            assert_eq!(error.downcast_ref::<platforms::AdapterError>() == Some(&platforms::AdapterError::Offline),
+                       state == RoomState::Offline);
+        }
     }
 
     #[test]

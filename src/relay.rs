@@ -277,6 +277,14 @@ impl std::fmt::Display for ResolveWaiting {
 }
 impl std::error::Error for ResolveWaiting {}
 
+/// A confirmed unavailable broadcast with "wait for live" disabled.
+#[derive(Debug)]
+pub struct ResolveUnavailable(pub(crate) &'static str);
+impl std::fmt::Display for ResolveUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.0) }
+}
+impl std::error::Error for ResolveUnavailable {}
+
 /// FLV onMetaData summary of the forwarded stream. The legacy launcher probed
 /// the upstream file for the same values before starting mpv; the relay already
 /// reads every tag, so the launch-time title hints need no extra connection.
@@ -671,9 +679,9 @@ impl Drop for StreamStatistics {
             stats.active_streams = stats.active_streams.saturating_sub(1);
             if record.state.active() {
                 record.state = RelayConnectionState::Ended;
+                record.waiting_state = None;
                 closed_active = true;
             }
-            record.waiting_state = None;
         });
         if closed_active {
             self.log(diag::Level::Info, format!("connection #{} closed", self.id));
@@ -2185,6 +2193,15 @@ fn pump(
             let resolved = match resolve_while_player_connected(Arc::clone(resolver), stream) {
                 ResolveAttempt::Resolved(resolved) => resolved,
                 ResolveAttempt::Failed(error) => {
+                    if let Some(confirmed) = error.downcast_ref::<ResolveUnavailable>() {
+                        statistics.update(|_, record| {
+                            record.state = RelayConnectionState::Ended;
+                            record.waiting_state = Some(confirmed.0.to_owned());
+                            record.last_error = None;
+                        });
+                        statistics.log(diag::Level::Info, format!("confirmed {}: stream ended", confirmed.0));
+                        return Ok(());
+                    }
                     if let Some(waiting) = error.downcast_ref::<ResolveWaiting>() {
                         if matches!(
                             waiting.state.as_str(),

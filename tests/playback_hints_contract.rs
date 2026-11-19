@@ -30,6 +30,7 @@ fn prepare(
             base,
             media,
             relay,
+            wait_for_live: true,
             bitrate_kbps,
             room_observation: None,
         },
@@ -227,9 +228,25 @@ fn synthetic_relay_sequence_updates_relay_and_state_hints() {
     assert_eq!(read(&relay), "OFFLINE");
     assert_eq!(read(&state), "OFFLINE");
 
+    // A freshly confirmed live room can override a *completed* connection's
+    // last offline status; polling the same historical record cannot undo it.
+    hints.observe_room(&RoomObservation { state: RoomState::Live, title: None, note: String::new() });
+    assert_eq!(read(&relay), "RECONNECTING");
+    let mut historical = telemetry("ended", 0);
+    historical.waiting_state = Some("offline".into());
+    observe(historical, 5);
+    assert_eq!(read(&state), "LIVE");
+    assert_eq!(read(&relay), "RECONNECTING");
+    observe(telemetry("connecting", 0), 5);
+    let mut offline = telemetry("waiting", 0);
+    offline.waiting_state = Some("offline".into());
+    observe(offline, 5);
+
     // Media for the same room starts flowing again: the room-state file may say
     // LIVE now (the relay confirmed the room is broadcasting).
-    observe(telemetry("streaming", 0), 6);
+    observe(telemetry("streaming", 0), 5);
+    assert_eq!(read(&state), "OFFLINE", "stale streaming status without bytes is not live evidence");
+    observe(telemetry("streaming", 1000), 6);
     assert_eq!(read(&relay), "ONLINE");
     assert_eq!(read(&state), "LIVE");
 
@@ -357,6 +374,7 @@ fn room_observations_update_state_and_media_hints() {
             base: "主播 - 旧标题",
             media: "旧标题",
             relay: true,
+            wait_for_live: true,
             bitrate_kbps: None,
             room_observation: Some(&observation),
         },
@@ -434,7 +452,7 @@ fn a_new_session_never_inherits_previous_hints() {
     );
     assert_ne!(second.paths().directory, first_directory);
     assert_eq!(read(second.paths().relay.as_ref().unwrap()), "");
-    assert!(!second.paths().state.exists(), "no stale room state");
+    assert!(read(&second.paths().state).starts_with("UNKNOWN|"), "new session must have no stale room state");
     assert_eq!(read(&second.paths().base), "主播 - 新标题");
 }
 

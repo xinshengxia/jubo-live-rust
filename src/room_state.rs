@@ -132,7 +132,10 @@ pub fn parse_douyin_page(page: &str) -> RoomObservation {
             .unwrap_or_else(|| vec![&root]);
         for entry in entries {
             if let Some(room) = entry.pointer("/state/roomStore/roomInfo/room").filter(|value| value.is_object()) {
-                return parse_douyin_room(room);
+                let observation = parse_douyin_room(room);
+                if observation.state != RoomState::Unknown {
+                    return observation;
+                }
             }
         }
     }
