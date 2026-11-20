@@ -590,6 +590,13 @@ pub(super) fn field_label(ui: &mut Ui, rect: Rect, label: &str, scope: Option<&s
     }
 }
 
+fn fresh_enter(input: &egui::InputState) -> bool {
+    input.events.iter().any(|event| matches!(event,
+        egui::Event::Key { key: egui::Key::Enter, pressed: true, repeat: false, modifiers, .. }
+        if !modifiers.command && !modifiers.alt && !modifiers.ctrl
+    ))
+}
+
 /// Single-line text input in the original ModernInput style: card fill, 5px
 /// radius, border (accent while focused), 8px inner padding.
 pub(super) fn input(
@@ -599,9 +606,11 @@ pub(super) fn input(
     hint_text: &str,
     pal: &Pal,
 ) -> Response {
-    let id = ui
-        .id()
-        .with(("wb-input", rect.left() as i32, rect.top() as i32));
+    workbench_input(ui, rect, text, hint_text, pal, false)
+}
+
+fn workbench_input(ui: &mut Ui, rect: Rect, text: &mut String, hint_text: &str, pal: &Pal, keep_focus: bool) -> Response {
+    let id = ui.next_auto_id().with(("wb-input", hint_text));
     let inner = rect.shrink2(vec2(8.0, 2.0));
     // The surface and border are painted before the text widget so the text
     // (including the placeholder) stays visible.
@@ -611,9 +620,10 @@ pub(super) fn input(
             .max_rect(inner)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
+    let edit = egui::TextEdit::singleline(text);
+    let edit = if keep_focus { edit.return_key(None) } else { edit };
     let response = child.add(
-        egui::TextEdit::singleline(text)
-            .id(id)
+        edit.id(id)
             .frame(false)
             .hint_text(hint_text)
             .font(font(12.0))

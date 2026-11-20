@@ -117,6 +117,50 @@ fn response(mut stream: TcpStream) -> (String, Vec<u8>) {
 }
 
 #[test]
+fn confirmed_offline_reconnects_skip_upstream_until_a_new_session() {
+    use live_hub_rust::{
+        broadcast::{BroadcastBackend, BroadcastResolver},
+        platforms::AdapterError,
+        room_state::RoomObservation,
+    };
+
+    #[derive(Default)]
+    struct OfflineBackend(AtomicUsize);
+    impl BroadcastBackend for OfflineBackend {
+        fn resolve(&self) -> Result<ResolvedStream> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(AdapterError::Offline.into())
+        }
+
+        fn observe(&self) -> Result<RoomObservation> {
+            panic!("explicit offline should not trigger an additional room query")
+        }
+    }
+
+    let backend = Arc::new(OfflineBackend::default());
+    for expected_calls in 1..=2 {
+        let resolver = BroadcastResolver::with_backend(backend.clone(), None, Duration::ZERO, false);
+        let mut cfg = config();
+        cfg.idle_timeout = Duration::from_secs(1);
+        let server = RelayServer::bind(cfg, Arc::new(resolver)).unwrap();
+        let address = server.local_addr().unwrap();
+        let worker = thread::spawn(move || server.run());
+        // Headers are sent before the first resolution. A confirmed offline ends its body.
+        let (first, body) = response(player(address, "synthetic-session"));
+        assert!(first.starts_with("HTTP/1.1 200"));
+        assert!(body.is_empty());
+        for _ in 0..23 {
+            let (status, body) = response(player(address, "synthetic-session"));
+            assert!(status.starts_with("HTTP/1.1 410 Gone"), "{status}");
+            assert!(body.is_empty());
+        }
+        assert!(response(player(address, "wrong-token")).0.starts_with("HTTP/1.1 403"));
+        assert_eq!(backend.0.load(Ordering::SeqCst), expected_calls);
+        worker.join().unwrap().unwrap();
+    }
+}
+
+#[test]
 fn binds_zero_port_rejects_public_bind_and_connection_budget_above_eight() {
     let resolver = Arc::new(|| -> Result<ResolvedStream> { anyhow::bail!("synthetic offline") });
     let mut cfg = config();

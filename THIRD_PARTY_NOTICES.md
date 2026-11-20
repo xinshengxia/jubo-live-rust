@@ -8,6 +8,8 @@
 
 主要直接依赖为 anyhow、base64、chrono、clap、eframe/egui、flate2、fs2、image、md5、qrcode、reqwest、serde、serde_json、tempfile、tungstenite、url、uuid，以及 Windows 目标下的 windows-sys。具体采用版本及完整传递依赖以 Cargo.lock 和收集清单为准，不以本文的概括替代其原文。
 
+Windows 输入法适配基于 egui-winit 0.33.3，修改位于 vendor/egui-winit/src/lib.rs。该目录附上游 MIT 与 Apache-2.0 许可原文。处理候选键及其释放的依据见 [egui-winit 0.34.2](https://github.com/emilk/egui/blob/0.34.2/crates/egui-winit/src/lib.rs)。
+
 ## 平台协议与算法
 
 - **Streamlink**：虎牙 anti-code / 斗鱼取流签名流程参考及适配。上游为 [streamlink/streamlink](https://github.com/streamlink/streamlink)，核对快照 `0045aae912972122b8a9c81cc4a0056d93b986c2`，BSD-2-Clause；版权 Christopher Rosell 与 Streamlink Team。见 licenses/streamlink-LICENSE.txt，适配范围为 src/platforms.rs。未携带 Python 运行时或 Streamlink 程序。

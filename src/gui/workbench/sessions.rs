@@ -75,9 +75,13 @@ impl Launcher {
                         relay.state, relay.active_streams, relay.total_streams, relay.reconnects, relay.failures, relay.consecutive_failures,
                         relay.stable_segments, relay.forwarded_tags, relay.forwarded_bytes, relay.budget_exhaustions));
                     ui.label(sync_diagnostics(relay));
+                    if session.player == crate::core::Player::PotPlayer {
+                        ui.small("播放器画面进度未知。若画面持续定格，可选中此房间并点“一次重新同步”。");
+                    }
                     ui.small("时钟差来自中继最新音视频包的时间戳，不是实际扬声器与屏幕的同步测量。标记异常后再重新同步，可保留故障当时的计数。");
                     if let Some(waiting) = &relay.waiting_state {
                         let label = match waiting.as_str() {
+                            "offline" if relay.state == "ended" => "已确认下播",
                             "offline" => "等待主播重新开播",
                             "replay_unavailable" => "重播暂不可取流",
                             "verification" => "请到账号页完成抖音网页验证",

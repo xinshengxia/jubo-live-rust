@@ -2744,7 +2744,11 @@ pub fn parse_huya_candidates(
     let first = root["data"]
         .as_array()
         .and_then(|items| items.first())
-        .ok_or(AdapterError::Offline)?;
+        .ok_or_else(|| match huya_page_state(page) {
+            crate::room_state::RoomState::Offline => AdapterError::Offline,
+            crate::room_state::RoomState::Replay => AdapterError::ReplayUnavailable,
+            _ => AdapterError::InvalidResponse("虎牙未返回流列表，房态待确认"),
+        })?;
     let mut rates: Vec<u64> = first["vMultiStreamInfo"]
         .as_array()
         .into_iter()
@@ -4994,6 +4998,16 @@ pub fn avatar_url(target: &Target) -> Option<String> {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+
+    #[test]
+    fn empty_huya_stream_data_needs_an_explicit_offline_marker() {
+        let page = r#"hyPlayerConfig = { stream: {"data":[]} }"#;
+        for (marker, offline) in [("", false), ("liveStatus-on", false), ("liveStatus-off", true)] {
+            let html = format!(r#"<div class="{marker}"></div>{page}"#);
+            let error = parse_huya_candidates(&html, &Quality::Best, 0, 1).unwrap_err();
+            assert_eq!(matches!(error.downcast_ref::<AdapterError>(), Some(AdapterError::Offline)), offline);
+        }
+    }
 
     #[test]
     fn bili_uid_binding_checks_canonical_room_alias_and_owner_identity() {

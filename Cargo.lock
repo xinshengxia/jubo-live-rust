@@ -710,8 +710,6 @@ dependencies = [
 [[package]]
 name = "egui-winit"
 version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec6687e5bb551702f4ad10ac428bab12acf9d53047ebb1082d4a0ed8c6251a29"
 dependencies = [
  "arboard",
  "bytemuck",
@@ -1527,7 +1525,7 @@ checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
 
 [[package]]
 name = "live-hub-rust"
-version = "1.0.11"
+version = "1.0.12"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

@@ -871,7 +871,7 @@ enum Event {
     /// Result of one room-live badge query.
     Badge {
         key: String,
-        result: std::result::Result<crate::room_state::RoomState, String>,
+        result: std::result::Result<crate::room_state::RoomState, &'static str>,
     },
     /// A bounded 48px avatar decoded on the download worker, ready for upload.
     LookupAvatar {
@@ -930,6 +930,7 @@ struct Launcher {
     ai_action_pending: bool,
     /// "我的收藏" page: show the room-input format help dialog.
     format_help_open: bool,
+    lookup_more_open: bool,
     lookup_web_search_open: bool,
     /// Selected AI research source on the "查找主播" page.
     lookup_source: Option<usize>,
@@ -1059,6 +1060,7 @@ struct Launcher {
     search_alias: String,
     health_all_requested: bool,
     badges: BTreeMap<String, badges::Badge>,
+    badge_notes: BTreeMap<String, badges::BadgeNote>,
     badge_times: BTreeMap<String, u64>,
     badge_pending: BTreeSet<String>,
     /// Test seam: headless constructors keep this off so no platform request is
@@ -1124,6 +1126,7 @@ impl Launcher {
             ai_dialog_message: None,
             ai_action_pending: false,
             format_help_open: false,
+            lookup_more_open: false,
             lookup_web_search_open: false,
             lookup_source: None,
             lookup_filter: None,
@@ -1212,6 +1215,7 @@ impl Launcher {
             search_alias: String::new(),
             health_all_requested: false,
             badges: BTreeMap::new(),
+            badge_notes: BTreeMap::new(),
             badge_times: BTreeMap::new(),
             badge_pending: BTreeSet::new(),
             badge_networking: false,
@@ -4262,19 +4266,34 @@ mod tests {
         let target = Target::new(Platform::Huya, "196645").unwrap();
         let key = badges::room_key(&target);
         app.badge_pending.insert(key.clone());
+        assert_eq!(app.badge_label(&target), Some("查询中"));
         app.apply_badge_result(key.clone(), Ok(crate::room_state::RoomState::Replay));
         assert!(!app.badge_pending.contains(&key));
         assert_eq!(app.badges.get(&key), Some(&badges::Badge::Replay));
-        assert_eq!(app.badge_label(&target), Some("[重播] "));
+        assert_eq!(app.badge_label(&target), Some("重播中"));
         let other = Target::new(Platform::Bili, "1").unwrap();
         let other_key = badges::room_key(&other);
-        app.apply_badge_result(other_key.clone(), Err("synthetic failure".into()));
+        app.apply_badge_result(other_key.clone(), Err("网络请求失败"));
         assert_eq!(app.badges.get(&other_key), Some(&badges::Badge::Unknown));
-        assert!(app.badge_label(&other).is_none());
+        assert_eq!(app.badge_label(&other), Some("状态待确认"));
+        assert!(app.badge_notes.contains_key(&other_key));
+        assert_eq!(app.badge_label(&target), Some("重播中"));
         assert!(
             app.badge_times.contains_key(&other_key),
             "an unknown result must get the short retry timestamp"
         );
+        app.apply_badge_result(other_key.clone(), Ok(crate::room_state::RoomState::Live));
+        assert_eq!(app.badge_label(&other), Some("直播中"));
+        assert!(!app.badge_notes.contains_key(&other_key));
+        let confirmed_at = app.badge_times[&other_key];
+        for failure in [Ok(crate::room_state::RoomState::Unknown), Err("网络请求失败")] {
+            app.apply_badge_result(other_key.clone(), failure);
+            assert_eq!(app.badge_label(&other), Some("状态待确认"));
+            assert_eq!(
+                app.badge_notes[&other_key].last_confirmed,
+                Some((badges::Badge::Live, confirmed_at))
+            );
+        }
     }
 
     #[test]

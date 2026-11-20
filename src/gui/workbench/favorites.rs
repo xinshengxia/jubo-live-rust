@@ -204,6 +204,19 @@ impl Launcher {
             }
         }
 
+        if host.height() < 570.0 || host.width() < 810.0 {
+            let mut area = child(ui, host);
+            scroll_area(&mut area, "favorites-page", |ui| {
+                let page = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), host.height()));
+                let bottom = self.favorites_body(ui, page, context, pal, true);
+                ui.allocate_space(vec2(page.width(), bottom - page.top()));
+            });
+        } else {
+            self.favorites_body(ui, host, context, pal, false);
+        }
+    }
+
+    fn favorites_body(&mut self, ui: &mut Ui, host: Rect, context: &egui::Context, pal: &Pal, short: bool) -> f32 {
         let width = host.width();
         let height = host.height();
         let pad = 16.0;
@@ -306,12 +319,12 @@ impl Launcher {
             );
             y += 32.0 + 10.0;
         }
-        let input_response = input(
+        let input_response = workbench_input(
             ui,
             input_rect,
             &mut self.room_input,
             "输入房间号，或粘贴官方直播间链接",
-            pal,
+            pal, true,
         );
         if input_response.changed() {
             self.favorite_selected = None;
@@ -459,18 +472,35 @@ impl Launcher {
             launch_origin + vec2(pad, y),
             vec2((inner - 140.0).max(100.0), note_height),
         );
-        hint(
-            ui,
-            hint_rect,
-            "画质、缓冲、弹幕用于本次播放；SC 与画质增强保存为偏好。",
-            pal,
-        );
-        let settings_rect = Rect::from_min_size(
-            launch_origin + vec2(width - pad - 104.0, y + (note_height - 24.0) / 2.0),
-            vec2(104.0, 24.0),
-        );
-        if link(ui, settings_rect, "弹幕设置…", pal).clicked() {
-            self.show_page(Page::Danmaku);
+        if self.snapshot.settings.mpv.is_none() && self.snapshot.settings.potplayer.is_none() {
+            let browse = Rect::from_min_size(hint_rect.min, vec2(118.0, note_height));
+            let detect = browse.translate(vec2(126.0, 0.0));
+            if link(ui, browse, "选择播放器…", pal).clicked() {
+                self.show_page(Page::Players);
+            }
+            if link(ui, detect, "自动查找播放器", pal).clicked() {
+                self.show_page(Page::Players);
+                self.player_edit = Player::Mpv;
+                self.discover_tool(file_dialog::ToolKind::Mpv, context);
+                if self.tool_choices.is_empty() && !self.tool_setup_busy {
+                    self.player_edit = Player::PotPlayer;
+                    self.discover_tool(file_dialog::ToolKind::PotPlayer, context);
+                }
+            }
+        } else {
+            hint(
+                ui,
+                hint_rect,
+                "画质、缓冲、弹幕用于本次播放；SC 与画质增强保存为偏好。",
+                pal,
+            );
+            let settings_rect = Rect::from_min_size(
+                launch_origin + vec2(width - pad - 104.0, y + (note_height - 24.0) / 2.0),
+                vec2(104.0, 24.0),
+            );
+            if link(ui, settings_rect, "弹幕设置…", pal).clicked() {
+                self.show_page(Page::Danmaku);
+            }
         }
         let launch_bottom = y + note_height + 8.0;
         debug_assert!((launch_bottom - launch_height).abs() < 0.5);
@@ -642,15 +672,15 @@ impl Launcher {
         let two_rows = CARD_INSET * 2.0 + CARD_HEIGHT * 2.0 + CARD_GAP;
         let mut browser_height = CARD_INSET * 2.0 + CARD_HEIGHT;
         let available = height - y - 4.0 - hint_line - 4.0;
-        if available >= two_rows {
+        if short {
+            browser_height = available.clamp(96.0, 260.0);
+        } else if available >= two_rows {
             browser_height = available;
         }
         let browser_rect =
             Rect::from_min_size(host.min + vec2(0.0, y), vec2(browser_width, browser_height));
-        self.favorite_grid(ui, browser_rect, context, pal, &platform_favorites);
-        let hint_top = (browser_rect.bottom() + 4.0)
-            .min(host.bottom() - hint_line - 2.0)
-            .max(host.top());
+        self.favorite_grid(ui, browser_rect, context, pal, &platform_favorites, short);
+        let hint_top = browser_rect.bottom() + 4.0;
         let favorites_hint = Rect::from_min_size(
             host.min + vec2(0.0, hint_top - host.min.y),
             vec2(browser_width, hint_line),
@@ -677,7 +707,7 @@ impl Launcher {
         // Arrow keys move the card selection when the user is not typing.
         let (enter, shift, up, down, left, right, escape) = ui.input(|input| {
             (
-                input.key_pressed(egui::Key::Enter),
+                fresh_enter(input),
                 input.modifiers.shift,
                 input.key_pressed(egui::Key::ArrowUp),
                 input.key_pressed(egui::Key::ArrowDown),
@@ -693,7 +723,7 @@ impl Launcher {
         if escape && !confirm_open {
             self.favorite_selected = None;
         }
-        if enter && !popup_open && !confirm_open {
+        if enter && !popup_open && !confirm_open && (input_response.has_focus() || !context.wants_keyboard_input()) {
             if shift {
                 self.launch_with(Player::PotPlayer, context);
             } else {
@@ -705,7 +735,7 @@ impl Launcher {
             && !confirm_open
             && !platform_favorites.is_empty()
         {
-            let columns = if inner >= 660.0 {
+            let columns = if short { 1 } else if inner >= 660.0 {
                 3
             } else if inner >= 420.0 {
                 2
@@ -735,6 +765,7 @@ impl Launcher {
                 self.fill_room(&name, &target);
             }
         }
+        home_rect.bottom().max(favorites_hint.bottom())
     }
 
     /// 3-column card grid (WorkbenchRoomBrowser with Cards=true).
@@ -745,6 +776,7 @@ impl Launcher {
         context: &egui::Context,
         pal: &Pal,
         favorites: &[(usize, String, Target)],
+        compact_rows: bool,
     ) {
         let painter = ui.painter();
         rounded(painter, rect, 0.0, pal.surface);
@@ -756,6 +788,21 @@ impl Launcher {
             let inset = CARD_INSET;
             let gap = CARD_GAP;
             let available = (client_width - inset * 2.0).max(1.0);
+            if compact_rows && !favorites.is_empty() {
+                for (index, name, target) in favorites {
+                    ui.push_id(*index, |ui| ui.horizontal(|ui| {
+                        let selected = self.favorite_selected == Some(*index);
+                        let response = ui.add_sized([available - 154.0, 32.0],
+                            egui::Button::selectable(selected, format!("{}  {}", name, self.badge_label(target).unwrap_or(""))).truncate());
+                        if let Some(note) = self.badge_notes.get(&crate::gui::badges::room_key(target)) { note.show(&response); }
+                        if response.clicked() { self.favorite_selected = Some(*index); self.fill_room(name, target); }
+                        let mpv = ui.button("mpv");
+                        if mpv.clicked() || response.double_clicked() { action = Some((*index, false)); }
+                        if ui.button("PotPlayer").clicked() { action = Some((*index, true)); }
+                    }));
+                }
+                return;
+            }
             let columns = if available >= 660.0 {
                 3
             } else if available >= 420.0 {
@@ -795,6 +842,9 @@ impl Launcher {
                 let response = ui.interact(card, id, Sense::click());
                 let selected = self.favorite_selected == Some(*favorite_index);
                 let badge = self.badge_label(target);
+                if let Some(note) = self.badge_notes.get(&crate::gui::badges::room_key(target)) {
+                    note.show(&response);
+                }
                 let texture = self.avatar_texture(ui.ctx(), target.platform, &target.room);
                 self.paint_room_card(
                     ui,
@@ -975,7 +1025,7 @@ impl Launcher {
             let live = matches!(state, "[播]" | "直播中");
             let text = match state {
                 "[播]" => "直播中",
-                "[休]" => "已下播",
+                "[休]" | "未开播" => "已下播",
                 "[重播]" => "重播中",
                 other => other,
             };

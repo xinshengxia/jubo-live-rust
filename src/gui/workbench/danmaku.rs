@@ -33,8 +33,6 @@ const CARD_HEAD_TOP: f32 = 12.0;
 const FORM_TOP: f32 = 42.0;
 const ROW_PITCH: f32 = 72.0;
 const FIELD_W: f32 = 484.0;
-/// Column delta between the two form columns (left label x = card+16, right = +514).
-const COL_DX: f32 = 498.0;
 const DROPDOWN_H: f32 = 25.0;
 const ACTION_H: f32 = 32.0;
 const ACTION_GAP: f32 = 10.0;
@@ -418,18 +416,23 @@ fn danmaku_heading(ui: &Ui, card: Rect, text: &str, pal: &Pal) {
 
 /// Label rect (h 22) and dropdown rect (h 25) for one form cell.
 fn form_slot(card: Rect, column: usize, row: usize) -> (Rect, Rect) {
-    let x = card.left() + CARD_PAD + column as f32 * COL_DX;
+    let narrow = card.width() < 720.0;
+    let field_width = if narrow { card.width() - 2.0 * CARD_PAD }
+        else { ((card.width() - 2.0 * CARD_PAD - 14.0) / 2.0).min(FIELD_W) };
+    let x = card.left() + CARD_PAD + if narrow { 0.0 } else { column as f32 * (field_width + 14.0) };
+    let row = if narrow { 2 * row + column } else { row };
     let y = card.top() + FORM_TOP + row as f32 * ROW_PITCH;
     (
-        Rect::from_min_size(pos2(x, y), vec2(FIELD_W, 22.0)),
-        Rect::from_min_size(pos2(x, y + 37.0), vec2(FIELD_W, DROPDOWN_H)),
+        Rect::from_min_size(pos2(x, y), vec2(field_width, 22.0)),
+        Rect::from_min_size(pos2(x, y + 37.0), vec2(field_width, DROPDOWN_H)),
     )
 }
 
 fn check_slot(card: Rect, column: usize, row: usize) -> Rect {
-    let x = card.left() + CARD_PAD + column as f32 * CHECK_COL_DX;
+    let step = CHECK_COL_DX.min((card.width() - CARD_PAD * 2.0) / 2.0);
+    let x = card.left() + CARD_PAD + column as f32 * step;
     let y = card.top() + CHECK_TOP + row as f32 * CHECK_PITCH;
-    Rect::from_min_size(pos2(x, y), vec2(FIELD_W.min(480.0), CHECK_H))
+    Rect::from_min_size(pos2(x, y), vec2(step - 8.0, CHECK_H))
 }
 
 /// Maximum rule lines one settings list may contain (DanmakuBehavior::validate
@@ -487,7 +490,8 @@ impl Launcher {
         available_h: f32,
         pal: &Pal,
     ) -> f32 {
-        let card_h = available_h.max(462.0);
+        let rows = if width < 720.0 { 10.0 } else { 5.0 };
+        let card_h = available_h.max(FORM_TOP + rows * ROW_PITCH + CARD_PAD);
         let card = Rect::from_min_size(origin, vec2(width, card_h));
         danmaku_card(ui, card, pal);
         danmaku_heading(ui, card, "显示与内容", pal);
@@ -632,7 +636,8 @@ impl Launcher {
 
     /// Tab 2: SC 醒目留言.
     fn danmaku_tab_sc(&mut self, ui: &mut Ui, origin: Pos2, width: f32, pal: &Pal) -> f32 {
-        let card_h = 292.0;
+        let rows = if width < 720.0 { 7.0 } else { 4.0 };
+        let card_h = FORM_TOP + rows * ROW_PITCH + 36.0;
         let card = Rect::from_min_size(origin, vec2(width, card_h));
         danmaku_card(ui, card, pal);
         danmaku_heading(ui, card, "SC 醒目留言", pal);
@@ -724,7 +729,7 @@ impl Launcher {
         let hint_rect = Rect::from_min_size(
             pos2(
                 card.left() + CARD_PAD,
-                card.top() + FORM_TOP + ROW_PITCH * 4.0 + 2.0,
+                card.top() + FORM_TOP + ROW_PITCH * rows + 2.0,
             ),
             vec2((card.width() - CARD_PAD * 2.0).max(200.0), 18.0),
         );
@@ -734,7 +739,7 @@ impl Launcher {
             "超过指定张数后改为滚轮翻看，不会据此丢弃旧卡片；0 表示不按张数收窄。",
             pal,
         );
-        card_h + ROW_PITCH
+        card_h
     }
 }
 
@@ -882,11 +887,12 @@ impl Launcher {
                 u16::from(behavior.min_medal_level),
             ),
         ] {
-            let x = card.left() + CARD_PAD + column as f32 * CHECK_COL_DX;
-            let label_rect = Rect::from_min_size(pos2(x, numeric_top), vec2(FIELD_W, 22.0));
+            let slot = check_slot(card, column, 0);
+            let x = slot.left();
+            let label_rect = Rect::from_min_size(pos2(x, numeric_top), vec2(slot.width(), 22.0));
             field_label(ui, label_rect, label, None, pal);
             let control =
-                Rect::from_min_size(pos2(x, numeric_top + 28.0), vec2(FIELD_W, DROPDOWN_H));
+                Rect::from_min_size(pos2(x, numeric_top + 28.0), vec2(slot.width(), DROPDOWN_H));
             let id = if column == 0 {
                 "dm-min-user"
             } else {
@@ -958,9 +964,10 @@ impl Launcher {
         danmaku_heading(ui, card, "更多弹幕设置", pal);
 
         let mut y = card.top() + 44.0;
-        let label_w = MORE_LABEL_W;
-        let ctrl_x = card.left() + MORE_CTRL_X;
-        let ctrl_w = (card.width() - MORE_CTRL_X - CARD_PAD).max(140.0);
+        let split = MORE_CTRL_X.min(card.width() * 0.48);
+        let label_w = MORE_LABEL_W.min(split - CARD_PAD);
+        let ctrl_x = card.left() + split;
+        let ctrl_w = card.width() - split - CARD_PAD;
 
         more_group(ui, card, y, "拥挤与准入", pal);
         y += 26.0;
@@ -1171,20 +1178,21 @@ impl Launcher {
         danmaku_heading(ui, card, "界面与热键", pal);
 
         let left_x = card.left() + CARD_PAD;
-        let right_x = card.left() + CARD_PAD + COL_DX;
+        let cell = ((width - 2.0 * CARD_PAD - 14.0) / 2.0).min(FIELD_W);
+        let right_x = left_x + cell + 14.0;
         let label_y = card.top() + FORM_TOP;
 
         // ---- 界面字体 / 界面字号（重启启动器生效）----
         field_label(
             ui,
-            Rect::from_min_size(pos2(left_x, label_y), vec2(FIELD_W, 18.0)),
+            Rect::from_min_size(pos2(left_x, label_y), vec2(cell, 18.0)),
             "界面字体",
             None,
             pal,
         );
         field_label(
             ui,
-            Rect::from_min_size(pos2(right_x, label_y), vec2(FIELD_W, 18.0)),
+            Rect::from_min_size(pos2(right_x, label_y), vec2(cell, 18.0)),
             "界面字号",
             None,
             pal,
@@ -1197,7 +1205,7 @@ impl Launcher {
             .map(|(_, label)| *label)
             .collect();
         let mut key_index = crate::gui::theme::ui_font_key_index(&settings.ui_font_key);
-        let key_rect = Rect::from_min_size(pos2(left_x, control_y), vec2(FIELD_W, DROPDOWN_H));
+        let key_rect = Rect::from_min_size(pos2(left_x, control_y), vec2(cell, DROPDOWN_H));
         if dropdown(
             ui,
             key_rect,
@@ -1216,7 +1224,7 @@ impl Launcher {
         }
 
         let percent_labels = ["85%", "100%", "115%", "130%"];
-        let percent_rect = Rect::from_min_size(pos2(right_x, control_y), vec2(FIELD_W, DROPDOWN_H));
+        let percent_rect = Rect::from_min_size(pos2(right_x, control_y), vec2(cell, DROPDOWN_H));
         if let Some(percent) = combo_numeric(
             ui,
             percent_rect,
@@ -1285,7 +1293,7 @@ impl Launcher {
             );
             let input_rect = Rect::from_min_size(
                 pos2(left_x + HOTKEY_INPUT_LEFT, row_y),
-                vec2(HOTKEY_INPUT_W, 24.0),
+                vec2(HOTKEY_INPUT_W.min(width - CARD_PAD * 2.0 - HOTKEY_INPUT_LEFT), 24.0),
             );
             let spec = hotkey_spec_mut(&mut self.overlay_draft.hotkeys, action);
             input(ui, input_rect, spec, "留空 = 不绑定", pal);
@@ -1519,4 +1527,26 @@ fn more_label(ui: &Ui, card: Rect, top: f32, text: &str, width: f32, pal: &Pal) 
 fn more_check(ui: &mut Ui, x: f32, top: f32, width: f32, text: &str, value: &mut bool, pal: &Pal) {
     let rect = Rect::from_min_size(pos2(x, top), vec2(width, 24.0));
     checkbox(ui, rect, text, value, pal);
+}
+
+#[cfg(test)]
+mod responsive_tests {
+    use super::*;
+
+    #[test]
+    fn display_controls_fit_without_overlap_at_small_and_large_widths() {
+        for width in [380.0, 540.0, 719.0, 720.0, 900.0, 1028.0] {
+            let card = Rect::from_min_size(pos2(12.0, 9.0), vec2(width, 800.0));
+            let mut previous = Vec::new();
+            for row in 0..5 {
+                for column in 0..2 {
+                    let (label, control) = form_slot(card, column, row);
+                    let field = label.union(control);
+                    assert!(card.contains_rect(field));
+                    assert!(previous.iter().all(|other| !field.intersects(*other)));
+                    previous.push(field);
+                }
+            }
+        }
+    }
 }

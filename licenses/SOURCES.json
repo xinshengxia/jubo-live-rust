@@ -10,6 +10,16 @@
     "sha256": "297b088424be212207df2ce8b98e335468b782aa6b96832af0b8b773d711e2b1",
     "name": "HarmonyOS Sans SC Regular"
   },
+  "egui_winit": {
+    "version": "0.33.3",
+    "source": "https://crates.io/crates/egui-winit/0.33.3",
+    "crate_sha256": "ec6687e5bb551702f4ad10ac428bab12acf9d53047ebb1082d4a0ed8c6251a29",
+    "usage": "Vendored Windows IME key translation",
+    "licenses": [
+      "vendor/egui-winit/LICENSE-MIT",
+      "vendor/egui-winit/LICENSE-APACHE"
+    ]
+  },
   "schema": "livehub-rust-third-party-sources/1",
   "components": [
     {

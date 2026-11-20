@@ -142,7 +142,7 @@ impl Launcher {
                 (
                     input.key_pressed(egui::Key::ArrowUp),
                     input.key_pressed(egui::Key::ArrowDown),
-                    input.key_pressed(egui::Key::Enter),
+                    fresh_enter(input),
                     input.modifiers.shift,
                 )
             });
@@ -309,16 +309,16 @@ impl Launcher {
                     pal.text_secondary,
                     Align2::LEFT_CENTER,
                 );
-                if let Some(badge) = self.badges.get(&crate::gui::badges::room_key(target)).copied()
-                    && badge != crate::gui::badges::Badge::Unknown
-                {
-                    let live = badge == crate::gui::badges::Badge::Live;
+                if let Some(label) = self.badge_label(target) {
+                    if let Some(note) = self.badge_notes.get(&crate::gui::badges::room_key(target)) {
+                        note.show(&response);
+                    }
+                    let live = label == crate::gui::badges::Badge::Live.description();
                     let color = if live {
                         pal.success
                     } else {
                         pal.text_secondary
                     };
-                    let label = badge.description();
                     let dot_x = state_right - state_width;
                     ui.painter().circle_filled(
                         pos2(dot_x + 3.0, card.top() + row_height / 2.0),

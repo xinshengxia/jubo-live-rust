@@ -78,7 +78,7 @@ impl Launcher {
         }
     }
 
-    fn discover_tool(&mut self, tool: ToolKind, context: &egui::Context) {
+    pub(super) fn discover_tool(&mut self, tool: ToolKind, context: &egui::Context) {
         let current = self.tool_value(tool);
         self.tool_feedback_kind = Some(tool);
         if !current.trim().is_empty() && PathBuf::from(current.trim_matches('"')).is_file() {

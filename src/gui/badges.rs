@@ -76,6 +76,51 @@ pub fn room_key(target: &Target) -> String {
     format!("{}:{}", target.platform, target.room)
 }
 
+fn badge_failure_note(error: &anyhow::Error) -> &'static str {
+    use crate::platforms::AdapterError;
+    match error.downcast_ref::<AdapterError>() {
+        Some(AdapterError::RateLimited) => "平台暂时限流或房间数据不完整",
+        Some(AdapterError::VerificationRequired) => "平台要求登录或网页验证",
+        Some(AdapterError::Transport) => "网络请求失败",
+        Some(AdapterError::InvalidResponse(_) | AdapterError::Unsupported(_)) => {
+            "暂时无法识别平台返回的房态"
+        }
+        _ => "本次房态查询失败",
+    }
+}
+
+fn badge_observation(result: Result<RoomState, &'static str>) -> (Badge, Option<&'static str>) {
+    match result {
+        Ok(RoomState::Unknown) => (Badge::Unknown, Some("平台尚未返回可识别的房态")),
+        Ok(state) => (Badge::from_state(state), None),
+        Err(reason) => (Badge::Unknown, Some(reason)),
+    }
+}
+
+#[derive(Default)]
+pub(super) struct BadgeNote {
+    reason: &'static str,
+    pub(super) last_confirmed: Option<(Badge, u64)>,
+}
+
+impl BadgeNote {
+    pub(super) fn show(&self, response: &egui::Response) {
+        response.clone().on_hover_ui(|ui| {
+            ui.label(self.reason);
+            if let Some((badge, time)) = self.last_confirmed
+                && let Some(at) = chrono::DateTime::from_timestamp(time as i64, 0)
+            {
+                let local = at.with_timezone(&chrono::Local);
+                ui.label(format!(
+                    "上次确认：{} {}",
+                    local.format("%m-%d %H:%M:%S"),
+                    badge.description()
+                ));
+            }
+        });
+    }
+}
+
 /// Records a query time. An unknown result is backdated so the room becomes
 /// eligible again after BADGE_UNKNOWN_RETRY_SECS, not after the full freshness
 /// window (mirrors the C# BadgeScheduler policy).
@@ -178,7 +223,7 @@ impl Launcher {
             let vault = CookieVault::open(root.join("credentials")).ok();
             let result = crate::room_state::check(&target, vault.as_ref())
                 .map(|observation| observation.state)
-                .map_err(|error| format!("{error:#}"));
+                .map_err(|error| badge_failure_note(&error));
             let _ = sender.send(Event::Badge { key, result });
         });
     }
@@ -196,28 +241,38 @@ impl Launcher {
     pub(super) fn apply_badge_result(
         &mut self,
         key: String,
-        result: std::result::Result<RoomState, String>,
+        result: std::result::Result<RoomState, &'static str>,
     ) {
         self.badge_pending.remove(&key);
         let now = health_now();
-        let (badge, unknown) = match result {
-            Ok(state) => (Badge::from_state(state), state == RoomState::Unknown),
-            Err(_) => (Badge::Unknown, true),
-        };
-        record_result(&mut self.badge_times, &key, now, unknown);
+        let (badge, note) = badge_observation(result);
+        if let Some(reason) = note {
+            let detail = self.badge_notes.entry(key.clone()).or_default();
+            detail.reason = reason;
+            if let (Some(&previous), Some(&at)) = (self.badges.get(&key), self.badge_times.get(&key))
+                && previous != Badge::Unknown
+            {
+                detail.last_confirmed = Some((previous, at));
+            }
+        } else {
+            self.badge_notes.remove(&key);
+        }
+        record_result(&mut self.badge_times, &key, now, badge == Badge::Unknown);
         self.badges.insert(key, badge);
         if self.badges.len() > BADGE_MAX_TRACKED {
             self.badges.clear();
+            self.badge_notes.clear();
             self.badge_times.clear();
         }
     }
 
-    /// Badge prefix for one room, if any result is known.
+    /// Show the most recent observation while it refreshes, or the initial query in flight.
     pub(super) fn badge_label(&self, target: &Target) -> Option<&'static str> {
+        let key = room_key(target);
         self.badges
-            .get(&room_key(target))
-            .map(|badge| badge.label())
-            .filter(|label| !label.is_empty())
+            .get(&key)
+            .map(|badge| badge.description())
+            .or_else(|| self.badge_pending.contains(&key).then_some("查询中"))
     }
 }
 

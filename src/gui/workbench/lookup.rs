@@ -97,20 +97,19 @@ impl Launcher {
                 pos2(combo.right() + 6.0, combo.top()),
                 vec2(search_width, ROW1_H),
             );
-            let input_response = input(
+            let input_response = workbench_input(
                 ui,
                 input_rect,
                 &mut self.search_input,
                 "输入主播名称、房间链接或分享文案",
-                pal,
+                pal, true,
             );
             let query_rect = Rect::from_min_size(
                 pos2(input_rect.right() + GAP, combo.top()),
                 vec2(80.0, ROW1_H),
             );
             if button(ui, query_rect, "查询", Btn::Primary, pal, true).clicked()
-                || (input_response.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                || (input_response.has_focus() && ui.input(fresh_enter))
             {
                 self.start_search(context, false);
             }
@@ -137,8 +136,9 @@ impl Launcher {
             // AI research actions live in the persistent AI section below (the
             // production ai_controls() renderer), so this row keeps only the
             // non-AI actions and fits narrow windows without wrapping.
-            let actions: [(&str, f32, bool); 5] = [
+            let actions: [(&str, f32, bool); 6] = [
                 ("刷新结果", 80.0, !self.searching),
+                (if self.lookup_more_open { "收起更多方式" } else { "更多查找方式" }, 104.0, true),
                 ("补充线索", 80.0, true),
                 ("抖音网页辅助", 96.0, !self.login_busy && !self.search_input.trim().is_empty()
                     && (self.search_all || self.platform == Platform::Douyin)),
@@ -148,6 +148,7 @@ impl Launcher {
             let mut x = 12.0_f32;
             let mut action_top = row2_top;
             for (index, (label, action_width, enabled)) in actions.into_iter().enumerate() {
+                if index > 1 && !self.lookup_more_open { break; }
                 if x > 12.0 && x + action_width > width - 12.0 {
                     x = 12.0;
                     action_top += ROW2_H + GAP;
@@ -157,12 +158,13 @@ impl Launcher {
                 if button(ui, rect, label, Btn::Secondary, pal, enabled).clicked() {
                     match index {
                         0 => self.start_search(context, true),
-                        1 => self.lookup_clues = !self.lookup_clues,
-                        2 => self.start_douyin_web_assist(context),
-                        3 => self.lookup_web_search_open = !self.lookup_web_search_open,
+                        1 => self.lookup_more_open = !self.lookup_more_open,
+                        2 => self.lookup_clues = !self.lookup_clues,
+                        3 => self.start_douyin_web_assist(context),
+                        4 => self.lookup_web_search_open = !self.lookup_web_search_open,
                         // A dialog is used so the API Key field is visible without
                         // scrolling the page or recognising a bare hint line.
-                        4 => self.ai_settings_open = true,
+                        5 => self.ai_settings_open = true,
                         _ => {}
                     }
                 }
@@ -170,7 +172,7 @@ impl Launcher {
             }
             // y is page-relative from here on; row1+row2 occupy their own space.
             let mut y = action_top - origin.y + ROW2_H + 12.0;
-            if self.lookup_web_search_open {
+            if self.lookup_more_open && self.lookup_web_search_open {
                 for (index, platform) in Platform::ALL.into_iter().enumerate() {
                     let step = (width - 24.0) / 4.0;
                     let rect = Rect::from_min_size(origin + vec2(12.0 + index as f32 * step, y), vec2(step - GAP, 30.0));
@@ -184,24 +186,26 @@ impl Launcher {
             // verify action are a persistent, scrollable section produced by the
             // production ai_controls() renderer. It must stay visible after the
             // result arrives instead of only on the click that started it.
-            let ai_height = if self.ai_result.is_some() || self.ai_busy {
-                320.0
-            } else {
-                104.0
-            };
-            let ai_panel =
-                Rect::from_min_size(origin + vec2(0.0, y), vec2(width, ai_height));
-            rounded(ui.painter(), ai_panel, 8.0, pal.card);
-            rounded_stroke(ui.painter(), ai_panel, 8.0, Stroke::new(1.0, pal.border));
-            let mut ai_ui = child(ui, ai_panel.shrink(10.0));
-            egui::ScrollArea::vertical()
-                .id_salt("lookup-ai-controls")
-                .max_height(ai_height - 20.0)
-                .show(&mut ai_ui, |ui| {
-                    self.ai_controls(ui, context);
-                });
-            y += ai_height + 10.0;
-            if self.lookup_clues {
+            if self.lookup_more_open {
+                let ai_height = if self.ai_result.is_some() || self.ai_busy {
+                    320.0
+                } else {
+                    104.0
+                };
+                let ai_panel =
+                    Rect::from_min_size(origin + vec2(0.0, y), vec2(width, ai_height));
+                rounded(ui.painter(), ai_panel, 8.0, pal.card);
+                rounded_stroke(ui.painter(), ai_panel, 8.0, Stroke::new(1.0, pal.border));
+                let mut ai_ui = child(ui, ai_panel.shrink(10.0));
+                egui::ScrollArea::vertical()
+                    .id_salt("lookup-ai-controls")
+                    .max_height(ai_height - 20.0)
+                    .show(&mut ai_ui, |ui| {
+                        self.ai_controls(ui, context);
+                    });
+                y += ai_height + 10.0;
+            }
+            if self.lookup_more_open && self.lookup_clues {
                 let clues = Rect::from_min_size(origin + vec2(0.0, y), vec2(width, 34.0));
                 let field_width = (width - 2.0 * GAP - 120.0) / 3.0;
                 for (index, (label, value)) in [
@@ -934,6 +938,34 @@ mod tests {
     }
 
     #[test]
+    fn ime_commit_keeps_focus_until_an_independent_enter_submits_once() {
+        let ctx = egui::Context::default();
+        let pal = Pal::of(theme::ThemeMode::Dark);
+        let mut text = String::new();
+        let mut submissions = 0;
+        let key = |pressed| egui::Event::Key { key: egui::Key::Enter, physical_key: None,
+            pressed, repeat: false, modifiers: egui::Modifiers::NONE };
+        for (frame, events) in [
+            vec![],
+            vec![egui::Event::Ime(egui::ImeEvent::Enabled), egui::Event::Ime(egui::ImeEvent::Preedit("halo".into()))],
+            vec![egui::Event::Ime(egui::ImeEvent::Commit("你好".into())), egui::Event::Ime(egui::ImeEvent::Disabled)],
+            vec![key(true)], vec![key(true)], vec![key(false)],
+        ].into_iter().enumerate() {
+            let _ = ctx.run(frame_input_at(frame as f64 / 10.0, events), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let rect = Rect::from_min_size(ui.cursor().min, vec2(280.0, ROW1_H));
+                    let response = workbench_input(ui, rect, &mut text, "搜索", &pal, true);
+                    if frame == 0 { response.request_focus(); }
+                    assert!(response.has_focus());
+                    if response.has_focus() && ui.input(fresh_enter) { submissions += 1; }
+                });
+            });
+            if frame >= 2 { assert_eq!(text, "你好"); }
+            assert_eq!(submissions, usize::from(frame >= 3));
+        }
+    }
+
+    #[test]
     fn regression_avatar_completions_release_slots_without_redrawing_old_rows() {
         let (mut app, _directory, _context) = synthetic_launcher();
         for index in 0..64 {
@@ -1235,29 +1267,14 @@ mod tests {
     #[test]
     fn deepseek_settings_button_opens_the_ai_dialog() {
         let (mut app, _directory, context) = synthetic_launcher();
-        // Mirror the action-row maths: 12px start, widths [80,80,96,96,111],
-        // 6px gap, second row at y=54 with a 34px height.
-        let widths = [80.0_f32, 80.0, 96.0, 96.0, 111.0];
-        let gap = 6.0_f32;
-        let button = egui::pos2(
-            12.0 + widths[..4].iter().sum::<f32>() + gap * 4.0 + widths[4] / 2.0,
-            54.0 + 34.0 / 2.0,
-        );
-        let click = |pressed: bool, time: f64| {
-            frame_input_at(
-                time,
-                vec![
-                    egui::Event::PointerMoved(button),
-                    egui::Event::PointerButton {
-                        pos: button,
-                        button: egui::PointerButton::Primary,
-                        pressed,
-                        modifiers: egui::Modifiers::default(),
-                    },
-                ],
-            )
-        };
-        for input in [frame_input_at(0.0, vec![]), click(true, 0.1), click(false, 0.2)] {
+        let more = egui::pos2(150.0, 71.0);
+        let settings = egui::pos2(12.0 + 80.0 + 104.0 + 80.0 + 96.0 + 96.0 + 5.0 * GAP + 55.0, 71.0);
+        let click = |pos, pressed, time| frame_input_at(time, vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::default() },
+        ]);
+        for input in [frame_input_at(0.0, vec![]), click(more, true, 0.1), click(more, false, 0.2),
+                      click(settings, true, 0.3), click(settings, false, 0.4)] {
             let _ = context.run(input, |ctx| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)

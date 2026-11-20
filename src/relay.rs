@@ -12,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAdd
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc,
 };
 use std::thread;
@@ -896,6 +896,7 @@ impl RelayServer {
 
     pub fn run(self) -> Result<()> {
         let active = Arc::new(AtomicUsize::new(0));
+        let confirmed_offline = Arc::new(AtomicBool::new(false));
         let last_client = Arc::new(Mutex::new(Instant::now()));
         loop {
             if self.player_lifetime.should_exit() {
@@ -934,6 +935,7 @@ impl RelayServer {
                     let resolver = Arc::clone(&self.resolver);
                     let player_lifetime = Arc::clone(&self.player_lifetime);
                     let statistics = Arc::clone(&self.statistics);
+                    let confirmed_offline = Arc::clone(&confirmed_offline);
                     thread::Builder::new()
                         .name("flv-relay-client".into())
                         .spawn(move || {
@@ -945,6 +947,7 @@ impl RelayServer {
                                 &resolver,
                                 &player_lifetime,
                                 statistics,
+                                &confirmed_offline,
                             ) {
                                 relay_log(
                                     config.log_dir.as_deref(),
@@ -2061,6 +2064,7 @@ fn pump(
     resolver: &Arc<dyn StreamResolver>,
     lifetime: &PlayerLifetime,
     statistics: Arc<Mutex<RelayStatistics>>,
+    confirmed_offline: &AtomicBool,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     stream.set_write_timeout(Some(config.write_timeout))?;
@@ -2138,6 +2142,12 @@ fn pump(
         let mut snapshot = statistics.lock().unwrap_or_else(|error| error.into_inner());
         snapshot.media_get_requests = snapshot.media_get_requests.saturating_add(1);
     }
+    // A player can reopen the media URL after EOF. Only an explicit offline
+    // result with waiting disabled is final for this relay session.
+    if confirmed_offline.load(Ordering::Acquire) {
+        reject(stream, "410 Gone")?;
+        return Ok(());
+    }
     let statistics = StreamStatistics::begin(statistics, config.log_dir.clone());
     // A streaming response has neither Content-Length nor chunked encoding.
     if let Err(error) = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/x-flv\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n") {
@@ -2190,10 +2200,18 @@ fn pump(
         reconnect = true;
         let mut progress = MediaProgress::default();
         let segment_failure = 'segment: {
-            let resolved = match resolve_while_player_connected(Arc::clone(resolver), stream) {
+            let attempt = if confirmed_offline.load(Ordering::Acquire) {
+                ResolveAttempt::Failed(ResolveUnavailable("offline").into())
+            } else {
+                resolve_while_player_connected(Arc::clone(resolver), stream)
+            };
+            let resolved = match attempt {
                 ResolveAttempt::Resolved(resolved) => resolved,
                 ResolveAttempt::Failed(error) => {
                     if let Some(confirmed) = error.downcast_ref::<ResolveUnavailable>() {
+                        if confirmed.0 == "offline" {
+                            confirmed_offline.store(true, Ordering::Release);
+                        }
                         statistics.update(|_, record| {
                             record.state = RelayConnectionState::Ended;
                             record.waiting_state = Some(confirmed.0.to_owned());
