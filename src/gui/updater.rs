@@ -130,7 +130,7 @@ impl Updater {
                 && self.available.as_deref() != Some(s)
             {
                 self.available = Some(s.to_owned());
-                notice = Some(format!("发现新版 {s}，可到「播放器与画质」点击更新。"));
+                notice = Some(format!("发现新版 {s}，可点主界面左下角的按钮更新。"));
             }
         }
         if let Some(ticket) = &self.ticket {

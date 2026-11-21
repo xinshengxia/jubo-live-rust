@@ -1179,6 +1179,8 @@ impl Launcher {
             vec2(140.0, 16.0),
         );
         group_label(ui, group_rect, "观看", pal);
+        // Reserve the bottom action even at the minimum supported window height.
+        let compact = rect.height() < 525.0;
         let mut y = rect.top() + 100.0;
         for (index, page) in Page::ALL.into_iter().enumerate() {
             if index == Page::SETTINGS_GROUP {
@@ -1192,6 +1194,7 @@ impl Launcher {
             } else {
                 NAV_H
             };
+            let height = if compact { height - 6.0 } else { height };
             let item = Rect::from_min_size(pos2(rect.left() + NAV_INDENT, y), vec2(NAV_W, height));
             let selected = self.page == page;
             let response = ui.interact(item, Id::new(("nav", page.key())), Sense::click());
@@ -1240,22 +1243,17 @@ impl Launcher {
             }
             y += height + NAV_GAP;
         }
-        let footer_y = (rect.bottom() - 53.0).max(y + 8.0);
-        draw_glyph(
-            ui.painter(),
-            Rect::from_min_size(pos2(rect.left() + 12.0, footer_y + 3.0), Vec2::splat(16.0)),
-            Glyph::Drive,
-            pal.text_secondary,
-            1.2,
+        let update = Rect::from_min_size(
+            pos2(rect.left() + NAV_INDENT, rect.bottom() - 48.0),
+            vec2(rect.width() - 2.0 * NAV_INDENT, 36.0),
         );
-        text_in(
-            ui.painter(),
-            Rect::from_min_size(pos2(rect.left() + 34.0, footer_y), vec2(122.0, 20.0)),
-            "本地播放器 · 四平台",
-            font(11.0),
-            pal.text_secondary,
-            Align2::LEFT_CENTER,
-        );
+        let label = self.updater.available.as_ref()
+            .map(|v| format!("更新至 {v}")).unwrap_or_else(|| "检查更新".into());
+        if button(ui, update, &label, Btn::Secondary, pal, true).clicked()
+            && let Err(e) = self.updater.open(&self.snapshot.root)
+        {
+            self.set_status(format!("打开更新窗口失败：{e}"), true);
+        }
     }
 
     fn content(&mut self, ui: &mut Ui, rect: Rect, context: &egui::Context, pal: &Pal) {
