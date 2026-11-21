@@ -201,22 +201,6 @@ impl Updater {
                         {
                             self.run(data, true, None);
                         }
-                        if ui
-                            .add_enabled(!self.installing, egui::Button::new("从本地安装…"))
-                            .clicked()
-                            && let Some(zip) = open_file_name(
-                                &build_filter(&[("正式版 ZIP", "*.zip")]),
-                                "选择正式版 ZIP 安装包",
-                                None,
-                            )
-                            && let Some(catalog) = open_file_name(
-                                &build_filter(&[("签名清单", "*.json")]),
-                                "选择与 ZIP 配套的签名清单",
-                                zip.parent(),
-                            )
-                        {
-                            self.run(data, true, Some((&zip, &catalog)));
-                        }
                     });
                     ui.add_space(16.0);
                     if let Some(dir) = cache() {
@@ -241,6 +225,32 @@ impl Updater {
                             }
                         }
                     }
+                    ui.add_space(20.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.strong("离线安装包");
+                    ui.label("从 Rust 版同一次发布的附件下载两个文件，也可从另一台电脑拷来。");
+                    ui.label("先选以 win-x64-lite.zip 结尾的安装包（无需解压），再选签名清单 channel.json。");
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add_enabled(!self.installing, egui::Button::new("从本地安装…"))
+                            .clicked()
+                            && let Some(zip) = open_file_name(
+                                &build_filter(&[("正式版 ZIP", "*.zip")]),
+                                "第 1 步，共 2 步 · 选择 Rust 正式版 ZIP 安装包",
+                                None,
+                            )
+                            && let Some(catalog) = open_file_name(
+                                &build_filter(&[("签名清单", "*.json")]),
+                                "第 2 步，共 2 步 · 选择同一版本的 channel.json",
+                                zip.parent(),
+                            )
+                        {
+                            self.run(data, true, Some((&zip, &catalog)));
+                        }
+                        ui.hyperlink_to("打开发布页", "https://github.com/xinshengxia/jubo-live-rust/releases/latest");
+                    });
                 });
         });
     }
