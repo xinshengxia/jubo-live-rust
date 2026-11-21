@@ -1,5 +1,7 @@
 # 看直播 · jubo-live-rust
 
+在「播放器与画质 → 播放外观」可以为 mpv 和 PotPlayer 分别选择沿用原设置或软件附带的定制外观。选择会在下次打开该播放器时生效。[外观与首次准备](docs/player-styles.md)
+
 Windows 多平台直播工具，支持 B站、虎牙、斗鱼、抖音，使用 mpv 或 PotPlayer 播放，提供弹幕、SC、收藏、历史和主播搜索。
 
 [下载 Windows x64 版](https://github.com/xinshengxia/jubo-live-rust/releases) · [使用说明](docs/getting-started.md) · [反馈问题](https://github.com/xinshengxia/jubo-live-rust/issues)
@@ -20,7 +22,7 @@ Windows 多平台直播工具，支持 B站、虎牙、斗鱼、抖音，使用 
 
 本轮提供 **lite**（不捆绑播放器或 yt-dlp）及源码 ZIP。已有工具可以直接选择，无需重新下载。暂不提供 full 包；不要把历史提到的 full 当成本版可下载的资产。以 Release 的实际附件为准。
 
-当前版本为 **1.0.12**。[本版变化](docs/release-notes-1.0.12.md) · [1.0.10 功能更新](docs/release-notes-1.0.10.md) · [历史版本](https://github.com/xinshengxia/jubo-live-rust/releases)
+当前版本为 **1.0.13**。[播放器外观与使用说明](docs/player-styles.md) · [1.0.12 变化](docs/release-notes-1.0.12.md) · [1.0.10 功能更新](docs/release-notes-1.0.10.md) · [历史版本](https://github.com/xinshengxia/jubo-live-rust/releases)
 
 ## 主要功能
 

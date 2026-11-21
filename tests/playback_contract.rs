@@ -282,3 +282,25 @@ fn potplayer_plan_is_never_touched_by_the_mpv_audio_policy() {
     }
     assert_eq!(arguments, ["/new", stream.url.as_str(), "/title=Synthetic 直播间", "/seek=0"]);
 }
+
+#[test]
+fn player_appearance_is_opt_in_and_persists_independently() {
+    let previous: PlaybackPreferences = serde_json::from_str(r#"{"wait_for_live":true}"#).unwrap();
+    assert!(!previous.custom_mpv_style && !previous.custom_potplayer_style);
+    let unchanged = serde_json::to_value(&previous).unwrap();
+    assert!(unchanged.get("custom_mpv_style").is_none());
+    assert!(unchanged.get("custom_potplayer_style").is_none());
+    let stream = synthetic_stream();
+    let original = playback::plan_with_preferences(Player::Mpv, "mpv.exe".into(), &stream, &previous).unwrap();
+    assert!(!original.arguments.iter().any(|arg| arg == "--load-scripts=no" || arg.to_string_lossy().starts_with("--config-dir=")));
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = live_hub_rust::core::Store::open(directory.path().to_path_buf()).unwrap();
+    for (mpv, potplayer) in [(true, false), (false, true), (false, false)] {
+        let mut selection = previous.clone();
+        selection.custom_mpv_style = mpv;
+        selection.custom_potplayer_style = potplayer;
+        store.save_playback_preferences(selection.clone()).unwrap();
+        let reopened = live_hub_rust::core::Store::open(directory.path().to_path_buf()).unwrap();
+        assert_eq!(reopened.settings().playback, selection);
+    }
+}

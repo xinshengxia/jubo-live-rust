@@ -11,3 +11,6 @@ assets/fonts/LICENSE.txt -text
 *.png -text
 *.ttf -text
 *.ico -text
+
+# Preserve bundled upstream bytes and their recorded checksums.
+assets/player-styles/** -text

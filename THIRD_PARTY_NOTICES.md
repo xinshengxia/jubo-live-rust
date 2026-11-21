@@ -2,6 +2,14 @@
 
 本项目是 live-hub 的独立 Rust 重构工程。保留原工程的 LICENSE 原文；本次重构不另行作出整套代码的许可变更或授权声明。Cargo package 设置为不可发布。
 
+## 可选播放器外观
+
+- **ModernZ v0.3.3** 由 Samillion 和贡献者维护，继承 mpv OSC、ModernX 等项目的工作。随包提供 LGPL-2.1 Lua 源码、语言文件和专用图标字体。字体包含 Google Material Symbols（Apache-2.0）与 Microsoft Fluent System Icons（MIT）图形。署名、许可原文与上游说明位于 `licenses/player-styles/ModernZ/`。[ModernZ](https://github.com/Samillion/ModernZ)
+- **thumbfast** 基于 po5/thumbfast，随包提供 MPL-2.0 修改版 Lua 源码。修改包括网络取帧、会话磁盘缓存、重试和按本次选用的播放器启动取帧进程。许可见 `licenses/player-styles/thumbfast/MPL-2.0.txt`，可修改的源码位于 `assets/player-styles/mpv/scripts/thumbfast.lua`。[thumbfast](https://github.com/po5/thumbfast)
+- **Fluent Glass** 生成器、Glass Orbit 图案与原创素材使用 MIT 许可，定制版调整了橙色进度条、黑色底栏、标题栏与本机准备流程。Lucide 0.468.0 图标使用 ISC 许可，源自 Feather 的部分保留 Cole Bemis 署名，完整 MIT 原文见 [Feather 许可证](licenses/player-styles/Feather-MIT.txt)。生成器的许可、第三方声明及图标原文位于 `assets/player-styles/fluent-glass/`。生成器在使用者电脑上读取已安装的 PotPlayer 默认资源，用于构建私有运行副本；所需 Pillow、resvg-py 由本机 Python 环境安装。[Fluent Glass](https://github.com/Elysia4319/potplayer-fluent-glass) · [Lucide](https://lucide.dev/license)
+
+固定来源版本与内容哈希记录在 `licenses/SOURCES.json` 的 `player_styles` 字段中。
+
 ## Rust 运行依赖
 
 使用 Cargo.lock 锁定版本与 registry 校验值。构建前核对上游声明，构建交付时由 scripts/Export-Licenses.ps1 从实际 Cargo 依赖图收集原始许可文件；收集目录与机器路径分离，公开清单只写 crate 名、版本、来源、commit（如有）、原相对路径与 SHA-256。尚未完成许可收集验收的构建不得视为可对外发布包。

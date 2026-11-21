@@ -208,7 +208,7 @@ impl Launcher {
             y += 36.0;
 
             // One player selector, one clear file summary, and a small action row.
-            let player_card = Rect::from_min_size(origin + vec2(0.0, y), vec2(width, 208.0));
+            let player_card = Rect::from_min_size(origin + vec2(0.0, y), vec2(width, 274.0));
             setup_panel(ui, player_card, pal);
             text_in(
                 ui.painter(),
@@ -353,6 +353,54 @@ impl Launcher {
                 } else {
                     "支持拖入程序或快捷方式 · PotPlayer 无需 OpenAL"
                 },
+                font(11.0),
+                pal.text_secondary,
+                Align2::LEFT_CENTER,
+            );
+            let style = match self.player_edit {
+                Player::Mpv => &mut self.playback_draft.custom_mpv_style,
+                Player::PotPlayer => &mut self.playback_draft.custom_potplayer_style,
+            };
+            let mut index = usize::from(*style);
+            let custom = if self.player_edit == Player::Mpv {
+                "ModernZ ＋ 缩略图"
+            } else {
+                "Fluent Glass"
+            };
+            text_in(
+                ui.painter(),
+                Rect::from_min_size(player_card.min + vec2(pad, 202.0), vec2(64.0, 32.0)),
+                "播放外观",
+                font(12.0),
+                pal.text,
+                Align2::LEFT_CENTER,
+            );
+            let appearance = Rect::from_min_size(
+                player_card.min + vec2(pad + 74.0, 202.0),
+                vec2((inner - 74.0).min(240.0), 32.0),
+            );
+            if dropdown(
+                ui,
+                appearance,
+                "player-appearance",
+                &mut index,
+                &["沿用播放器设置", custom],
+                pal,
+            )
+            .changed()
+            {
+                *style = index == 1;
+                self.send_store(StoreAction::SavePlayback(self.playback_draft.clone()));
+            }
+            let hint = if index == 1 && self.player_edit == Player::PotPlayer {
+                "首次生成需要 64 位 Python 3.10+ 和联网安装依赖"
+            } else {
+                "下次打开该播放器时生效"
+            };
+            text_in(
+                ui.painter(),
+                Rect::from_min_size(player_card.min + vec2(pad, 242.0), vec2(inner, 18.0)),
+                hint,
                 font(11.0),
                 pal.text_secondary,
                 Align2::LEFT_CENTER,

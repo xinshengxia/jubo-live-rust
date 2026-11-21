@@ -35,8 +35,7 @@ const RELAY_READY_LINES: usize = 16;
 /// How often the supervisor checks whether the player or relay already exited.
 const SUPERVISE_POLL: Duration = Duration::from_millis(100);
 /// The original launcher's mpv helpers: dynamic window title (resolution, fps,
-/// codec, bitrate) and the refresh / jump-to-live keys. The launcher keeps
-/// --load-scripts=no, so both scripts are passed explicitly.
+/// codec, bitrate) and the refresh / jump-to-live keys, loaded explicitly.
 const TITLE_SCRIPT_RELATIVE: &str = "assets/lua/live-title.lua";
 const RESYNC_SCRIPT_RELATIVE: &str = "assets/lua/live-resync.lua";
 /// Per-session hint files live in the temp root; bound the directory name so a
@@ -621,7 +620,6 @@ pub fn plan_with_preferences(
                     "--force-window=immediate",
                     "--keep-open=yes",
                     "--keep-open-pause=no",
-                    "--load-scripts=no",
                     "--ytdl=no",
                     "--hwdec=auto-safe",
                     // Compatibility profile from jubo-live v1.0.3–v1.1.2 (the
@@ -644,6 +642,14 @@ pub fn plan_with_preferences(
                 .iter()
                 .map(OsString::from),
             );
+            if preferences.custom_mpv_style {
+                let directory = style_resources()?.join("mpv");
+                ensure!(
+                    directory.join("mpv.conf").is_file(),
+                    "缺少 mpv 定制资源，请重新解压完整软件包"
+                );
+                args.push(format!("--config-dir={}", directory.display()).into());
+            }
             match preferences.buffer_mode {
                 BufferMode::LowLatency => args.extend(
                     ["--cache-secs=3", "--demuxer-readahead-secs=2"]
@@ -711,8 +717,57 @@ pub fn plan_with_preferences(
     })
 }
 
+fn style_resources() -> Result<PathBuf> {
+    let launcher = std::env::current_exe()?;
+    Ok(launcher
+        .parent()
+        .context("无法定位播放器资源")?
+        .join("assets/player-styles"))
+}
+
+fn prepare_styled_potplayer(player: &Path) -> Result<PathBuf> {
+    let package = style_resources()?;
+    let script = package.join("Prepare-PotPlayer.ps1");
+    ensure!(
+        script.is_file(),
+        "缺少 Fluent Glass 生成器，请重新解压完整软件包"
+    );
+    let shell = PathBuf::from(std::env::var_os("SystemRoot").context("需要 Windows 版 PotPlayer")?)
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let output = command(&shell)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(script)
+        .arg("-Player")
+        .arg(player)
+        .stdin(Stdio::null())
+        .output()
+        .context("无法准备 PotPlayer 定制外观")?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "Fluent Glass 准备失败：{}",
+            error.lines().next().unwrap_or("请检查播放器和 Python 环境")
+        );
+    }
+    let runtime = PathBuf::from(String::from_utf8(output.stdout)?.trim());
+    ensure!(
+        runtime.is_absolute() && runtime.is_file(),
+        "定制 PotPlayer 未生成"
+    );
+    Ok(runtime)
+}
+
 pub fn spawn_plan(plan: &PlaybackPlan) -> Result<Child> {
     let mut process = command(&plan.executable);
+    if plan.player == Player::Mpv {
+        process.env("JUBO_THUMBFAST_MPV", &plan.executable);
+    }
     // The audio policy applies to the mpv child only; the function itself keeps
     // the player check so PotPlayer can never receive mpv output settings.
     #[cfg(windows)]
@@ -2285,7 +2340,11 @@ pub fn launch_controlled(
     notify(&observer, PlaybackEvent::CheckingPlayer);
     control.check_start()?;
     target.validate()?;
-    let executable = find_player(player, settings)?;
+    let mut executable = find_player(player, settings)?;
+    if player == Player::PotPlayer && settings.playback.custom_potplayer_style {
+        executable = prepare_styled_potplayer(&executable)?;
+        control.check_start()?;
+    }
     let worker_target = target.clone();
     let worker_settings = settings.clone();
     let worker_vault = vault.cloned();

@@ -454,6 +454,10 @@ impl PercentRect {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PlaybackPreferences {
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub custom_mpv_style: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub custom_potplayer_style: bool,
     pub buffer_mode: BufferMode,
     pub enhancement: Enhancement,
     pub wait_for_live: bool,
@@ -467,6 +471,8 @@ pub struct PlaybackPreferences {
 impl Default for PlaybackPreferences {
     fn default() -> Self {
         Self {
+            custom_mpv_style: false,
+            custom_potplayer_style: false,
             buffer_mode: BufferMode::LowLatency,
             enhancement: Enhancement::Off,
             wait_for_live: true,

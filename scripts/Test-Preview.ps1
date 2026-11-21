@@ -38,11 +38,32 @@ $requiredEntries = @(
     'assets/fonts/LICENSE.txt',
     'assets/lua/live-title.lua',
     'assets/lua/live-resync.lua',
+    'assets/player-styles/mpv/mpv.conf',
+    'assets/player-styles/mpv/script-opts/modernz.conf',
+    'assets/player-styles/mpv/script-opts/thumbfast.conf',
+    'docs/player-styles.md',
+    'assets/player-styles/Prepare-PotPlayer.ps1',
     'assets/emoji-sheet.png',
     'assets/emoji-sheet.txt'
 )
 foreach ($required in $requiredEntries) {
     if (-not $expected.Contains($required)) { throw ('Required preview entry missing: '+$required) }
+}
+$sources = (Get-Content -LiteralPath (Join-Path $packagePath 'licenses/SOURCES.json') -Raw | ConvertFrom-Json).player_styles
+if (@($sources).Count -ne 3) { throw 'Missing player style source records' }
+foreach ($component in $sources) {
+    foreach ($entry in $component.files.PSObject.Properties) {
+        if (-not $expected.Contains($entry.Name) -or (Get-FileHash -LiteralPath (Join-Path $packagePath $entry.Name)).Hash -ne $entry.Value) {
+            throw ('Missing or modified player style component: ' + $entry.Name)
+        }
+    }
+}
+foreach ($row in Get-Content -LiteralPath (Join-Path $packagePath 'assets/player-styles/fluent-glass.sha256')) {
+    $hash, $name = $row -split '  ', 2
+    $entry = 'assets/player-styles/fluent-glass/' + $name
+    if (-not $expected.Contains($entry) -or (Get-FileHash -LiteralPath (Join-Path $packagePath $entry)).Hash -ne $hash) {
+        throw ('Missing or modified skin generator file: ' + $entry)
+    }
 }
 if (-not @($expected | Where-Object { $_ -match '^assets/fonts/[^/]+\.ttf$' }).Count) { throw 'Embedded font file is missing from preview' }
 $allFiles = @(Get-ChildItem -LiteralPath $packagePath -Recurse -File -Force)

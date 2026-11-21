@@ -16,3 +16,4 @@
 __pycache__/
 *.zip
 *.sha256
+!/assets/player-styles/fluent-glass.sha256
