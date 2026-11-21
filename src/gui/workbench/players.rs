@@ -798,6 +798,12 @@ impl Launcher {
                     }
                 }
             }
+            let label = self.updater.available.as_ref().map(|v| format!("更新至 {v}")).unwrap_or_else(|| "检查更新".into());
+            if button(ui, Rect::from_min_size(origin + vec2(pad,y), vec2(140.0,32.0)),
+                &label, Btn::Subtle, pal, true).clicked() && let Err(e) = self.updater.open(&self.snapshot.root) {
+                self.set_status(format!("打开更新窗口失败：{e}"),true);
+            }
+            y += 48.0;
             ui.allocate_space(vec2(width, y));
         });
         self.setup_dialogs(context, pal);

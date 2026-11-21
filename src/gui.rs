@@ -47,6 +47,7 @@ pub mod observations;
 mod sessions_page;
 pub mod theme;
 mod ui_shot;
+mod updater;
 pub mod widgets;
 mod window_frame;
 mod workbench;
@@ -101,7 +102,11 @@ pub fn run(data_root: PathBuf) -> Result<()> {
     eframe::run_native(
         WINDOW_TITLE,
         options,
-        Box::new(move |context| Ok(Box::new(Launcher::new(context, store)))),
+        Box::new(move |context| {
+            let mut launcher = Launcher::new(context, store);
+            launcher.updater.enabled = true;
+            Ok(Box::new(launcher))
+        }),
     )
     .map_err(|error| anyhow!("无法打开应用窗口：{error}"))
 }
@@ -996,6 +1001,7 @@ struct Launcher {
     import_kind: ImportKind,
     credential_path: String,
     sessions: SessionManager,
+    updater: updater::Updater,
     session_events: Receiver<SessionSnapshot>,
     handled_sessions: BTreeSet<String>,
     session_overlay: BTreeMap<String, bool>,
@@ -1132,6 +1138,7 @@ impl Launcher {
             lookup_filter: None,
             account_details: None,
             ui_shot: None,
+            updater: updater::Updater::default(),
             shot_mode: false,
             platform: Platform::Bili,
             room_input: String::new(),
@@ -2564,6 +2571,13 @@ impl eframe::App for Launcher {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         // The screenshot driver is temporarily moved out of self so it can
         // receive a mutable launcher without aliasing the field it lives in.
+        if self.updater.enabled {
+            let (close, notice) = self.updater.poll(&self.snapshot.root, || !self.login_busy && !self.tool_setup_busy &&
+                self.sessions.snapshots().iter().all(|s| s.phase.is_terminal()));
+            if let Some(text) = notice { self.set_status(text, false); }
+            if close { context.send_viewport_cmd(egui::ViewportCommand::Close); }
+            context.request_repaint_after(std::time::Duration::from_secs(2));
+        }
         let mut shot = self.ui_shot.take();
         if let Some(driver) = shot.as_mut() {
             driver.begin_frame(self, context);
