@@ -18,9 +18,9 @@ use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Final page keys (the 8-page shell). Kept here so the CLI and the capture
+/// Workbench page keys, including the footer update entry. Kept here so the CLI and the capture
 /// report share one list; unknown keys are reported and skipped, never guessed.
-pub(super) const DEFAULT_PAGE_KEYS: [&str; 8] = [
+pub(super) const DEFAULT_PAGE_KEYS: [&str; 9] = [
     "favorites",
     "recent",
     "lookup",
@@ -29,6 +29,7 @@ pub(super) const DEFAULT_PAGE_KEYS: [&str; 8] = [
     "danmaku",
     "accounts",
     "data",
+    "updates",
 ];
 
 /// A page that never produced a rendered frame within this window aborts the
@@ -341,6 +342,7 @@ mod tests {
                 "danmaku".to_owned(),
                 "accounts".to_owned(),
                 "data".to_owned(),
+                "updates".to_owned(),
             ]
         );
     }

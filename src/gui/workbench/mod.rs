@@ -176,6 +176,7 @@ impl Glyph {
             Page::Players => Self::Data,
             Page::Danmaku => Self::Danmaku,
             Page::Accounts => Self::Accounts,
+            Page::Updates => Self::Refresh,
             Page::Data => Self::Data,
         }
     }
@@ -502,7 +503,7 @@ fn button_with_icon(
     rounded_stroke(ui.painter(), rect, radius, Stroke::new(1.0, border));
     if let Some(glyph) = icon {
         let icon_rect = Rect::from_min_size(pos2(rect.left() + 10.0, rect.center().y - 10.0), Vec2::splat(20.0));
-        draw_glyph(ui.painter(), icon_rect, glyph, if enabled { pal.accent } else { fore }, 1.6);
+        draw_glyph(ui.painter(), icon_rect, glyph, if enabled && kind != Btn::Primary { pal.accent } else { fore }, 1.6);
         let label = Rect::from_min_max(pos2(icon_rect.right() + 6.0, rect.top()), rect.right_bottom());
         text_in(ui.painter(), label, text, font(12.0), fore, Align2::LEFT_CENTER);
     } else {
@@ -1200,7 +1201,7 @@ impl Launcher {
         // Reserve the bottom action even at the minimum supported window height.
         let compact = rect.height() < 525.0;
         let mut y = rect.top() + 100.0;
-        for (index, page) in Page::ALL.into_iter().enumerate() {
+        for (index, page) in Page::ALL.into_iter().filter(|p| *p != Page::Updates).enumerate() {
             if index == Page::SETTINGS_GROUP {
                 group_rect =
                     Rect::from_min_size(pos2(rect.left() + 12.0, y + 10.0), vec2(140.0, 16.0));
@@ -1267,10 +1268,10 @@ impl Launcher {
         );
         let label = self.updater.available.as_ref()
             .map(|v| format!("更新至 {v}")).unwrap_or_else(|| "检查更新".into());
-        if button_with_icon(ui, update, &label, Btn::Secondary, pal, true, Some(Glyph::Refresh)).clicked()
-            && let Err(e) = self.updater.open(&self.snapshot.root)
-        {
-            self.set_status(format!("打开更新窗口失败：{e}"), true);
+        let style = if self.page == Page::Updates { Btn::Primary } else { Btn::Secondary };
+        if button_with_icon(ui, update, &label, style, pal, true, Some(Glyph::Refresh)).clicked() {
+            self.show_page(Page::Updates);
+            self.updater.check(&self.snapshot.root);
         }
     }
 
@@ -1337,6 +1338,7 @@ impl Launcher {
             Page::Players => self.players_page(&mut page_ui, host, context, pal),
             Page::Danmaku => self.danmaku_page(&mut page_ui, host, context, pal),
             Page::Accounts => self.accounts_workbench_page(&mut page_ui, host, context),
+            Page::Updates => self.updater.page(&mut page_ui, &self.snapshot.root, pal.card),
             Page::Data => self.data_workbench_page(&mut page_ui, host, context, pal),
         }
         self.footer(ui, footer, context, pal);

@@ -283,7 +283,7 @@ fn shot_lookup_candidates() -> Vec<platforms::LookupCandidate> {
     ]
 }
 
-/// The eight workbench pages of the original C# launcher.
+/// Pages shown inside the launcher workbench.
 ///
 /// The Rust preview's old "开始看直播" page is folded into the favourites
 /// launch card, the old combined settings page is split into the original
@@ -299,11 +299,12 @@ pub enum Page {
     Danmaku,
     Accounts,
     Data,
+    Updates,
 }
 
 impl Page {
-    /// Navigation order of the original sidebar.
-    pub const ALL: [Self; 8] = [
+    /// Main navigation followed by the fixed footer entry.
+    pub const ALL: [Self; 9] = [
         Self::Favorites,
         Self::Recent,
         Self::Lookup,
@@ -312,6 +313,7 @@ impl Page {
         Self::Danmaku,
         Self::Accounts,
         Self::Data,
+        Self::Updates,
     ];
     /// Index of the first "设置与账号" group entry in Self::ALL.
     const SETTINGS_GROUP: usize = 4;
@@ -326,6 +328,7 @@ impl Page {
             Self::Players => "players",
             Self::Danmaku => "danmaku",
             Self::Accounts => "accounts",
+            Self::Updates => "updates",
             Self::Data => "data",
         }
     }
@@ -344,6 +347,7 @@ impl Page {
             Self::Players => "播放器与画质",
             Self::Danmaku => "弹幕与 SC 设置",
             Self::Accounts => "账号与登录",
+            Self::Updates => "检查更新",
             Self::Data => "本地数据 / 平台状态",
         }
     }
@@ -357,6 +361,7 @@ impl Page {
             Self::Players => "选择程序路径，管理画质和播放偏好。",
             Self::Danmaku => "显示、过滤、SC 与更多覆盖层设置。",
             Self::Accounts => "四个平台的登录与 Cookie 状态，一处管理。",
+            Self::Updates => "查看正式版并管理更新。",
             Self::Data => "浏览本地数据，查看解析、取流和弹幕运行状态。",
         }
     }
@@ -371,6 +376,7 @@ impl Page {
             Self::Players => "两种播放器分别指定路径；画质增强仅对 mpv 生效。",
             Self::Danmaku => "编辑后保存，运行中的覆盖层会读取更新。",
             Self::Accounts => "登录与 Cookie 检测按平台独立管理。",
+            Self::Updates => "安装更新会等待当前观看会话结束。",
             Self::Data => "只读查看本地数据；清理仅作用于缓存和日志。",
         }
     }
@@ -4472,9 +4478,7 @@ mod tests {
     }
 
     #[test]
-    fn page_keys_match_the_original_eight_page_navigation() {
-        // The sidebar order is the original navigation order; the old Rust-only
-        // pages (开始看直播 / 设置与凭据 / 关于) are folded into these eight.
+    fn page_keys_include_the_footer_update_entry() {
         let keys: Vec<&str> = Page::ALL.iter().map(|page| page.key()).collect();
         assert_eq!(
             keys,
@@ -4486,7 +4490,8 @@ mod tests {
                 "players",
                 "danmaku",
                 "accounts",
-                "data"
+                "data",
+                "updates"
             ]
         );
         for page in Page::ALL {
