@@ -22,7 +22,7 @@ Windows 多平台直播工具，支持 B站、虎牙、斗鱼、抖音，使用 
 
 本轮提供 **lite**（不捆绑播放器或 yt-dlp）及源码 ZIP。已有工具可以直接选择，无需重新下载。暂不提供 full 包；不要把历史提到的 full 当成本版可下载的资产。以 Release 的实际附件为准。
 
-当前版本为 **1.0.18**。主界面左下角可检查更新，支持自动检查更新，点击安装后等待直播结束并自动替换。「观看会话」可查看 mpv 的 A-V、两类丢帧和前向缓存，标记时保存当次采样；PotPlayer 显示可读取的播放状态和位置。[会话指标说明](docs/getting-started.md#播放器实时指标) · [播放器外观与使用说明](docs/player-styles.md) · [1.0.12 变化](docs/release-notes-1.0.12.md) · [1.0.10 功能更新](docs/release-notes-1.0.10.md) · [历史版本](https://github.com/xinshengxia/jubo-live-rust/releases)
+当前版本为 **1.1.0**。主界面左下角可检查更新，支持自动检查更新，点击安装后等待直播结束并自动替换。「观看会话」可查看 mpv 的 A-V、两类丢帧和前向缓存，标记时保存当次采样；PotPlayer 显示可读取的播放状态和位置。[会话指标说明](docs/getting-started.md#播放器实时指标) · [播放器外观与使用说明](docs/player-styles.md) · [1.0.12 变化](docs/release-notes-1.0.12.md) · [1.0.10 功能更新](docs/release-notes-1.0.10.md) · [历史版本](https://github.com/xinshengxia/jubo-live-rust/releases)
 
 ## 主要功能
 

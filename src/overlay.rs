@@ -4693,11 +4693,16 @@ mod native {
 
     static ORIGINAL_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 
-    fn client_point(window: Hwnd, lparam: isize) -> Point {
-        let mut point = Point {
+    fn message_point(lparam: isize) -> Point {
+        Point {
             x: (lparam & 0xffff) as u16 as i16 as i32,
             y: ((lparam >> 16) & 0xffff) as u16 as i16 as i32,
-        };
+        }
+    }
+
+    // Only WM_NCHITTEST and WM_MOUSEWHEEL supply screen coordinates.
+    fn screen_message_to_client(window: Hwnd, lparam: isize) -> Point {
+        let mut point = message_point(lparam);
         unsafe {
             ScreenToClient(window, &mut point);
         }
@@ -4725,7 +4730,7 @@ mod native {
             // Never activate/steal focus from the player window.
             WM_MOUSEACTIVATE => return 3, // MA_NOACTIVATE
             WM_NCHITTEST => {
-                let point = client_point(window, lparam);
+                let point = screen_message_to_client(window, lparam);
                 return if super::interaction_contains(point.x as f32, point.y as f32) {
                     HTCLIENT
                 } else {
@@ -4733,7 +4738,7 @@ mod native {
                 };
             }
             WM_LBUTTONDOWN => {
-                let point = client_point(window, lparam);
+                let point = message_point(lparam);
                 if let Some(offset) = super::interaction_bar_grab(point.x as f32, point.y as f32) {
                     // The scrollbar starts a drag; never treat it as a card click.
                     super::begin_native_bar_drag(offset);
@@ -4746,14 +4751,14 @@ mod native {
                 }
             }
             WM_MOUSEMOVE => {
-                let point = client_point(window, lparam);
+                let point = message_point(lparam);
                 super::move_native_bar_drag(point.y as f32);
                 if super::interaction_contains(point.x as f32, point.y as f32) {
                     return 0;
                 }
             }
             WM_LBUTTONUP => {
-                let point = client_point(window, lparam);
+                let point = message_point(lparam);
                 // Finishing a scrollbar drag must not trigger the card click.
                 if super::end_native_bar_drag() {
                     return 0;
@@ -4763,7 +4768,7 @@ mod native {
                 }
             }
             WM_MOUSEWHEEL => {
-                let point = client_point(window, lparam);
+                let point = screen_message_to_client(window, lparam);
                 if super::interaction_contains(point.x as f32, point.y as f32) {
                     let notches = ((wparam >> 16) & 0xffff) as u16 as i16 as f32 / 120.0;
                     super::record_native_wheel(notches);
@@ -4816,7 +4821,7 @@ mod native {
     // *thread*, so it never reliably reached PotPlayer (a different process):
     // the player lost mouse hover (its fullscreen control bar never appeared)
     // and the overlay felt "sometimes click-through". Paid-message input now
-    // lives in a separate, fully transparent (alpha 0) layered window whose
+    // lives in a separate, almost transparent layered window whose
     // *window region* is the union of the painted card rectangles. The system
     // skips a window outside its region, so every other pixel reaches the
     // player natively regardless of process boundaries.
@@ -4911,7 +4916,7 @@ mod native {
                 }
             }
             WM_LBUTTONDOWN => {
-                let point = client_point(window, lparam);
+                let point = message_point(lparam);
                 if let Some(offset) = super::interaction_bar_grab(point.x as f32, point.y as f32) {
                     super::begin_native_bar_drag(offset);
                     super::move_native_bar_drag(point.y as f32);
@@ -4924,7 +4929,7 @@ mod native {
                 }
             }
             WM_MOUSEMOVE => {
-                let point = client_point(window, lparam);
+                let point = message_point(lparam);
                 super::move_native_bar_drag(point.y as f32);
                 unsafe { forward_player_mouse_move(window, point) };
                 if super::interaction_contains(point.x as f32, point.y as f32) {
@@ -4932,7 +4937,7 @@ mod native {
                 }
             }
             WM_LBUTTONUP => {
-                let point = client_point(window, lparam);
+                let point = message_point(lparam);
                 unsafe { ReleaseCapture() };
                 if super::end_native_bar_drag() {
                     return 0;
@@ -4942,7 +4947,7 @@ mod native {
                 }
             }
             WM_MOUSEWHEEL => {
-                let point = client_point(window, lparam);
+                let point = screen_message_to_client(window, lparam);
                 if super::interaction_contains(point.x as f32, point.y as f32)
                     || super::interaction_bar_hit(point.x as f32, point.y as f32)
                 {
@@ -4997,10 +5002,13 @@ mod native {
                     diag_log("sc-input: CreateWindowExW failed");
                     return;
                 }
+                // Windows skips alpha-zero layered windows during mouse hit testing.
+                if SetLayeredWindowAttributes(window, 0, 1, 2) == 0 {
+                    DestroyWindow(window);
+                    diag_log("sc-input: layered window setup failed");
+                    return;
+                }
                 SC_INPUT_HWND.store(window as isize, AtomicOrdering::Release);
-                // Alpha 0: invisible yet still hit-testable; only LWA_COLORKEY
-                // would make the window click-through.
-                SetLayeredWindowAttributes(window, 0, 0, 2);
                 let mut message: HotkeyMessage = std::mem::zeroed();
                 loop {
                     let got = GetMessageW(&mut message, std::ptr::null_mut(), 0, 0);
@@ -5036,36 +5044,20 @@ mod native {
         player: Hwnd,
         area: &ClientArea,
         visible: bool,
-        last_signature: &mut u64,
+        last_signature: &mut Option<u64>,
     ) {
         SC_PLAYER_HWND.store(player as isize, AtomicOrdering::Release);
         let window = SC_INPUT_HWND.load(AtomicOrdering::Acquire) as Hwnd;
         if window.is_null() {
             return;
         }
-        if !visible {
+        let regions = super::interaction_regions();
+        if !visible || regions.is_empty() {
             unsafe { ShowWindowAsync(window, 0) };
             return;
         }
-        unsafe {
-            SetWindowPos(
-                window,
-                overlay,
-                area.left,
-                area.top,
-                area.width,
-                area.height,
-                0x0010, // SWP_NOACTIVATE: keep it directly above the overlay
-            );
-        }
-        let regions = super::interaction_regions();
         let signature = region_signature(&regions);
-        if signature != *last_signature {
-            *last_signature = signature;
-            if regions.is_empty() {
-                unsafe { ShowWindowAsync(window, 0) };
-                return;
-            }
+        if Some(signature) != *last_signature {
             let region = unsafe { CreateRectRgn(0, 0, 0, 0) };
             if region.is_null() {
                 return;
@@ -5080,18 +5072,31 @@ mod native {
                     )
                 };
                 if piece.is_null() {
-                    continue;
+                    unsafe { DeleteObject(region) };
+                    return;
                 }
-                unsafe {
-                    CombineRgn(region, region, piece, 2); // RGN_OR
+                let combined = unsafe {
+                    let result = CombineRgn(region, region, piece, 2); // RGN_OR
                     DeleteObject(piece);
+                    result
+                };
+                if combined == 0 {
+                    unsafe { DeleteObject(region) };
+                    return;
                 }
             }
             if unsafe { SetWindowRgn(window, region, 1) } == 0 {
                 unsafe { DeleteObject(region) };
+                return;
             }
+            *last_signature = Some(signature);
         }
-        unsafe { ShowWindowAsync(window, 4) }; // SW_SHOWNOACTIVATE
+        // The visible overlay passes through mouse input. Keep this clipped
+        // window immediately below it, above the player, without activating it.
+        unsafe {
+            SetWindowPos(window, overlay, area.left, area.top, area.width, area.height,
+                0x0010 | 0x0040); // SWP_NOACTIVATE | SWP_SHOWWINDOW
+        }
     }
 
     pub fn close_sc_input_window() {
@@ -5289,7 +5294,7 @@ mod native {
         // Dedicated thread + window for paid-message input; the main window keeps
         // WS_EX_TRANSPARENT so the player always receives its own mouse input.
         spawn_sc_input_thread();
-        let mut sc_input_signature: u64 = 0;
+        let mut sc_input_signature = None;
         while !cancel.is_cancelled() {
             let fatal_notice = super::fatal_notice(fatal);
             if let Some(notice) = &fatal_notice {
@@ -5332,7 +5337,7 @@ mod native {
             // WM_NCHITTEST with HTTRANSPARENT outside the cards, but that only
             // forwards inside the same thread: PotPlayer (another process) lost
             // the hover that reveals its fullscreen control bar. Input for cards
-            // now lives in a separate alpha-0 window clipped to the card rects
+            // now lives in a separate window clipped to the card rects
             // (see spawn_sc_input_thread), so the main window can stay transparent.
             let passthrough = true;
             let mut desired = native_style & !(0x20 | 0x0004_0000);
@@ -5503,6 +5508,10 @@ mod native {
                             }
                             crate::window_policy::ZOrderAction::AbovePlayer => {
                                 let mut above = GetWindow(target, 3); // GW_HWNDPREV
+                                let input = SC_INPUT_HWND.load(AtomicOrdering::Acquire) as Hwnd;
+                                if !input.is_null() && above == input {
+                                    above = GetWindow(input, 3);
+                                }
                                 if above == overlay {
                                     flags |= 0x0004; // NOZORDER
                                     above = std::ptr::null_mut();
