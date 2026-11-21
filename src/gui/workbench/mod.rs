@@ -156,6 +156,7 @@ pub(super) enum Glyph {
     Data,
     Monitor,
     MonitorPlay,
+    Refresh,
     Drive,
     Play,
     Check,
@@ -206,6 +207,17 @@ pub(super) fn draw_glyph(painter: &Painter, rect: Rect, glyph: Glyph, color: Col
         painter.add(egui::Shape::line(pts, stroke));
     };
     match glyph {
+        Glyph::Refresh => {
+            for start in [192.0_f32, 12.0] {
+                let arc = (0..=14).map(|i| {
+                    let a = (start + 138.0 * i as f32 / 14.0).to_radians();
+                    pos2(x + size * (0.5 + a.cos() / 3.0), y + size * (0.5 + a.sin() / 3.0))
+                }).collect();
+                painter.add(egui::Shape::line(arc, stroke));
+            }
+            poly(&[(19.0 / 24.0, 3.0 / 24.0), (19.0 / 24.0, 8.0 / 24.0), (14.0 / 24.0, 8.0 / 24.0)], false);
+            poly(&[(5.0 / 24.0, 21.0 / 24.0), (5.0 / 24.0, 16.0 / 24.0), (10.0 / 24.0, 16.0 / 24.0)], false);
+        }
         Glyph::Favorites => {
             let mut points = Vec::new();
             for index in 0..10 {
@@ -406,6 +418,12 @@ pub(super) fn button(
     pal: &Pal,
     enabled: bool,
 ) -> Response {
+    button_with_icon(ui, rect, text, kind, pal, enabled, None)
+}
+
+fn button_with_icon(
+    ui: &mut Ui, rect: Rect, text: &str, kind: Btn, pal: &Pal, enabled: bool, icon: Option<Glyph>,
+) -> Response {
     let id = ui
         .id()
         .with(("wb-button", rect.left() as i32, rect.top() as i32, text));
@@ -482,14 +500,14 @@ pub(super) fn button(
     };
     rounded(ui.painter(), rect, radius, fill);
     rounded_stroke(ui.painter(), rect, radius, Stroke::new(1.0, border));
-    text_in(
-        ui.painter(),
-        rect,
-        text,
-        font(12.0),
-        fore,
-        Align2::CENTER_CENTER,
-    );
+    if let Some(glyph) = icon {
+        let icon_rect = Rect::from_min_size(pos2(rect.left() + 10.0, rect.center().y - 10.0), Vec2::splat(20.0));
+        draw_glyph(ui.painter(), icon_rect, glyph, if enabled { pal.accent } else { fore }, 1.6);
+        let label = Rect::from_min_max(pos2(icon_rect.right() + 6.0, rect.top()), rect.right_bottom());
+        text_in(ui.painter(), label, text, font(12.0), fore, Align2::LEFT_CENTER);
+    } else {
+        text_in(ui.painter(), rect, text, font(12.0), fore, Align2::CENTER_CENTER);
+    }
     response
 }
 
@@ -1249,7 +1267,7 @@ impl Launcher {
         );
         let label = self.updater.available.as_ref()
             .map(|v| format!("更新至 {v}")).unwrap_or_else(|| "检查更新".into());
-        if button(ui, update, &label, Btn::Secondary, pal, true).clicked()
+        if button_with_icon(ui, update, &label, Btn::Secondary, pal, true, Some(Glyph::Refresh)).clicked()
             && let Err(e) = self.updater.open(&self.snapshot.root)
         {
             self.set_status(format!("打开更新窗口失败：{e}"), true);
