@@ -3056,14 +3056,14 @@ impl Overlay {
                 );
             }
         }
-        let items: Vec<danmaku::FlyingDanmaku> = self.scheduler.active().to_vec();
+        let items = self.scheduler.active();
         let dictionary = show_images.then_some(&self.emoticons);
         let manifest = if self.options.show_color_emoji {
             self.color_emoji.as_ref().map(|sheet| &sheet.manifest)
         } else {
             None
         };
-        for item in &items {
+        for item in items {
             let repeat = self.pipeline.count(&item.message.id);
             let mut merge = 1.0_f32;
             if repeat > 1 && self.options.behavior.enlarge_merged {
@@ -4541,7 +4541,9 @@ impl eframe::App for Overlay {
                 rect.height()
             ));
         }
-        ctx.request_repaint_after(Duration::from_millis(33));
+        let idle = self.scheduler.active().is_empty() && self.super_chats.len() == 0
+            && self.live_events.is_empty() && self.pending.is_empty();
+        ctx.request_repaint_after(Duration::from_millis(if idle { 100 } else { 33 }));
     }
 }
 
@@ -5488,6 +5490,7 @@ mod native {
                     overlay_log(crate::diag::Level::Debug, &line);
                 }
             }
+            let previously_shown = shown;
             let visible = force_visible || decision.visible;
             if visible {
                 if let Some(area) = area {
@@ -5510,15 +5513,11 @@ mod native {
                                 flags |= 0x0004; // NOZORDER
                             }
                         }
-                        SetWindowPos(
-                            overlay,
-                            insert_after,
-                            area.left,
-                            area.top,
-                            area.width,
-                            area.height,
-                            flags,
-                        );
+                        // Avoid asynchronous move/resize messages when the overlay is already
+                        // visible, aligned and in the correct z-order above its player.
+                        if !shown || flags & 0x0004 == 0 || client_area(overlay) != Some(area) {
+                            SetWindowPos(overlay, insert_after, area.left, area.top, area.width, area.height, flags);
+                        }
                     }
                 }
                 if !shown {
@@ -5549,7 +5548,9 @@ mod native {
                 visible && area.is_some(),
                 &mut sc_input_signature,
             );
-            ctx.request_repaint_after(Duration::from_millis(33));
+            // Preserve the visible follow/redraw cadence and wake a newly shown window.
+            if visible != previously_shown { ctx.request_repaint(); }
+            else if visible { ctx.request_repaint_after(Duration::from_millis(33)); }
             thread::sleep(Duration::from_millis(50));
         }
         if overlay.is_null() {

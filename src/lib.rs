@@ -25,6 +25,7 @@ pub mod network;
 pub mod overlay;
 pub mod platforms;
 pub mod playback;
+mod player_metrics;
 pub mod relay;
 pub mod room_state;
 pub mod search;

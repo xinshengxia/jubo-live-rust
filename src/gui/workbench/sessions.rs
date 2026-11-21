@@ -39,11 +39,12 @@ impl Launcher {
                     && let Some(session) = &selected {
                     let counters = session.relay.as_ref().map(sync_diagnostics)
                         .unwrap_or_else(|| "尚无中继遥测".into());
-                    let message = format!("session={} player={} phase={} {}", session.id,
-                        session.player, session.phase.label(), counters);
+                    let metrics = self.sessions.player_metrics(&session.id, true);
+                    let message = format!("session={} player={} phase={} 播放器采样={} {}", session.id,
+                        session.player, session.phase.label(), metrics, counters);
                     let saved = crate::diag::append(&self.snapshot.root.join("logs"), "avsync",
                         crate::diag::Level::Info, &message);
-                    self.set_status(if saved { "已记录异常时间与当前中继计数，可在诊断日志查看。" }
+                    self.set_status(if saved { "已记录异常时间、播放器采样与当前中继计数，可在诊断日志查看。" }
                         else { "异常标记未保存，请检查日志目录写入权限。" }, !saved);
                 }
                 if ui.button("查看诊断日志").clicked() {
@@ -63,6 +64,10 @@ impl Launcher {
             ui.allocate_space(vec2(table.width(), height + 8.0));
             if let Some(session) = selected {
                 ui.strong(format!("{} · {}", session.room_state.label(), session.phase.label()));
+                ui.label(self.sessions.player_metrics(&session.id, false));
+                if !session.phase.is_terminal() {
+                    context.request_repaint_after(std::time::Duration::from_secs(1));
+                }
                 // The backend already reports an explicit resync through
                 // room_note ("正在停止本会话…/已重新打开为新的观看会话（第N次）"),
                 // so the page only has to render that note and the relay counters.
@@ -76,7 +81,7 @@ impl Launcher {
                         relay.stable_segments, relay.forwarded_tags, relay.forwarded_bytes, relay.budget_exhaustions));
                     ui.label(sync_diagnostics(relay));
                     if session.player == crate::core::Player::PotPlayer {
-                        ui.small("播放器画面进度未知。若画面持续定格，可选中此房间并点“一次重新同步”。");
+                        ui.small("若画面持续定格，可选中此房间并点“一次重新同步”。");
                     }
                     ui.small("时钟差来自中继最新音视频包的时间戳，不是实际扬声器与屏幕的同步测量。标记异常后再重新同步，可保留故障当时的计数。");
                     if let Some(waiting) = &relay.waiting_state {

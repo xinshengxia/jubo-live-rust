@@ -230,6 +230,7 @@ impl RelayTelemetry {
 
 #[derive(Default)]
 struct ControlState {
+    metrics: Mutex<crate::player_metrics::PlayerMetrics>,
     // Starting -> Running or Cancelled. Cancellation cannot cross the atomic
     // transition to Running and accidentally stop an already playing session.
     lifecycle: AtomicU8,
@@ -240,6 +241,10 @@ struct ControlState {
 pub struct PlaybackControl(Arc<ControlState>);
 
 impl PlaybackControl {
+    pub(crate) fn player_metrics(&self, pid: u32, force: bool, player: Player) -> String {
+        self.0.metrics.lock().unwrap_or_else(|e| e.into_inner()).summary(pid, force, player)
+    }
+
     pub fn cancel_start(&self) -> bool {
         self.0
             .lifecycle
@@ -2159,6 +2164,11 @@ where
             })
             .map(|hints| {
                 hints.apply_to(&mut plan, &scripts.title, scripts.resync.as_deref());
+                let metrics = scripts.title.with_file_name("session-metrics.lua");
+                if let Some(path) = mpv_option_path(&metrics) {
+                    plan.arguments.insert(0, format!("--script={path}").into());
+                    control.0.metrics.lock().unwrap_or_else(|e| e.into_inner()).state_file = Some(hints.paths().state.clone());
+                }
                 if target.platform == Platform::Bili && !relayed
                     && let Some(watch) = &room_watch
                     && let Ok(binary) = std::env::current_exe()

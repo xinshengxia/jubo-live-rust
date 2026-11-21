@@ -252,6 +252,16 @@ impl SessionManager {
             .map(|entry| entry.snapshot.clone())
     }
 
+    pub fn player_metrics(&self, id: &str, force: bool) -> String {
+        let (control, pid, player) = {
+            let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(entry) = state.entries.get(id) else { return "会话已结束".into(); };
+            if entry.snapshot.phase.is_terminal() { return "会话已结束".into(); }
+            (entry.control.clone(), entry.snapshot.player_pid, entry.snapshot.player)
+        };
+        pid.map(|p| control.player_metrics(p, force, player)).unwrap_or_else(|| "等待播放器采样".into())
+    }
+
     pub fn launch_settings(&self, id: &str) -> Option<Settings> {
         self.inner.state.lock().unwrap_or_else(|e| e.into_inner())
             .entries.get(id).map(|entry| entry.settings.clone())
