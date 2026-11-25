@@ -2,13 +2,11 @@
 
 ## mpv
 
-默认播放需要 **OpenAL 音频输出**。应用直接探测选中的二进制，不根据文件名、“完整版”或版本新旧推断支持。没有 OpenAL 时请换构建或选择 PotPlayer；应用不会静默切回其他后端。
+Windows x64 推荐使用 **zhongfly 的 2026-11-24 普通 x64 构建**。该构建的 mpv 版本为 `v0.42.0-228-g35efcf53d`，已通过 `--ao=help` 验证支持本应用默认使用的 OpenAL 音频输出。[下载 mpv-x86_64-20261124-git-35efcf53d5.7z](https://github.com/zhongfly/mpv-winbuild/releases/download/2026-11-24-35efcf53d5/mpv-x86_64-20261124-git-35efcf53d5.7z) · [GitHub 发布页](https://github.com/zhongfly/mpv-winbuild/releases/tag/2026-11-24-35efcf53d5)
 
-2026-11-17 已检查的 Windows x64 构建：shinchiro `20261021`，mpv `v0.41.0-1227-ge471496c5`；版本输出及 `--ao=help` 包含 OpenAL 已通过。本地短播放、实际直播和两小时同步结果见本版验证记录，未完成部分不作保证。
+归档的 SHA-256 为 `00708d773d289b5154ec0805d5b25a30612c5333dfa59a26239964d5df3f7946`。
 
-[下载该兼容构建](https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261021/mpv-x86_64-20261021-git-e471496c56.7z) · [构建发布页](https://github.com/shinchiro/mpv-winbuild-cmake/releases/tag/20261021)
-
-归档 SHA-256：`4a355f3e89c83fabc730d33fb4e759dfec747806ed2287b61a90d1681b83e8d3`。解压后选择 `mpv.exe`。该条是已检查的兼容选择，不表示它是最新 mpv，也不会强制替换用户现有播放器。其他构建须在应用里重新检测。
+完整解压归档，在应用的“播放器”页选择其中的 `mpv.exe`，然后点击“检测并保存”。已有 mpv 也可以直接选择，应用会检测该程序是否支持 OpenAL。
 
 ## PotPlayer
 
