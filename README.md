@@ -14,7 +14,7 @@ Windows 多平台直播工具，支持 B站、虎牙、斗鱼、抖音，使用 
 2. 打开“播放器与画质”，选择已有 mpv / PotPlayer 程序，或桌面、开始菜单的 `.lnk` 快捷方式；检测通过后自动保存真实程序位置。没有播放器时使用“获取兼容 mpv”。
 3. 输入直播间链接或“平台:房间号”，打开直播；平台需要登录或验证时，再到“账号与登录”操作。
 
-mpv 默认使用 OpenAL 音频输出。Windows x64 推荐使用 zhongfly 的 2026-11-24 普通 x64 构建，已验证支持 OpenAL。[下载推荐的 x64 归档](https://github.com/zhongfly/mpv-winbuild/releases/download/2026-11-24-35efcf53d5/mpv-x86_64-20261124-git-35efcf53d5.7z) · [安装方法与 SHA-256](docs/tool-setup.md#mpv)
+Windows 用户推荐使用 shinchiro 最新成功的普通 x64 构建。在作者的 Actions 构建记录中按日期找到最近成功的 `Building mpv (x86_64)`，登录 GitHub 后下载该次的 `mpv-x86_64`。本应用使用 OpenAL 音频输出。[构建记录](https://github.com/shinchiro/mpv-winbuild-cmake/actions/workflows/mpv_clang.yml) · [当前核验的 11 月 25 日构建](https://github.com/shinchiro/mpv-winbuild-cmake/actions/runs/45514553107/artifacts/14979868817) · [解压和校验方法](docs/tool-setup.md#mpv)
 
 ## 下载哪个包
 

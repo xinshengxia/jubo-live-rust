@@ -2,11 +2,16 @@
 
 ## mpv
 
-Windows x64 推荐使用 **zhongfly 的 2026-11-24 普通 x64 构建**。该构建的 mpv 版本为 `v0.42.0-228-g35efcf53d`，已通过 `--ao=help` 验证支持本应用默认使用的 OpenAL 音频输出。[下载 mpv-x86_64-20261124-git-35efcf53d5.7z](https://github.com/zhongfly/mpv-winbuild/releases/download/2026-11-24-35efcf53d5/mpv-x86_64-20261124-git-35efcf53d5.7z) · [GitHub 发布页](https://github.com/zhongfly/mpv-winbuild/releases/tag/2026-11-24-35efcf53d5)
+推荐使用 **shinchiro 最新成功的普通 Windows x64 构建**。打开作者的 Actions 构建记录，从最近的一次开始查看 `Building mpv (x86_64)` 作业。只要该作业成功且产物可用，即可登录 GitHub，在该次运行的 Artifacts 下下载 `mpv-x86_64`。其他架构可能让整次运行显示失败。[查看各日期的构建记录](https://github.com/shinchiro/mpv-winbuild-cmake/actions/workflows/mpv_clang.yml)
 
-归档的 SHA-256 为 `00708d773d289b5154ec0805d5b25a30612c5333dfa59a26239964d5df3f7946`。
+已核验的 2026-11-25 构建为 `v0.42.0-229-gd32c910be`，已通过 OpenAL/WASAPI 双声道静音播放测试。本次普通 x64 下载有效至 2027-02-23 00:00 UTC。此链接过期后，请从上方的构建记录选择最新可用作业。[查看本次 x64 成功作业](https://github.com/shinchiro/mpv-winbuild-cmake/actions/runs/45514553107/job/138870539617) · [下载本次 mpv-x86_64](https://github.com/shinchiro/mpv-winbuild-cmake/actions/runs/45514553107/artifacts/14979868817)
 
-完整解压归档，在应用的“播放器”页选择其中的 `mpv.exe`，然后点击“检测并保存”。已有 mpv 也可以直接选择，应用会检测该程序是否支持 OpenAL。
+下载后先解压 Actions 提供的 ZIP，再解压里面的 `mpv-x86_64-20261125-git-d32c910be6.7z`。在应用的“播放器”页选择 `mpv.exe`，点击“检测并保存”即可检查本应用需要的 OpenAL 音频输出。
+
+| 11 月 25 日构建的归档 | SHA-256 |
+| --- | --- |
+| Actions 下载的 ZIP | `091e89a2b4cc34c3ec9eca121b5a5b2d717e0cd1df3af7919673a7cdc7769f1c` |
+| ZIP 内的 7z | `6b2960130007817c9be5ddfd1d3f69ca476d3d391d5549d303b7c05668cb7fad` |
 
 ## PotPlayer
 
