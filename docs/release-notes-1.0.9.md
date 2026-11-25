@@ -13,11 +13,11 @@
 
 ## 兼容 mpv 获取
 
-推荐 **[shinchiro/mpv-winbuild-cmake GitHub 项目](https://github.com/shinchiro/mpv-winbuild-cmake)**。
+安装 mpv 时，请参阅[当前推荐的 Windows x64 构建与安装方法](tool-setup.md#mpv)。
 
-本轮已检查 [20261021 Windows x64 构建](https://github.com/shinchiro/mpv-winbuild-cmake/releases/tag/20261021)：mpv `v0.41.0-1227-ge471496c5`，`--ao=help` 含 OpenAL。[直接下载归档](https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261021/mpv-x86_64-20261021-git-e471496c56.7z)。归档 SHA-256：`4a355f3e89c83fabc730d33fb4e759dfec747806ed2287b61a90d1681b83e8d3`。
+**1.0.9 发布时的验证记录。** 当时使用 shinchiro 的 20261021 Windows x64 构建，mpv 版本为 `v0.41.0-1227-ge471496c5`，`--ao=help` 列出了 OpenAL。该归档的 SHA-256 为 `4a355f3e89c83fabc730d33fb4e759dfec747806ed2287b61a90d1681b83e8d3`。[历史构建发布页](https://github.com/shinchiro/mpv-winbuild-cmake/releases/tag/20261021)
 
-这是已检查的兼容选择，不表示最新版本。**项目名、版本较新或“完整版”都不能代替实际能力检测。** 选其他日期、架构或来源的构建后，请在本应用重新检测。不会静默切回 WASAPI；PotPlayer 不需要 OpenAL。
+使用其他 mpv 构建时，请在应用中重新检测 OpenAL 支持。PotPlayer 使用自己的音频输出。
 
 ## 发布包与升级
 
