@@ -1351,7 +1351,7 @@ impl Launcher {
                 let overlay = if enabled {
                     snapshot
                         .player_pid
-                        .map(|pid| launch_overlay(&snapshot.target, pid, &self.snapshot.root))
+                        .map(|pid| launch_overlay(&snapshot.target, snapshot.player, pid, &self.snapshot.root))
                         .unwrap_or_else(|| OverlayLaunch::Failed("播放器进程号不可用".into()))
                 } else {
                     OverlayLaunch::Disabled
@@ -3042,7 +3042,7 @@ fn credential_state(data_root: &Path) -> CredentialState {
 ///
 /// The overlay process decides on its own whether it should become visible; the
 /// launcher only creates it and reports the outcome without blocking playback.
-fn launch_overlay(target: &Target, player_pid: u32, data_root: &Path) -> OverlayLaunch {
+fn launch_overlay(target: &Target, player: Player, player_pid: u32, data_root: &Path) -> OverlayLaunch {
     if !cfg!(windows) {
         return OverlayLaunch::UnsupportedSystem;
     }
@@ -3057,16 +3057,17 @@ fn launch_overlay(target: &Target, player_pid: u32, data_root: &Path) -> Overlay
         Ok(executable) => executable,
         Err(error) => return OverlayLaunch::Failed(format!("无法定位当前程序：{error}")),
     };
-    spawn_overlay_child(&executable, &arguments)
+    spawn_overlay_child(&executable, &arguments, player)
 }
 
 #[cfg(windows)]
-fn spawn_overlay_child(executable: &Path, arguments: &[OsString]) -> OverlayLaunch {
+fn spawn_overlay_child(executable: &Path, arguments: &[OsString], player: Player) -> OverlayLaunch {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     let mut command = Command::new(executable);
     command
         .args(arguments)
+        .env("LIVE_HUB_OVERLAY_PLAYER", player.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -3080,7 +3081,7 @@ fn spawn_overlay_child(executable: &Path, arguments: &[OsString]) -> OverlayLaun
 }
 
 #[cfg(not(windows))]
-fn spawn_overlay_child(_executable: &Path, _arguments: &[OsString]) -> OverlayLaunch {
+fn spawn_overlay_child(_executable: &Path, _arguments: &[OsString], _player: Player) -> OverlayLaunch {
     OverlayLaunch::UnsupportedSystem
 }
 

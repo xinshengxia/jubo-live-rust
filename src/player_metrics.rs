@@ -21,7 +21,6 @@ impl PlayerMetrics {
         {
             return text.clone();
         }
-        let now = Utc::now().timestamp();
         let text = if player == crate::core::Player::PotPlayer {
             format!(
                 "PotPlayer {}  ·  A-V —  ·  丢帧 解码 — / 输出 —  ·  缓存 —（PotPlayer 未提供）",
@@ -30,17 +29,20 @@ impl PlayerMetrics {
         } else {
             self.state_file
                 .as_deref()
-                .and_then(|p| {
-                    (0..2)
-                        .filter_map(|slot| read_slot(p, slot, pid, now))
-                        .max_by_key(|item| item.0)
-                })
-                .map(|(_, text)| text)
+                .and_then(|path| latest_mpv_sample(path, pid))
                 .unwrap_or_else(|| "mpv 暂无新采样".into())
         };
         self.last_read = Some((Instant::now(), pid, text.clone()));
         text
     }
+}
+
+pub(crate) fn latest_mpv_sample(path: &Path, pid: u32) -> Option<String> {
+    let now = Utc::now().timestamp();
+    (0..2)
+        .filter_map(|slot| read_slot(path, slot, pid, now))
+        .max_by_key(|item| item.0)
+        .map(|(_, text)| text)
 }
 
 fn read_slot(path: &Path, slot: u8, pid: u32, now: i64) -> Option<(i64, String)> {

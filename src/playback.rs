@@ -1032,6 +1032,10 @@ fn supervise_controlled(
     room_watch_stop: Arc<AtomicBool>,
 ) {
     let telemetry_stop = Arc::new(AtomicBool::new(false));
+    // Keep pre-incident player counters alongside the overlay's window events.
+    // The two live metric slots are overwritten every second.
+    let display_metrics = control.0.metrics.lock().unwrap_or_else(|e| e.into_inner()).state_file.clone();
+    let mut next_display_sample = Instant::now();
     if let Some(relay_url) = relay_url {
         let stop = telemetry_stop.clone();
         let observer = observer.clone();
@@ -1079,6 +1083,14 @@ fn supervise_controlled(
         }
         let player_status = player.try_wait();
         let player_exited = matches!(player_status, Ok(Some(_)) | Err(_));
+        if !player_exited && let Some(path) = &display_metrics
+            && crate::diag::is_initialized() && Instant::now() >= next_display_sample
+        {
+            next_display_sample = Instant::now() + Duration::from_secs(10);
+            if let Some(sample) = crate::player_metrics::latest_mpv_sample(path, player.id()) {
+                crate::diag::log("mpv-display", crate::diag::Level::Info, &format!("pid={} {sample}", player.id()));
+            }
+        }
         if let Some(child) = relay.as_mut() {
             let relay_status = child.try_wait();
             if matches!(relay_status, Ok(Some(_)) | Err(_)) {

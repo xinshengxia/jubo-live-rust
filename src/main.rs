@@ -1064,6 +1064,7 @@ fn dispatch(data_dir: Option<PathBuf>, action: Action) -> Result<()> {
                     &outcome.player_pid.to_string(),
                 ]);
                 command.env("LIVE_HUB_CREDENTIAL_ROOT", vault.root());
+                command.env("LIVE_HUB_OVERLAY_PLAYER", player.to_string());
                 command
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())

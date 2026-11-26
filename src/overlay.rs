@@ -1878,26 +1878,32 @@ fn run_configured(
                 }
             })?;
         let title = format!("LiveHub Rust Overlay {}", uuid::Uuid::new_v4().simple());
-        let window_title = title.clone();
+        let bitmap = native::layered::use_bitmap(player_pid);
+        let render_title = if bitmap { format!("LiveHub frame renderer {}", uuid::Uuid::new_v4().simple()) }
+            else { title.clone() };
+        let render_window_title = render_title.clone();
         let app_cancel = cancellation.clone();
         let app_fatal = fatal.clone();
         let shared = shared_options(options.clone());
         let native_options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([640.0, 360.0])
-                .with_transparent(true)
                 .with_decorations(false)
                 .with_resizable(false)
                 .with_active(false)
                 .with_visible(false)
-                .with_mouse_passthrough(true),
+                .with_taskbar(false)
+                .with_transparent(!bitmap)
+                .with_mouse_passthrough(!bitmap),
+            vsync: !bitmap,
             renderer: eframe::Renderer::Glow,
             ..Default::default()
         };
         let result = eframe::run_native(
-            &title,
+            &render_title,
             native_options,
             Box::new(move |context| {
+                let windows = native::layered::create(&render_window_title, &title, bitmap)?;
                 // A hidden window still needs its first paint; the watcher will show
                 // it only when a suitable player client area is in the foreground.
                 let (hotkey_sender, hotkey_receiver) = std::sync::mpsc::sync_channel(16);
@@ -1920,7 +1926,7 @@ fn run_configured(
                     .spawn(move || {
                         native::follow(
                             process,
-                            &window_title,
+                            windows,
                             &ctx,
                             &follow_cancel,
                             &follow_fatal,
@@ -4408,11 +4414,18 @@ impl Drop for Overlay {
 }
 
 impl eframe::App for Overlay {
+    #[cfg(windows)]
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        native::layered::shutdown(gl);
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 0.0]
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        native::layered::schedule(ctx);
         // Opt-in renderer evidence contains only this overlay's RGBA pixels,
         // never a desktop capture. Refuse to replace any existing file.
         for event in ctx.input(|input| input.events.clone()) {
@@ -4449,6 +4462,8 @@ impl eframe::App for Overlay {
         // A terminal receiver error is shown once, then the overlay exits instead
         // of spinning on a platform whose transport cannot work.
         if let Some(notice) = fatal_notice(&self.fatal) {
+            #[cfg(windows)]
+            native::layered::set_content_hidden(false);
             self.paint_fatal(ctx, &notice);
             ctx.request_repaint_after(Duration::from_millis(100));
             if fatal_expired(notice.since.elapsed()) {
@@ -4468,6 +4483,8 @@ impl eframe::App for Overlay {
         }
         self.apply_hotkeys(ctx);
         self.poll_settings();
+        #[cfg(windows)]
+        native::layered::set_content_hidden(self.user_hidden);
         if self.last_stats_log.elapsed() >= Duration::from_secs(30) {
             self.last_stats_log = Instant::now();
             overlay_log(
@@ -4529,7 +4546,13 @@ impl eframe::App for Overlay {
             && now >= 4.0
         {
             self.diag_capture_requested = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+            #[cfg(windows)]
+            let captured = native::layered::request_capture();
+            #[cfg(not(windows))]
+            let captured = false;
+            if !captured {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+            }
         }
         if std::env::var_os("LIVE_HUB_OVERLAY_DIAG_LOG").is_some() && (now.fract() < 0.05) {
             diag_log(&format!(
@@ -4578,6 +4601,7 @@ fn paint_galley_with_outline(
 
 #[cfg(windows)]
 mod native {
+    pub(super) mod layered { include!("overlay_layered.rs"); }
     use super::*;
     use crate::hotkeys::FixedOverlayAction;
     use std::ffi::c_void;
@@ -5264,7 +5288,7 @@ mod native {
     /// through the overlay (WS_EX_TRANSPARENT) and it never activates.
     pub fn follow(
         process: PlayerProcess,
-        title: &str,
+        windows: layered::Windows,
         ctx: &egui::Context,
         cancel: &Cancellation,
         fatal: &FatalSlot,
@@ -5283,13 +5307,14 @@ mod native {
         let mut last_fixed_retry = Instant::now() - Duration::from_secs(3);
         let mut live_options = super::OverlaySettings::default();
         let mut last_hide_reason: Option<crate::window_policy::HideReason> = None;
-        let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
         let diag_force_show = super::diag_force_show_from(|key| std::env::var(key).ok());
-        let mut overlay: Hwnd = std::ptr::null_mut();
-        let mut target: Hwnd = std::ptr::null_mut();
+        let overlay = windows.visible as Hwnd;
+        let renderer = windows.renderer as Hwnd;
         let mut style_set = false;
+        let bitmap = overlay != renderer;
+        let mut last_present_log = Instant::now();
+        let mut target: Hwnd = std::ptr::null_mut();
         let mut shown = false;
-        let started = Instant::now();
         let mut window_missing_since = None;
         // Dedicated thread + window for paid-message input; the main window keeps
         // WS_EX_TRANSPARENT so the player always receives its own mouse input.
@@ -5310,18 +5335,6 @@ mod native {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 break;
             }
-            if overlay.is_null() {
-                overlay = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
-            }
-            if overlay.is_null() {
-                if started.elapsed() > Duration::from_secs(15) {
-                    cancel.cancel();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    break;
-                }
-                thread::sleep(Duration::from_millis(50));
-                continue;
-            }
             let mut owner_pid = 0;
             unsafe {
                 GetWindowThreadProcessId(overlay, &mut owner_pid);
@@ -5331,34 +5344,36 @@ mod native {
                 break;
             }
             install_interaction_subclass(overlay);
-            let native_style = unsafe { GetWindowLongPtrW(overlay, -20) };
-            // The overlay window is mouse-transparent for its whole lifetime.
-            // Paid-message hit testing used to clear WS_EX_TRANSPARENT and answer
-            // WM_NCHITTEST with HTTRANSPARENT outside the cards, but that only
-            // forwards inside the same thread: PotPlayer (another process) lost
-            // the hover that reveals its fullscreen control bar. Input for cards
-            // now lives in a separate window clipped to the card rects
-            // (see spawn_sc_input_thread), so the main window can stay transparent.
-            let passthrough = true;
-            let mut desired = native_style & !(0x20 | 0x0004_0000);
-            desired |= 0x0800_0000 | 0x80; // NOACTIVATE | TOOLWINDOW
-            if passthrough {
-                desired |= 0x20; // TRANSPARENT
-            }
-            let tracked = 0x0800_0000 | 0x20 | 0x80;
-            if !style_set
-                || (native_style & tracked) != (desired & tracked)
-                || (native_style & 0x0004_0000) != 0
-            {
-                unsafe {
-                    SetWindowLongPtrW(overlay, -20, desired);
-                    // winit cursor passthrough adds WS_EX_LAYERED. Windows does
-                    // not composite a newly layered window until its attributes
-                    // are initialized, even when OpenGL has rendered pixels.
-                    // Keep full window alpha; egui supplies per-pixel opacity.
-                    SetLayeredWindowAttributes(overlay, 0, 255, 0x2); // LWA_ALPHA
+            if !bitmap {
+                let native_style = unsafe { GetWindowLongPtrW(overlay, -20) };
+                // The overlay window is mouse-transparent for its whole lifetime.
+                // Paid-message hit testing used to clear WS_EX_TRANSPARENT and answer
+                // WM_NCHITTEST with HTTRANSPARENT outside the cards, but that only
+                // forwards inside the same thread: PotPlayer (another process) lost
+                // the hover that reveals its fullscreen control bar. Input for cards
+                // now lives in a separate window clipped to the card rects
+                // (see spawn_sc_input_thread), so the main window can stay transparent.
+                let passthrough = true;
+                let mut desired = native_style & !(0x20 | 0x0004_0000);
+                desired |= 0x0800_0000 | 0x80; // NOACTIVATE | TOOLWINDOW
+                if passthrough {
+                    desired |= 0x20; // TRANSPARENT
                 }
-                style_set = true;
+                let tracked = 0x0800_0000 | 0x20 | 0x80;
+                if !style_set
+                    || (native_style & tracked) != (desired & tracked)
+                    || (native_style & 0x0004_0000) != 0
+                {
+                    unsafe {
+                        SetWindowLongPtrW(overlay, -20, desired);
+                        // winit cursor passthrough adds WS_EX_LAYERED. Windows does
+                        // not composite a newly layered window until its attributes
+                        // are initialized, even when OpenGL has rendered pixels.
+                        // Keep full window alpha; egui supplies per-pixel opacity.
+                        SetLayeredWindowAttributes(overlay, 0, 255, 0x2); // LWA_ALPHA
+                    }
+                    style_set = true;
+                }
             }
             // A hidden player window is not a followable target: re-resolve it so
             // the overlay hides and re-attaches when the player becomes visible.
@@ -5499,6 +5514,7 @@ mod native {
             let visible = force_visible || decision.visible;
             if visible {
                 if let Some(area) = area {
+                    if bitmap { layered::sync_renderer(renderer, target, area, ctx); }
                     unsafe {
                         let mut flags = 0x0010 | 0x0040 | 0x4000; // NOACTIVATE | SHOWWINDOW | ASYNCWINDOWPOS
                         let mut insert_after = std::ptr::null_mut();
@@ -5559,43 +5575,18 @@ mod native {
             );
             // Preserve the visible follow/redraw cadence and wake a newly shown window.
             if visible != previously_shown { ctx.request_repaint(); }
-            else if visible { ctx.request_repaint_after(Duration::from_millis(33)); }
+            else if visible && !bitmap { ctx.request_repaint_after(Duration::from_millis(33)); }
+            if bitmap && last_present_log.elapsed() >= Duration::from_secs(10) {
+                layered::log_health(visible);
+                last_present_log = Instant::now();
+            }
             thread::sleep(Duration::from_millis(50));
-        }
-        if overlay.is_null() {
-            overlay = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
         }
         close_sc_input_window();
         restore_interaction_subclass(overlay);
-        let mut final_owner_pid = 0;
-        if !overlay.is_null() {
-            unsafe {
-                GetWindowThreadProcessId(overlay, &mut final_owner_pid);
-            }
-        }
-        if !overlay.is_null() && final_owner_pid == std::process::id() {
-            // Close before hiding: winit/eframe can leave the event loop waiting
-            // for a repaint once the window is hidden, so a WM_CLOSE posted after
-            // the hide may never be processed and the process would linger.
-            unsafe {
-                PostMessageW(overlay, 0x0010, 0, 0);
-            }
-            diag_log("follow: posted WM_CLOSE");
-            let deadline = Instant::now() + Duration::from_millis(1500);
-            while Instant::now() < deadline && unsafe { IsWindow(overlay) } != 0 {
-                thread::sleep(Duration::from_millis(50));
-            }
-            diag_log(if unsafe { IsWindow(overlay) } != 0 {
-                "follow: window still alive after WM_CLOSE; hiding"
-            } else {
-                "follow: window closed"
-            });
-            if unsafe { IsWindow(overlay) } != 0 {
-                unsafe {
-                    ShowWindowAsync(overlay, 0);
-                }
-            }
-        }
+        // Close the eframe host on its event-loop thread; it owns the bitmap window too.
+        unsafe { PostMessageW(renderer, 0x0010, 0, 0); }
+
     }
 }
 
