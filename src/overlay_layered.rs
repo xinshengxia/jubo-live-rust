@@ -8,6 +8,11 @@ use std::{
     sync::OnceLock,
     sync::atomic::{AtomicU64, Ordering},
 };
+mod damage {
+    include!("overlay_damage.rs");
+}
+use damage::Scene;
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 pub(in crate::overlay) struct Windows {
@@ -194,6 +199,7 @@ struct Framebuffer {
     fbo: glow::Framebuffer,
     color: glow::Renderbuffer,
     dib: Dib,
+    pack: Option<PackBuffer>,
 }
 
 impl Framebuffer {
@@ -224,15 +230,165 @@ impl Framebuffer {
                 gl.delete_framebuffer(fbo);
                 anyhow::bail!("incomplete RGBA8 overlay framebuffer");
             }
-            Ok(Self { fbo, color, dib })
+            let pack = PackBuffer::new(gl, dib.len);
+            Ok(Self {
+                fbo,
+                color,
+                dib,
+                pack,
+            })
         }
     }
 
     fn delete(self, gl: &glow::Context) {
         unsafe {
+            if let Some(pack) = self.pack {
+                gl.delete_buffer(pack.buffer);
+            }
             gl.delete_renderbuffer(self.color);
             gl.delete_framebuffer(self.fbo);
         }
+    }
+}
+
+// Queue compact reads into one reusable buffer. Reading rectangles straight into a
+// full-width DIB with a large row pitch can make drivers allocate a separate
+// transfer surface for each rectangle size.
+struct PackBuffer {
+    buffer: glow::Buffer,
+    capacity: usize,
+}
+
+struct PackedRect {
+    buffer_offset: usize,
+    dib_offset: usize,
+    rows: usize,
+    row_bytes: usize,
+}
+
+impl PackBuffer {
+    fn new(gl: &glow::Context, bytes: usize) -> Option<Self> {
+        if gl.version().major < 3 {
+            return None;
+        }
+        let capacity = bytes.min(4 * 1024 * 1024);
+        unsafe {
+            let buffer = gl.create_buffer().ok()?;
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buffer));
+            gl.buffer_data_size(glow::PIXEL_PACK_BUFFER, capacity as i32, glow::STREAM_READ);
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            if gl.get_error() != glow::NO_ERROR {
+                gl.delete_buffer(buffer);
+                return None;
+            }
+            Some(Self { buffer, capacity })
+        }
+    }
+
+    fn read(
+        &self,
+        gl: &glow::Context,
+        dst: &mut [u8],
+        size: [i32; 2],
+        regions: &[Rect],
+    ) -> anyhow::Result<()> {
+        if regions.is_empty() {
+            return Ok(());
+        }
+        let [width, height] = size;
+        let gles = gl.version().is_embedded;
+        let format = if gles { glow::RGBA } else { glow::BGRA };
+        let mut batch = Vec::with_capacity(regions.len());
+        let mut used = 0;
+        unsafe {
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(self.buffer));
+            gl.pixel_store_i32(glow::PACK_ROW_LENGTH, 0);
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
+        }
+        let result = (|| {
+            for r in regions {
+                let w = r.right - r.left;
+                let row_bytes = w as usize * 4;
+                anyhow::ensure!(
+                    row_bytes <= self.capacity,
+                    "overlay row exceeds pixel pack buffer"
+                );
+                let mut y = height - r.bottom;
+                let end = height - r.top;
+                while y < end {
+                    let rows = ((self.capacity - used) / row_bytes).min((end - y) as usize);
+                    if rows == 0 {
+                        Self::copy_batch(gl, dst, width, &batch, used, gles)?;
+                        batch.clear();
+                        used = 0;
+                        continue;
+                    }
+                    unsafe {
+                        gl.read_pixels(
+                            r.left,
+                            y,
+                            w,
+                            rows as i32,
+                            format,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelPackData::BufferOffset(used as u32),
+                        );
+                    }
+                    batch.push(PackedRect {
+                        buffer_offset: used,
+                        dib_offset: (y as usize * width as usize + r.left as usize) * 4,
+                        rows,
+                        row_bytes,
+                    });
+                    used += rows * row_bytes;
+                    y += rows as i32;
+                }
+            }
+            Self::copy_batch(gl, dst, width, &batch, used, gles)
+        })();
+        unsafe {
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+        }
+        result
+    }
+
+    fn copy_batch(
+        gl: &glow::Context,
+        dst: &mut [u8],
+        width: i32,
+        batch: &[PackedRect],
+        used: usize,
+        gles: bool,
+    ) -> anyhow::Result<()> {
+        unsafe {
+            let ptr =
+                gl.map_buffer_range(glow::PIXEL_PACK_BUFFER, 0, used as i32, glow::MAP_READ_BIT);
+            anyhow::ensure!(
+                !ptr.is_null(),
+                "mapping the overlay pixel pack buffer failed"
+            );
+            let source = std::slice::from_raw_parts(ptr, used);
+            for patch in batch {
+                for row in 0..patch.rows {
+                    let target = patch.dib_offset + row * width as usize * 4;
+                    let from = patch.buffer_offset + row * patch.row_bytes;
+                    let line = &mut dst[target..target + patch.row_bytes];
+                    line.copy_from_slice(&source[from..from + patch.row_bytes]);
+                    if gles {
+                        for px in line.chunks_exact_mut(4) {
+                            px.swap(0, 2);
+                        }
+                    }
+                }
+            }
+            gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
+            let error = gl.get_error();
+            anyhow::ensure!(
+                error == glow::NO_ERROR,
+                "overlay pixel pack transfer failed ({error:#x})"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -248,12 +404,115 @@ struct Presenter {
     previous_sample: Option<u64>,
     sample_changes: u64,
     capture: Option<std::path::PathBuf>,
+    previous_scene: Option<Arc<Scene>>,
+    audit: Option<DamageAudit>,
+}
+
+#[derive(Default)]
+struct DamageAudit {
+    reference: Vec<u8>,
+    checked: u64,
+    empty_checked: u64,
+    mismatches: u64,
+    full: u64,
+    partial: u64,
+    skipped: u64,
+    pixels: u64,
+    possible: u64,
+    last_log: Option<Instant>,
+}
+
+// Reference path for validation, and the 1.1.1-compatible fallback on
+// drivers that cannot allocate or map a compact pixel pack buffer.
+fn read_full(gl: &glow::Context, bytes: &mut [u8], [w, h]: [i32; 2]) -> anyhow::Result<()> {
+    let gles = gl.version().is_embedded;
+    unsafe {
+        gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
+        if !gles || gl.version().major >= 3 {
+            gl.pixel_store_i32(glow::PACK_ROW_LENGTH, 0);
+        }
+        gl.read_pixels(
+            0,
+            0,
+            w,
+            h,
+            if gles { glow::RGBA } else { glow::BGRA },
+            glow::UNSIGNED_BYTE,
+            glow::PixelPackData::Slice(Some(bytes)),
+        );
+        let error = gl.get_error();
+        anyhow::ensure!(
+            error == glow::NO_ERROR,
+            "overlay pixel readback failed ({error:#x})"
+        );
+    }
+    if gles {
+        for pixel in bytes.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+    }
+    Ok(())
+}
+
+impl DamageAudit {
+    fn check(
+        &mut self,
+        gl: &glow::Context,
+        bytes: &[u8],
+        size: [i32; 2],
+        patches: &[Rect],
+    ) -> anyhow::Result<()> {
+        let whole = damage::full(size);
+        self.reference.resize(bytes.len(), 0);
+        read_full(gl, &mut self.reference, size)?;
+        self.checked += 1;
+        self.possible += damage::area(whole) as u64;
+        let count = patches.iter().copied().map(damage::area).sum::<i64>() as u64;
+        self.pixels += count;
+        if count == 0 {
+            self.skipped += 1;
+        } else if count == damage::area(whole) as u64 {
+            self.full += 1;
+        } else {
+            self.partial += 1;
+        }
+        let mismatch = self.reference != bytes;
+        if mismatch {
+            self.mismatches += 1;
+        } else if self.reference.chunks_exact(4).all(|pixel| pixel[3] == 0) {
+            self.empty_checked += 1;
+        }
+        if mismatch
+            || self
+                .last_log
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+        {
+            diag_log(&format!(
+                "damage audit: checked={} mismatches={} full={} partial={} skipped={} pixels={} possible={} empty_checked={}",
+                self.checked,
+                self.mismatches,
+                self.full,
+                self.partial,
+                self.skipped,
+                self.pixels,
+                self.possible,
+                self.empty_checked
+            ));
+            self.last_log = Some(Instant::now());
+        }
+        anyhow::ensure!(!mismatch, "dirty DIB differs from full RGBA framebuffer");
+        Ok(())
+    }
 }
 
 static CLOCK: OnceLock<Instant> = OnceLock::new();
 static SUBMITTED: AtomicU64 = AtomicU64::new(0);
 static LAST_MS: AtomicU64 = AtomicU64::new(0);
 static FAILURES: AtomicU64 = AtomicU64::new(0);
+static NEEDS_REPRESENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(super) fn visibility_changed() {
+    NEEDS_REPRESENT.store(true, Ordering::Release);
+}
 static ALPHA_COUNTS: AtomicU64 = AtomicU64::new(0);
 
 fn elapsed_ms() -> u64 {
@@ -362,6 +621,10 @@ pub(in crate::overlay) fn create(
                 diagnostic: std::env::var_os(super::super::ENV_DIAG_LOG).is_some(),
                 previous_sample: None,
                 sample_changes: 0,
+                previous_scene: None,
+                audit: (std::env::var_os("LIVE_HUB_OVERLAY_VERIFY_DAMAGE").as_deref()
+                    == Some(std::ffi::OsStr::new("1")))
+                .then(DamageAudit::default),
             })
         });
         Ok(Windows {
@@ -398,10 +661,15 @@ pub(super) fn sync_renderer(renderer: Hwnd, target: Hwnd, area: ClientArea, ctx:
 impl Presenter {
     fn prepare(&mut self, gl: &glow::Context, size: [i32; 2]) -> anyhow::Result<()> {
         self.painting = false;
+        if NEEDS_REPRESENT.swap(false, Ordering::AcqRel) {
+            self.previous_scene = None;
+        }
         if unsafe { IsWindowVisible(self.window) } == 0 {
+            self.previous_scene = None;
             return Ok(());
         }
         if !client_area(self.window).is_some_and(|area| [area.width, area.height] == size) {
+            self.previous_scene = None;
             return Ok(());
         }
         if self.frame.as_ref().map(|f| f.dib.size) != Some(size) {
@@ -410,10 +678,16 @@ impl Presenter {
                 old.delete(gl);
             }
             self.cleared_while_hidden = false;
+            self.previous_scene = None;
             let line = format!("layered framebuffer ready: {}x{}", size[0], size[1]);
             super::super::overlay_log(crate::diag::Level::Info, &line);
             diag_log(&line);
-        } else if self.content_hidden && self.cleared_while_hidden {
+        } else if self.content_hidden
+            && self.cleared_while_hidden
+            && self.previous_scene.is_some()
+            && self.audit.is_none()
+            && self.capture.is_none()
+        {
             return Ok(());
         }
         unsafe {
@@ -426,32 +700,55 @@ impl Presenter {
         Ok(())
     }
 
-    fn present(&mut self, gl: &glow::Context) -> anyhow::Result<()> {
+    fn present(
+        &mut self,
+        gl: &glow::Context,
+        scene: &Arc<Scene>,
+        actual_scale: f32,
+    ) -> anyhow::Result<()> {
         if !std::mem::take(&mut self.painting) {
             return Ok(());
         }
-        let dib = &mut self.frame.as_mut().unwrap().dib;
+        let frame = self.frame.as_mut().unwrap();
+        let dib = &mut frame.dib;
         let [w, h] = dib.size;
         // egui_glow blends premultiplied RGB. Windows accepts the same values in BGRA order.
         let bytes = unsafe { std::slice::from_raw_parts_mut(dib.bits, dib.len) };
-        let gles = gl.version().is_embedded;
-        unsafe {
-            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
-            gl.read_pixels(
-                0,
-                0,
-                w,
-                h,
-                if gles { glow::RGBA } else { glow::BGRA },
-                glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(bytes)),
+        // Once the retained DIB is touched, only a successful window update
+        // establishes a new baseline. A failed/racing submit retries a full frame.
+        // During a monitor/DPI transition layout and drawing can briefly disagree.
+        let scale_matches = scene.pixels_per_point == actual_scale;
+        let previous = self.previous_scene.take().filter(|_| scale_matches);
+        let mut patches = damage::changed(previous.as_deref(), scene, dib.size);
+        if self.capture.is_some() && patches.is_empty() {
+            patches.push(damage::full(dib.size));
+        }
+        if let Some(pack) = &frame.pack
+            && let Err(err) = pack.read(gl, bytes, dib.size, &patches)
+        {
+            super::super::overlay_log(
+                crate::diag::Level::Warn,
+                &format!("overlay pixel pack unavailable; retrying direct readback: {err}"),
             );
-        }
-        if gles {
-            for px in bytes.chunks_exact_mut(4) {
-                px.swap(0, 2);
+            if let Some(pack) = frame.pack.take() {
+                unsafe {
+                    gl.delete_buffer(pack.buffer);
+                }
             }
+            patches = vec![damage::full(dib.size)];
         }
+        if frame.pack.is_none() && !patches.is_empty() {
+            patches = vec![damage::full(dib.size)];
+            read_full(gl, bytes, dib.size)?;
+        }
+        if let Some(audit) = &mut self.audit {
+            audit.check(gl, bytes, dib.size, &patches)?;
+        }
+        let Some(dirty) = patches.iter().copied().reduce(damage::bounds) else {
+            self.previous_scene = Some(scene.clone());
+            self.cleared_while_hidden = self.content_hidden;
+            return Ok(());
+        };
         let origin = Point::default();
         let blend = [0, 0, 255, 1]; // AC_SRC_OVER, SourceConstantAlpha, AC_SRC_ALPHA
         let update = LayeredUpdate {
@@ -464,7 +761,11 @@ impl Presenter {
             key: 0,
             blend: &blend,
             flags: 2 | 8,
-            dirty: ptr::null(), // ULW_ALPHA | ULW_EX_NORESIZE
+            dirty: if previous.is_none() {
+                ptr::null()
+            } else {
+                &dirty
+            },
         };
         if unsafe { UpdateLayeredWindowIndirect(self.window, &update) } == 0 {
             let error = io::Error::last_os_error();
@@ -478,6 +779,7 @@ impl Presenter {
             ));
         }
         self.cleared_while_hidden = self.content_hidden;
+        self.previous_scene = scale_matches.then(|| scene.clone());
         LAST_MS.store(elapsed_ms(), Ordering::Relaxed);
         let first = SUBMITTED.fetch_add(1, Ordering::Relaxed) == 0;
         let interval = Duration::from_secs(if self.diagnostic { 1 } else { 10 });
@@ -588,10 +890,12 @@ pub(in crate::overlay) fn schedule(ctx: &egui::Context) {
         return;
     }
     let rect = ctx.content_rect();
+    let scene = Arc::new(Scene::collect(ctx));
     // Both callbacks execute on the same event-loop/GL thread. The locked
     // egui_glow painter restores its shader state between primitives but leaves
     // our draw framebuffer bound until the second callback restores its target.
     for (order, first) in [(egui::Order::Background, true), (egui::Order::Debug, false)] {
+        let scene = scene.clone();
         let callback = eframe::egui_glow::CallbackFn::new(move |info, painter| {
             PRESENTER.with(|slot| {
                 let mut state = slot.borrow_mut();
@@ -600,7 +904,7 @@ pub(in crate::overlay) fn schedule(ctx: &egui::Context) {
                     let result = if first {
                         p.prepare(gl, info.screen_size_px.map(|v| v as i32))
                     } else {
-                        let result = p.present(gl);
+                        let result = p.present(gl, &scene, info.pixels_per_point);
                         unsafe {
                             gl.bind_framebuffer(glow::FRAMEBUFFER, painter.intermediate_fbo());
                         }

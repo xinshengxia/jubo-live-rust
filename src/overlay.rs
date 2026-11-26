@@ -4424,8 +4424,14 @@ impl eframe::App for Overlay {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.draw_overlay(ctx);
         #[cfg(windows)]
         native::layered::schedule(ctx);
+    }
+}
+
+impl Overlay {
+    fn draw_overlay(&mut self, ctx: &egui::Context) {
         // Opt-in renderer evidence contains only this overlay's RGBA pixels,
         // never a desktop capture. Refuse to replace any existing file.
         for event in ctx.input(|input| input.events.clone()) {
@@ -5574,7 +5580,10 @@ mod native {
                 &mut sc_input_signature,
             );
             // Preserve the visible follow/redraw cadence and wake a newly shown window.
-            if visible != previously_shown { ctx.request_repaint(); }
+            if visible != previously_shown {
+                if bitmap { layered::visibility_changed(); }
+                ctx.request_repaint();
+            }
             else if visible && !bitmap { ctx.request_repaint_after(Duration::from_millis(33)); }
             if bitmap && last_present_log.elapsed() >= Duration::from_secs(10) {
                 layered::log_health(visible);
