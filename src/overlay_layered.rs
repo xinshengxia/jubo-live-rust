@@ -12,7 +12,12 @@ mod damage {
     include!("overlay_damage.rs");
 }
 use damage::Scene;
+#[path = "overlay_dcomp.rs"]
+mod dcomp;
 use std::sync::Arc;
+#[path = "overlay_sprite_frames.rs"]
+mod sprite_frames;
+pub(in crate::overlay) use sprite_frames::SpriteBatch;
 
 #[derive(Clone, Copy)]
 pub(in crate::overlay) struct Windows {
@@ -23,9 +28,11 @@ pub(in crate::overlay) struct Windows {
 #[link(name = "user32")]
 unsafe extern "system" {
     fn GetSystemMetrics(index: i32) -> i32;
+    fn EnableWindow(window: Hwnd, enable: i32) -> i32;
     fn GetDpiForWindow(window: Hwnd) -> u32;
     fn GetClassNameW(window: Hwnd, name: *mut u16, len: i32) -> i32;
     fn UpdateLayeredWindowIndirect(window: Hwnd, update: *const LayeredUpdate) -> i32;
+    fn SetLayeredWindowAttributes(window: Hwnd, color: u32, opacity: u8, flags: u32) -> i32;
 }
 
 #[repr(C)]
@@ -198,13 +205,21 @@ impl Drop for Dib {
 struct Framebuffer {
     fbo: glow::Framebuffer,
     color: glow::Renderbuffer,
+    size: [i32; 2],
+    bitmap: Option<BitmapFrame>,
+}
+
+struct BitmapFrame {
     dib: Dib,
     pack: Option<PackBuffer>,
 }
 
 impl Framebuffer {
     fn new(gl: &glow::Context, size: [i32; 2]) -> anyhow::Result<Self> {
-        let dib = Dib::new(size)?;
+        anyhow::ensure!(
+            size[0] > 0 && size[1] > 0,
+            "invalid overlay framebuffer size"
+        );
         unsafe {
             let fbo = gl.create_framebuffer().map_err(anyhow::Error::msg)?;
             let color = match gl.create_renderbuffer() {
@@ -230,19 +245,27 @@ impl Framebuffer {
                 gl.delete_framebuffer(fbo);
                 anyhow::bail!("incomplete RGBA8 overlay framebuffer");
             }
-            let pack = PackBuffer::new(gl, dib.len);
             Ok(Self {
                 fbo,
                 color,
-                dib,
-                pack,
+                size,
+                bitmap: None,
             })
         }
     }
 
+    fn bitmap(&mut self, gl: &glow::Context) -> anyhow::Result<&mut BitmapFrame> {
+        if self.bitmap.is_none() {
+            let dib = Dib::new(self.size)?;
+            let pack = PackBuffer::new(gl, dib.len);
+            self.bitmap = Some(BitmapFrame { dib, pack });
+        }
+        Ok(self.bitmap.as_mut().unwrap())
+    }
+
     fn delete(self, gl: &glow::Context) {
         unsafe {
-            if let Some(pack) = self.pack {
+            if let Some(pack) = self.bitmap.and_then(|bitmap| bitmap.pack) {
                 gl.delete_buffer(pack.buffer);
             }
             gl.delete_renderbuffer(self.color);
@@ -395,7 +418,14 @@ impl PackBuffer {
 struct Presenter {
     window: Hwnd,
     frame: Option<Framebuffer>,
+    gpu: Option<dcomp::GpuPresenter>,
+    gpu_requested: bool,
+    sprites: Option<sprite_frames::Frames>,
+    composition_style: bool,
+    gpu_fail_after: Option<u64>,
+    gpu_submitted: u64,
     painting: bool,
+    sc_generation: u64,
     last_warning: Option<Instant>,
     content_hidden: bool,
     cleared_while_hidden: bool,
@@ -505,6 +535,119 @@ impl DamageAudit {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ScTarget {
+    overlay: isize,
+    player: isize,
+    area: ClientArea,
+    dpi: u32,
+}
+
+impl ScTarget {
+    fn size(self) -> [i32; 2] {
+        [self.area.width, self.area.height]
+    }
+
+    fn geometry(self) -> (isize, isize, [i32; 2], u32) {
+        (self.overlay, self.player, self.size(), self.dpi)
+    }
+}
+
+#[derive(Default)]
+struct ScPresentation {
+    target: Option<ScTarget>,
+    generation: u64,
+    ready: bool,
+}
+
+impl ScPresentation {
+    fn set_target(&mut self, target: Option<ScTarget>) -> bool {
+        let changed = self.target.map(ScTarget::geometry) != target.map(ScTarget::geometry);
+        self.target = target;
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+            self.ready = false;
+        }
+        changed
+    }
+
+    fn accept(&mut self, generation: u64, size: [i32; 2], scale: f32, submitted: bool) -> bool {
+        self.ready = generation == self.generation
+            && self.target.is_some_and(|target| {
+                target.size() == size && (scale - target.dpi as f32 / 96.0).abs() <= 0.001
+            })
+            && (submitted || self.ready);
+        self.ready
+    }
+}
+
+static SC_PRESENTATION: std::sync::Mutex<ScPresentation> = std::sync::Mutex::new(ScPresentation {
+    target: None,
+    generation: 0,
+    ready: false,
+});
+
+fn apply_sc_hits(hits: Option<&InteractionState>) {
+    if let Some(mut state) = INTERACTION.get().and_then(|state| state.lock().ok()) {
+        state.apply_bitmap_hits(hits);
+    }
+}
+
+pub(super) fn follow_sc_target(overlay: Hwnd, player: Hwnd, area: Option<ClientArea>) {
+    let target = area.map(|area| ScTarget {
+        overlay: overlay as isize,
+        player: player as isize,
+        area,
+        dpi: unsafe { GetDpiForWindow(player) },
+    });
+    if let Ok(mut presentation) = SC_PRESENTATION.lock()
+        && presentation.set_target(target)
+    {
+        apply_sc_hits(None);
+    }
+}
+
+pub(super) fn sc_input_target() -> Option<(Hwnd, Hwnd, ClientArea)> {
+    let presentation = SC_PRESENTATION.lock().ok()?;
+    let target = presentation.target.filter(|_| presentation.ready)?;
+    Some((target.overlay as Hwnd, target.player as Hwnd, target.area))
+}
+
+fn invalidate_sc_frame() {
+    let wake = if let Ok(mut presentation) = SC_PRESENTATION.lock() {
+        let was_ready = std::mem::take(&mut presentation.ready);
+        if was_ready {
+            apply_sc_hits(None);
+        }
+        was_ready
+    } else {
+        false
+    };
+    if wake {
+        wake_bitmap_sc_input();
+    }
+}
+
+fn accept_sc_frame(
+    generation: u64,
+    size: [i32; 2],
+    scale: f32,
+    hits: &InteractionState,
+    submitted: bool,
+) {
+    if let Ok(mut presentation) = SC_PRESENTATION.lock() {
+        let was_ready = presentation.ready;
+        let ready = presentation.accept(generation, size, scale, submitted);
+        apply_sc_hits(ready.then_some(hits));
+        if was_ready == ready {
+            return;
+        }
+    }
+    // The follow loop refreshes stable regions. Wake the input thread promptly
+    // when this frame changes whether the window can accept any input.
+    wake_bitmap_sc_input();
+}
+
 static CLOCK: OnceLock<Instant> = OnceLock::new();
 static SUBMITTED: AtomicU64 = AtomicU64::new(0);
 static LAST_MS: AtomicU64 = AtomicU64::new(0);
@@ -545,6 +688,33 @@ fn offscreen_x(width: i32) -> i32 {
     unsafe { GetSystemMetrics(76) }
         .saturating_sub(width)
         .saturating_sub(64) // SM_XVIRTUALSCREEN
+}
+
+const WS_EX_LAYERED: isize = 0x0008_0000;
+
+fn set_extended_style(window: Hwnd, style: isize) -> io::Result<()> {
+    unsafe {
+        // A return of zero can mean either success or failure.
+        windows_sys::Win32::Foundation::SetLastError(0);
+        let previous = SetWindowLongPtrW(window, -20, style);
+        if previous == 0 && windows_sys::Win32::Foundation::GetLastError() != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn reset_bitmap_style(window: Hwnd) -> io::Result<()> {
+    let style = unsafe { GetWindowLongPtrW(window, -20) };
+    // ULW is unavailable after SetLayeredWindowAttributes until the layer bit is reset.
+    let unlayered = style & !WS_EX_LAYERED;
+    set_extended_style(window, unlayered).map_err(|e| io::Error::other(format!("clear layered style: {e}")))?;
+    let window_style = unsafe { GetWindowLongPtrW(window, -16) };
+    if window_style & 0x0800_0000 != 0 {
+        unsafe { EnableWindow(window, 1) };
+    }
+    set_extended_style(window, unlayered | WS_EX_LAYERED).map_err(|e| io::Error::other(format!("restore layered style: {e}")))?;
+    Ok(())
 }
 
 pub(in crate::overlay) fn create(
@@ -589,13 +759,22 @@ pub(in crate::overlay) fn create(
         {
             return Err(io::Error::last_os_error());
         }
-        // WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE.
-        // Never call SetLayeredWindowAttributes on this HWND: that disables ULW.
+        let gpu_requested = matches!(
+            std::env::var("LIVE_HUB_OVERLAY_PRESENTER").as_deref(),
+            Ok("dcomp")
+        ) && std::env::var_os("LIVE_HUB_OVERLAY_VERIFY_DAMAGE").is_none();
+        let sprites_requested = matches!(
+            std::env::var("LIVE_HUB_OVERLAY_PRESENTER").as_deref(),
+            Ok("dcomp-sprites") | Err(std::env::VarError::NotPresent)
+        ) && std::env::var_os("LIVE_HUB_OVERLAY_VERIFY_DAMAGE").is_none()
+          && std::env::var_os("LIVE_HUB_OVERLAY_DIAG_SCREENSHOT").is_none()
+          && super::super::diag_freeze_ms_from(|key| std::env::var(key).ok()).is_none();
+        // This is the same HWND that the existing follow and SC hit-window code tracks.
         let window = CreateWindowExW(
             0x0808_00a0,
             name.as_ptr(),
             wide(title).as_ptr(),
-            0x8000_0000,
+            if sprites_requested { 0x8800_0000 } else { 0x8000_0000 },
             0,
             0,
             1,
@@ -612,7 +791,16 @@ pub(in crate::overlay) fn create(
             *slot.borrow_mut() = Some(Presenter {
                 window,
                 frame: None,
+                gpu: None,
+                gpu_requested,
+                sprites: sprites_requested.then(sprite_frames::Frames::default),
+                composition_style: gpu_requested || sprites_requested,
+                gpu_fail_after: std::env::var_os("LIVE_HUB_OVERLAY_FIXTURE")
+                    .and_then(|_| std::env::var("LIVE_HUB_OVERLAY_DIAG_DCOMP_FAIL_AFTER").ok())
+                    .and_then(|frames| frames.parse().ok()),
+                gpu_submitted: 0,
                 painting: false,
+                sc_generation: 0,
                 last_warning: None,
                 capture: None,
                 content_hidden: false,
@@ -658,27 +846,158 @@ pub(super) fn sync_renderer(renderer: Hwnd, target: Hwnd, area: ClientArea, ctx:
     }
 }
 
+fn save_renderer_screenshot(
+    path: std::path::PathBuf,
+    bytes: &[u8],
+    [w, h]: [i32; 2],
+) -> anyhow::Result<()> {
+    use image::ImageEncoder;
+    let mut rgba = Vec::with_capacity(bytes.len());
+    for row in bytes.chunks_exact(w as usize * 4).rev() {
+        for px in row.chunks_exact(4) {
+            rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)?;
+    image::codecs::png::PngEncoder::new(file).write_image(
+        &rgba,
+        w as u32,
+        h as u32,
+        image::ExtendedColorType::Rgba8,
+    )?;
+    diag_log("renderer screenshot saved");
+    Ok(())
+}
+
 impl Presenter {
+    fn fall_back_to_bitmap(&mut self, gl: &glow::Context) -> anyhow::Result<()> {
+        invalidate_sc_frame();
+        self.gpu_requested = false;
+        self.previous_scene = None;
+        self.cleared_while_hidden = false;
+        if let Some(mut gpu) = self.gpu.take() {
+            gpu.destroy(gl);
+        }
+        if self.composition_style {
+            reset_bitmap_style(self.window)?;
+            self.composition_style = false;
+        }
+        Ok(())
+    }
+
+    fn initialize_gpu(&mut self, gl: &glow::Context) -> anyhow::Result<()> {
+        if !self.gpu_requested {
+            if self.composition_style {
+                self.fall_back_to_bitmap(gl)?;
+            }
+        } else if self.gpu.is_none() {
+            let initialized = (|| {
+                if unsafe { SetLayeredWindowAttributes(self.window, 0, 255, 2) } == 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                dcomp::GpuPresenter::new(self.window)
+            })();
+            match initialized {
+                Ok(gpu) => self.gpu = Some(gpu),
+                Err(error) => {
+                    self.report(Err(
+                        error.context("DirectComposition initialization; switching to bitmap")
+                    ));
+                    self.fall_back_to_bitmap(gl)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn present_gpu(
+        &mut self,
+        gl: &glow::Context,
+        scene: &Arc<Scene>,
+        actual_scale: f32,
+        layout_size: [i32; 2],
+        sc_hits: &InteractionState,
+    ) -> anyhow::Result<()> {
+        let frame = self.frame.as_ref().unwrap();
+        let size = frame.size;
+        let layout_matches = scene.pixels_per_point == actual_scale && layout_size == size;
+        let previous = self.previous_scene.take().filter(|_| layout_matches);
+        let dirty = damage::changed(previous.as_deref(), scene, size)
+            .into_iter()
+            .reduce(damage::bounds);
+        if let Some(dirty) = dirty {
+            if self.gpu_fail_after == Some(self.gpu_submitted) {
+                anyhow::bail!("injected DirectComposition submission failure");
+            }
+            self.gpu
+                .as_mut()
+                .unwrap()
+                .submit(gl, frame.fbo, size, Some(dirty))?;
+            self.gpu_submitted += 1;
+            LAST_MS.store(elapsed_ms(), Ordering::Relaxed);
+            if SUBMITTED.fetch_add(1, Ordering::Relaxed) == 0 {
+                diag_log("overlay presenter: first DirectComposition GPU frame submitted");
+            }
+        }
+        if layout_matches
+            && client_area(self.window).is_some_and(|area| [area.width, area.height] == size)
+        {
+            self.previous_scene = Some(scene.clone());
+            self.cleared_while_hidden = self.content_hidden;
+            accept_sc_frame(
+                self.sc_generation,
+                size,
+                actual_scale,
+                sc_hits,
+                dirty.is_some(),
+            );
+        } else {
+            invalidate_sc_frame();
+        }
+        if let Some(path) = self.capture.take() {
+            let capture = (|| {
+                unsafe {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(frame.fbo));
+                }
+                let mut pixels = vec![0; size[0] as usize * size[1] as usize * 4];
+                read_full(gl, &mut pixels, size)?;
+                save_renderer_screenshot(path, &pixels, size)
+            })();
+            if let Err(error) = capture {
+                diag_log(&format!("DirectComposition diagnostic capture: {error:#}"));
+            }
+        }
+        Ok(())
+    }
     fn prepare(&mut self, gl: &glow::Context, size: [i32; 2]) -> anyhow::Result<()> {
         self.painting = false;
-        if NEEDS_REPRESENT.swap(false, Ordering::AcqRel) {
+        let generation = SC_PRESENTATION
+            .lock()
+            .map(|state| state.generation)
+            .unwrap_or(0);
+        if NEEDS_REPRESENT.swap(false, Ordering::AcqRel) || generation != self.sc_generation {
             self.previous_scene = None;
+            self.sc_generation = generation;
         }
-        if unsafe { IsWindowVisible(self.window) } == 0 {
+        if unsafe { IsWindowVisible(self.window) } == 0
+            || !client_area(self.window).is_some_and(|area| [area.width, area.height] == size)
+        {
             self.previous_scene = None;
+            invalidate_sc_frame();
             return Ok(());
         }
-        if !client_area(self.window).is_some_and(|area| [area.width, area.height] == size) {
+        if self.sprites.is_none() { self.initialize_gpu(gl)?; }
+        if self.frame.as_ref().map(|f| f.size) != Some(size) {
             self.previous_scene = None;
-            return Ok(());
-        }
-        if self.frame.as_ref().map(|f| f.dib.size) != Some(size) {
+            invalidate_sc_frame();
             let next = Framebuffer::new(gl, size)?;
             if let Some(old) = self.frame.replace(next) {
                 old.delete(gl);
             }
             self.cleared_while_hidden = false;
-            self.previous_scene = None;
             let line = format!("layered framebuffer ready: {}x{}", size[0], size[1]);
             super::super::overlay_log(crate::diag::Level::Info, &line);
             diag_log(&line);
@@ -705,11 +1024,35 @@ impl Presenter {
         gl: &glow::Context,
         scene: &Arc<Scene>,
         actual_scale: f32,
+        layout_size: [i32; 2],
+        sc_hits: &InteractionState,
     ) -> anyhow::Result<()> {
         if !std::mem::take(&mut self.painting) {
             return Ok(());
         }
-        let frame = self.frame.as_mut().unwrap();
+        if self.gpu.is_some() {
+            match self.present_gpu(gl, scene, actual_scale, layout_size, sc_hits) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    self.report(Err(
+                        error.context("DirectComposition frame; switching to bitmap")
+                    ));
+                    self.fall_back_to_bitmap(gl)?;
+                    unsafe {
+                        gl.bind_framebuffer(
+                            glow::FRAMEBUFFER,
+                            Some(self.frame.as_ref().unwrap().fbo),
+                        );
+                    }
+                }
+            }
+        }
+        let frame = self
+            .frame
+            .as_mut()
+            .unwrap()
+            .bitmap(gl)
+            .inspect_err(|_| invalidate_sc_frame())?;
         let dib = &mut frame.dib;
         let [w, h] = dib.size;
         // egui_glow blends premultiplied RGB. Windows accepts the same values in BGRA order.
@@ -717,8 +1060,8 @@ impl Presenter {
         // Once the retained DIB is touched, only a successful window update
         // establishes a new baseline. A failed/racing submit retries a full frame.
         // During a monitor/DPI transition layout and drawing can briefly disagree.
-        let scale_matches = scene.pixels_per_point == actual_scale;
-        let previous = self.previous_scene.take().filter(|_| scale_matches);
+        let layout_matches = scene.pixels_per_point == actual_scale && layout_size == dib.size;
+        let previous = self.previous_scene.take().filter(|_| layout_matches);
         let mut patches = damage::changed(previous.as_deref(), scene, dib.size);
         if self.capture.is_some() && patches.is_empty() {
             patches.push(damage::full(dib.size));
@@ -739,14 +1082,21 @@ impl Presenter {
         }
         if frame.pack.is_none() && !patches.is_empty() {
             patches = vec![damage::full(dib.size)];
-            read_full(gl, bytes, dib.size)?;
+            read_full(gl, bytes, dib.size).inspect_err(|_| invalidate_sc_frame())?;
         }
         if let Some(audit) = &mut self.audit {
-            audit.check(gl, bytes, dib.size, &patches)?;
+            audit
+                .check(gl, bytes, dib.size, &patches)
+                .inspect_err(|_| invalidate_sc_frame())?;
         }
         let Some(dirty) = patches.iter().copied().reduce(damage::bounds) else {
-            self.previous_scene = Some(scene.clone());
-            self.cleared_while_hidden = self.content_hidden;
+            if client_area(self.window).is_some_and(|area| [area.width, area.height] == dib.size) {
+                self.previous_scene = Some(scene.clone());
+                self.cleared_while_hidden = self.content_hidden;
+                accept_sc_frame(self.sc_generation, dib.size, actual_scale, sc_hits, false);
+            } else {
+                invalidate_sc_frame();
+            }
             return Ok(());
         };
         let origin = Point::default();
@@ -769,6 +1119,7 @@ impl Presenter {
         };
         if unsafe { UpdateLayeredWindowIndirect(self.window, &update) } == 0 {
             let error = io::Error::last_os_error();
+            invalidate_sc_frame();
             // The asynchronous watcher can resize the destination during
             // readback. A stale frame must never resize the player overlay back.
             if client_area(self.window).is_some_and(|area| [area.width, area.height] != dib.size) {
@@ -779,7 +1130,14 @@ impl Presenter {
             ));
         }
         self.cleared_while_hidden = self.content_hidden;
-        self.previous_scene = scale_matches.then(|| scene.clone());
+        if layout_matches
+            && client_area(self.window).is_some_and(|area| [area.width, area.height] == dib.size)
+        {
+            self.previous_scene = Some(scene.clone());
+            accept_sc_frame(self.sc_generation, dib.size, actual_scale, sc_hits, true);
+        } else {
+            invalidate_sc_frame();
+        }
         LAST_MS.store(elapsed_ms(), Ordering::Relaxed);
         let first = SUBMITTED.fetch_add(1, Ordering::Relaxed) == 0;
         let interval = Duration::from_secs(if self.diagnostic { 1 } else { 10 });
@@ -825,24 +1183,7 @@ impl Presenter {
             log_health(true);
         }
         if let Some(path) = self.capture.take() {
-            use image::ImageEncoder;
-            let mut rgba = Vec::with_capacity(bytes.len());
-            for row in bytes.chunks_exact(w as usize * 4).rev() {
-                for px in row.chunks_exact(4) {
-                    rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-                }
-            }
-            let file = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(path)?;
-            image::codecs::png::PngEncoder::new(file).write_image(
-                &rgba,
-                w as u32,
-                h as u32,
-                image::ExtendedColorType::Rgba8,
-            )?;
-            diag_log("renderer screenshot saved");
+            save_renderer_screenshot(path, bytes, [w, h])?;
         }
         Ok(())
     }
@@ -877,6 +1218,10 @@ pub(in crate::overlay) fn request_capture() -> bool {
 pub(in crate::overlay) fn set_content_hidden(hidden: bool) {
     PRESENTER.with(|slot| {
         if let Some(p) = slot.borrow_mut().as_mut() {
+            if hidden && !p.content_hidden {
+                invalidate_sc_frame();
+                p.previous_scene = None;
+            }
             p.content_hidden = hidden;
             if !hidden {
                 p.cleared_while_hidden = false;
@@ -885,17 +1230,30 @@ pub(in crate::overlay) fn set_content_hidden(hidden: bool) {
     });
 }
 
-pub(in crate::overlay) fn schedule(ctx: &egui::Context) {
-    if !PRESENTER.with(|s| s.borrow().is_some()) {
+pub(in crate::overlay) fn sprites_enabled() -> bool {
+    PRESENTER.with(|slot| slot.borrow().as_ref().is_some_and(|p| p.sprites.is_some()))
+}
+
+pub(in crate::overlay) fn has_presenter() -> bool {
+    PRESENTER.with(|slot| slot.borrow().is_some())
+}
+
+pub(in crate::overlay) fn schedule(ctx: &egui::Context, sc_hits: InteractionState, batch: SpriteBatch) {
+    if sprites_enabled() {
+        sprite_frames::schedule(ctx, sc_hits, batch);
         return;
     }
     let rect = ctx.content_rect();
+    let layout = ctx.viewport_rect().size() * ctx.pixels_per_point();
+    let layout_size = [layout.x.round() as i32, layout.y.round() as i32];
     let scene = Arc::new(Scene::collect(ctx));
+    let sc_hits = Arc::new(sc_hits);
     // Both callbacks execute on the same event-loop/GL thread. The locked
     // egui_glow painter restores its shader state between primitives but leaves
     // our draw framebuffer bound until the second callback restores its target.
     for (order, first) in [(egui::Order::Background, true), (egui::Order::Debug, false)] {
         let scene = scene.clone();
+        let sc_hits = sc_hits.clone();
         let callback = eframe::egui_glow::CallbackFn::new(move |info, painter| {
             PRESENTER.with(|slot| {
                 let mut state = slot.borrow_mut();
@@ -904,7 +1262,8 @@ pub(in crate::overlay) fn schedule(ctx: &egui::Context) {
                     let result = if first {
                         p.prepare(gl, info.screen_size_px.map(|v| v as i32))
                     } else {
-                        let result = p.present(gl, &scene, info.pixels_per_point);
+                        let result =
+                            p.present(gl, &scene, info.pixels_per_point, layout_size, &sc_hits);
                         unsafe {
                             gl.bind_framebuffer(glow::FRAMEBUFFER, painter.intermediate_fbo());
                         }
@@ -928,9 +1287,16 @@ pub(in crate::overlay) fn schedule(ctx: &egui::Context) {
 pub(in crate::overlay) fn shutdown(gl: Option<&glow::Context>) {
     PRESENTER.with(|slot| {
         if let Some(mut p) = slot.borrow_mut().take() {
-            if let (Some(f), Some(gl)) = (p.frame.take(), gl) {
-                f.delete(gl);
+            invalidate_sc_frame();
+            if let Some(gl) = gl {
+                if let Some(mut gpu) = p.gpu.take() {
+                    gpu.destroy(gl);
+                }
+                if let Some(frame) = p.frame.take() {
+                    frame.delete(gl);
+                }
             }
+            p.sprites.take();
             unsafe {
                 DestroyWindow(p.window);
             }
@@ -945,6 +1311,83 @@ mod tests {
     #[link(name = "gdi32")]
     unsafe extern "system" {
         fn GetPixel(dc: Hwnd, x: i32, y: i32) -> u32;
+    }
+
+    fn sc_target(size: [i32; 2], dpi: u32) -> ScTarget {
+        ScTarget {
+            overlay: 1,
+            player: 2,
+            area: ClientArea {
+                left: 0,
+                top: 0,
+                width: size[0],
+                height: size[1],
+            },
+            dpi,
+        }
+    }
+
+    #[test]
+    fn bitmap_sc_failure_discards_hits_and_requires_a_new_submit() {
+        let size = [960, 540];
+        let mut presentation = ScPresentation::default();
+        presentation.set_target(Some(sc_target(size, 96)));
+        let generation = presentation.generation;
+        assert!(!presentation.accept(generation, size, 1.0, false));
+        assert!(presentation.accept(generation, size, 1.0, true));
+        let mut active = InteractionState::default();
+        let staged = InteractionState {
+            enabled: true,
+            hit: vec![[20.0, 60.0, 260.0, 200.0]],
+            close: vec![[235.0, 60.0, 260.0, 85.0]],
+            bar_track: Some([260.0, 60.0, 265.0, 200.0]),
+            bar_thumb: Some([260.0, 60.0, 265.0, 80.0]),
+            ..Default::default()
+        };
+        active.apply_bitmap_hits(Some(&staged));
+        active.click = Some((240.0, 65.0));
+        active.wheel = 1.0;
+        active.bar_drag = Some((5.0, 145.0));
+        assert!(presentation.accept(generation, size, 1.0, false));
+        presentation.ready = false;
+        active.apply_bitmap_hits(None);
+        assert!(!active.enabled);
+        assert!(active.hit.is_empty() && active.close.is_empty());
+        assert!(active.bar_track.is_none() && active.bar_thumb.is_none());
+        assert!(active.click.is_none() && active.bar_drag.is_none());
+        assert_eq!(active.wheel, 0.0);
+        assert!(!presentation.accept(generation, size, 1.0, false));
+        assert!(presentation.accept(generation, size, 1.0, true));
+        active.apply_bitmap_hits(Some(&staged));
+        assert!(active.enabled);
+        assert_eq!(active.hit, staged.hit);
+    }
+
+    #[test]
+    fn bitmap_sc_resize_and_dpi_changes_reject_stale_frames() {
+        let size = [960, 540];
+        let mut presentation = ScPresentation::default();
+        presentation.set_target(Some(sc_target(size, 96)));
+        let original = presentation.generation;
+        assert!(presentation.accept(original, size, 1.0, true));
+
+        let larger = [1200, 800];
+        assert!(presentation.set_target(Some(sc_target(larger, 120))));
+        let resized = presentation.generation;
+        assert!(!presentation.ready);
+        assert!(!presentation.accept(original, size, 1.0, true));
+        assert!(!presentation.accept(resized, larger, 1.0, true));
+        assert!(presentation.accept(resized, larger, 1.25, true));
+
+        assert!(presentation.set_target(None));
+        assert!(presentation.set_target(Some(sc_target(size, 96))));
+        assert!(!presentation.accept(original, size, 1.0, true));
+        let current = presentation.generation;
+        assert!(presentation.accept(current, size, 1.0, true));
+        let mut moved = sc_target(size, 96);
+        moved.area.left = -960;
+        assert!(!presentation.set_target(Some(moved)));
+        assert!(presentation.accept(current, size, 1.0, false));
     }
 
     #[test]

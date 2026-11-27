@@ -1213,6 +1213,46 @@ pub type SharedInteraction = std::sync::Arc<std::sync::Mutex<InteractionState>>;
 
 static INTERACTION: std::sync::OnceLock<SharedInteraction> = std::sync::OnceLock::new();
 
+#[cfg(windows)]
+thread_local! {
+    // For bitmap presentation, layout is provisional until its paint callback runs.
+    static BITMAP_SC_HITS: std::cell::RefCell<Option<InteractionState>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+fn edit_sc_hits(edit: impl FnOnce(&mut InteractionState)) {
+    #[cfg(windows)]
+    let Some(edit) = BITMAP_SC_HITS.with(|hits| {
+        if let Some(hits) = hits.borrow_mut().as_mut() {
+            edit(hits);
+            None
+        } else {
+            Some(edit)
+        }
+    }) else {
+        return;
+    };
+    if let Some(mut state) = INTERACTION.get().and_then(|state| state.lock().ok()) {
+        edit(&mut state);
+    }
+}
+
+#[cfg(windows)]
+impl InteractionState {
+    fn apply_bitmap_hits(&mut self, hits: Option<&Self>) {
+        if let Some(hits) = hits.filter(|hits| hits.enabled) {
+            self.hit.clone_from(&hits.hit);
+            self.close.clone_from(&hits.close);
+            self.bar_track = hits.bar_track;
+            self.bar_thumb = hits.bar_thumb;
+            self.enabled = true;
+        } else {
+            *self = Self::default();
+        }
+    }
+}
+
 /// Registers the interaction state read by the native window procedure. Called
 /// once when the overlay app starts.
 pub fn install_interaction(state: SharedInteraction) {
@@ -1237,7 +1277,9 @@ pub fn interaction_enabled() -> bool {
 fn record_native_click(x: f32, y: f32) {
     if let Some(state) = INTERACTION.get() {
         if let Ok(mut state) = state.lock() {
-            state.click = Some((x, y));
+            if state.enabled {
+                state.click = Some((x, y));
+            }
         }
     }
 }
@@ -1246,7 +1288,9 @@ fn record_native_click(x: f32, y: f32) {
 fn record_native_wheel(notches: f32) {
     if let Some(state) = INTERACTION.get() {
         if let Ok(mut state) = state.lock() {
-            state.wheel += notches;
+            if state.enabled {
+                state.wheel += notches;
+            }
         }
     }
 }
@@ -1258,61 +1302,57 @@ fn publish_sc_hits(
     viewport: Rect,
     enabled: bool,
 ) {
-    if let Some(state) = INTERACTION.get() {
-        if let Ok(mut state) = state.lock() {
-            state.hit.clear();
-            state.close.clear();
-            state.enabled = enabled;
-            if !enabled {
-                return;
+    edit_sc_hits(|state| {
+        state.hit.clear();
+        state.close.clear();
+        state.enabled = enabled;
+        if !enabled {
+            return;
+        }
+        for (rect, close, _) in hits {
+            // Clip to the visible band before publishing: a card that is
+            // scrolled partially out of view must not reserve the whole
+            // off-screen rectangle for the mouse (that made the overlay seem
+            // to stop being click-through around a tall stack).
+            let visible = rect.intersect(viewport);
+            if !visible.is_positive() {
+                continue;
             }
-            for (rect, close, _) in hits {
-                // Clip to the visible band before publishing: a card that is
-                // scrolled partially out of view must not reserve the whole
-                // off-screen rectangle for the mouse (that made the overlay seem
-                // to stop being click-through around a tall stack).
-                let visible = rect.intersect(viewport);
-                if !visible.is_positive() {
-                    continue;
-                }
-                let clamp = |value: f32| if value.is_finite() { value } else { 0.0 };
-                state.hit.push([
-                    clamp(visible.left()) * pixels_per_point,
-                    clamp(visible.top()) * pixels_per_point,
-                    clamp(visible.right()) * pixels_per_point,
-                    clamp(visible.bottom()) * pixels_per_point,
+            let clamp = |value: f32| if value.is_finite() { value } else { 0.0 };
+            state.hit.push([
+                clamp(visible.left()) * pixels_per_point,
+                clamp(visible.top()) * pixels_per_point,
+                clamp(visible.right()) * pixels_per_point,
+                clamp(visible.bottom()) * pixels_per_point,
+            ]);
+            if *close != Rect::NOTHING && close.intersects(viewport) {
+                let close_visible = close.intersect(viewport);
+                state.close.push([
+                    clamp(close_visible.left()) * pixels_per_point,
+                    clamp(close_visible.top()) * pixels_per_point,
+                    clamp(close_visible.right()) * pixels_per_point,
+                    clamp(close_visible.bottom()) * pixels_per_point,
                 ]);
-                if *close != Rect::NOTHING && close.intersects(viewport) {
-                    let close_visible = close.intersect(viewport);
-                    state.close.push([
-                        clamp(close_visible.left()) * pixels_per_point,
-                        clamp(close_visible.top()) * pixels_per_point,
-                        clamp(close_visible.right()) * pixels_per_point,
-                        clamp(close_visible.bottom()) * pixels_per_point,
-                    ]);
-                }
             }
         }
-    }
+    });
 }
 
 /// Publishes the paid-message scrollbar rectangles (physical pixels) so the
 /// window procedure can start a drag and the cursor can change over the bar.
 fn publish_sc_bar(track: Option<Rect>, thumb: Option<Rect>, pixels_per_point: f32) {
-    if let Some(state) = INTERACTION.get() {
-        if let Ok(mut state) = state.lock() {
-            let to_physical = |rect: Rect| {
-                [
-                    rect.left() * pixels_per_point,
-                    rect.top() * pixels_per_point,
-                    rect.right() * pixels_per_point,
-                    rect.bottom() * pixels_per_point,
-                ]
-            };
-            state.bar_track = track.map(to_physical);
-            state.bar_thumb = thumb.map(to_physical);
-        }
-    }
+    edit_sc_hits(|state| {
+        let to_physical = |rect: Rect| {
+            [
+                rect.left() * pixels_per_point,
+                rect.top() * pixels_per_point,
+                rect.right() * pixels_per_point,
+                rect.bottom() * pixels_per_point,
+            ]
+        };
+        state.bar_track = track.map(to_physical);
+        state.bar_thumb = thumb.map(to_physical);
+    });
 }
 
 /// Grab offset (physical px from the thumb top) when the point is on the
@@ -1334,7 +1374,9 @@ fn interaction_bar_grab(x: f32, y: f32) -> Option<f32> {
 fn begin_native_bar_drag(offset: f32) {
     if let Some(state) = INTERACTION.get() {
         if let Ok(mut state) = state.lock() {
-            state.bar_drag = Some((offset, offset));
+            if state.enabled {
+                state.bar_drag = Some((offset, offset));
+            }
         }
     }
 }
@@ -1385,16 +1427,14 @@ pub fn sc_bar_scroll_for(
 
 /// Disables native hit testing (full mouse passthrough), e.g. no SC cards.
 fn clear_sc_hits() {
-    if let Some(state) = INTERACTION.get() {
-        if let Ok(mut state) = state.lock() {
-            state.hit.clear();
-            state.close.clear();
-            state.enabled = false;
-            state.bar_track = None;
-            state.bar_thumb = None;
-            state.bar_drag = None;
-        }
-    }
+    edit_sc_hits(|state| {
+        state.hit.clear();
+        state.close.clear();
+        state.enabled = false;
+        state.bar_track = None;
+        state.bar_thumb = None;
+        state.bar_drag = None;
+    });
 }
 
 /// Whether a physical client pixel is inside a clickable paid-message area.
@@ -2942,7 +2982,13 @@ impl Overlay {
         usize::from(self.options.max_visible).min(tracks.saturating_mul(2).max(1))
     }
 
-    fn paint_danmaku(&mut self, painter: &egui::Painter, rect: Rect, now: f64) {
+    fn paint_danmaku(
+        &mut self,
+        painter: &egui::Painter,
+        rect: Rect,
+        now: f64,
+        #[cfg(windows)] sprites: &mut Option<native::layered::SpriteBatch>,
+    ) {
         if !self.settings.danmaku_visible {
             self.pending.clear();
             return;
@@ -3092,8 +3138,12 @@ impl Overlay {
             };
             let color = apply_text_opacity(base_color, self.options.text_opacity_percent);
             let text_height = font_points * 1.2;
-            let top = rect.top() + item.y + ((item.height - text_height) / 2.0).max(0.0);
-            let left = rect.left() + item.x(now);
+            let text_y = rect.top() + item.y + ((item.height - text_height) / 2.0).max(0.0);
+            #[cfg(windows)]
+            let sprite_start = sprites.as_ref().map(|_| native::layered::SpriteBatch::shape_count(painter));
+            let (left, top) = (rect.left() + item.x(now), text_y);
+            #[cfg(windows)]
+            let (left, top) = if sprite_start.is_some() { (0.0, 0.0) } else { (left, top) };
             let mut painted_image = false;
             if show_images {
                 if let Some(url) = &item.message.image_url {
@@ -3155,6 +3205,10 @@ impl Overlay {
                     &mut self.image_textures,
                     &self.image_loader,
                 );
+            }
+            #[cfg(windows)]
+            if let (Some(batch), Some(first)) = (sprites.as_mut(), sprite_start) {
+                batch.capture(painter, first, item, rect.left(), text_y);
             }
         }
         let live_ids: std::collections::BTreeSet<&str> = self
@@ -4424,14 +4478,25 @@ impl eframe::App for Overlay {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.draw_overlay(ctx);
         #[cfg(windows)]
-        native::layered::schedule(ctx);
+        if native::layered::has_presenter() {
+            BITMAP_SC_HITS.with(|hits| *hits.borrow_mut() = Some(InteractionState::default()));
+            let mut sprites = native::layered::sprites_enabled().then(native::layered::SpriteBatch::default);
+            self.draw_overlay(ctx, &mut sprites);
+            let hits = BITMAP_SC_HITS.with(|hits| hits.borrow_mut().take().unwrap());
+            native::layered::schedule(ctx, hits, sprites.unwrap_or_default());
+            return;
+        }
+        self.draw_overlay(ctx, #[cfg(windows)] &mut None);
     }
 }
 
 impl Overlay {
-    fn draw_overlay(&mut self, ctx: &egui::Context) {
+    fn draw_overlay(
+        &mut self,
+        ctx: &egui::Context,
+        #[cfg(windows)] sprites: &mut Option<native::layered::SpriteBatch>,
+    ) {
         // Opt-in renderer evidence contains only this overlay's RGBA pixels,
         // never a desktop capture. Refuse to replace any existing file.
         for event in ctx.input(|input| input.events.clone()) {
@@ -4542,7 +4607,11 @@ impl Overlay {
         if !self.options.solid_text {
             painter.set_opacity(f32::from(self.options.opacity_percent) / 100.0);
         }
-        self.paint_danmaku(&painter, rect, now);
+        #[cfg(windows)]
+        if let Some(batch) = sprites.as_mut() {
+            batch.set_canvas(rect, self.metrics.height, pixels_per_point, self.start);
+        }
+        self.paint_danmaku(&painter, rect, now, #[cfg(windows)] sprites);
         self.paint_super_chats(&painter, rect, pixels_per_point, now);
         // Legacy draw order: danmaku, paid cards, live events, transient status.
         self.paint_live_events(&painter, rect);
@@ -4572,6 +4641,8 @@ impl Overlay {
         }
         let idle = self.scheduler.active().is_empty() && self.super_chats.len() == 0
             && self.live_events.is_empty() && self.pending.is_empty();
+        #[cfg(windows)]
+        let idle = idle || sprites.is_some();
         ctx.request_repaint_after(Duration::from_millis(if idle { 100 } else { 33 }));
     }
 }
@@ -4661,6 +4732,7 @@ mod native {
             height: i32,
             flags: u32,
         ) -> i32;
+        fn ShowWindow(window: Hwnd, command: i32) -> i32;
         fn ShowWindowAsync(window: Hwnd, command: i32) -> i32;
         fn PostMessageW(window: Hwnd, message: u32, wparam: usize, lparam: isize) -> i32;
         fn RegisterHotKey(window: Hwnd, id: i32, modifiers: u32, key: u32) -> i32;
@@ -4857,8 +4929,16 @@ mod native {
     // player natively regardless of process boundaries.
 
     const SC_INPUT_CLASS: &str = "LiveHubRustScInput";
+    const WM_SYNC_BITMAP_SC: u32 = 0x8001;
     static SC_INPUT_HWND: AtomicIsize = AtomicIsize::new(0);
     static SC_PLAYER_HWND: AtomicIsize = AtomicIsize::new(0);
+
+    fn wake_bitmap_sc_input() {
+        let window = SC_INPUT_HWND.load(AtomicOrdering::Acquire) as Hwnd;
+        if !window.is_null() {
+            unsafe { PostMessageW(window, WM_SYNC_BITMAP_SC, 0, 0) };
+        }
+    }
 
     #[repr(C)]
     struct WndClassExW {
@@ -5040,10 +5120,25 @@ mod native {
                 }
                 SC_INPUT_HWND.store(window as isize, AtomicOrdering::Release);
                 let mut message: HotkeyMessage = std::mem::zeroed();
+                let mut bitmap_signature = None;
                 loop {
                     let got = GetMessageW(&mut message, std::ptr::null_mut(), 0, 0);
                     if got <= 0 {
                         break;
+                    }
+                    if message.window == window && message.message == WM_SYNC_BITMAP_SC {
+                        // Resolve readiness on the window's thread so a queued follow tick
+                        // cannot show an old region after a failed submission has hidden it.
+                        if let Some((overlay, player, area)) = layered::sc_input_target()
+                            && IsWindowVisible(overlay) != 0
+                            && client_area(overlay) == Some(area)
+                            && client_area(player) == Some(area)
+                        {
+                            sync_sc_input(overlay, player, &area, true, &mut bitmap_signature, true);
+                        } else {
+                            hide_bitmap_sc_input(window);
+                        }
+                        continue;
                     }
                     TranslateMessage(&message);
                     DispatchMessageW(&message);
@@ -5066,15 +5161,23 @@ mod native {
         hash ^ (regions.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
     }
 
+    fn hide_bitmap_sc_input(window: Hwnd) {
+        unsafe {
+            ReleaseCapture();
+            ShowWindow(window, 0);
+        }
+    }
+
     /// Keeps the transparent input window glued to the overlay client area and
-    /// clips it to the painted card rectangles. `last_signature` lives in the
-    /// follow loop so an unchanged layout does not rebuild the region.
-    pub fn sync_sc_input(
+    /// clips it to the painted card rectangles. Cache the last region so an
+    /// unchanged layout does not rebuild it.
+    fn sync_sc_input(
         overlay: Hwnd,
         player: Hwnd,
         area: &ClientArea,
         visible: bool,
         last_signature: &mut Option<u64>,
+        bitmap: bool,
     ) {
         SC_PLAYER_HWND.store(player as isize, AtomicOrdering::Release);
         let window = SC_INPUT_HWND.load(AtomicOrdering::Acquire) as Hwnd;
@@ -5083,7 +5186,11 @@ mod native {
         }
         let regions = super::interaction_regions();
         if !visible || regions.is_empty() {
-            unsafe { ShowWindowAsync(window, 0) };
+            if bitmap {
+                hide_bitmap_sc_input(window);
+            } else {
+                unsafe { ShowWindowAsync(window, 0) };
+            }
             return;
         }
         let signature = region_signature(&regions);
@@ -5518,6 +5625,9 @@ mod native {
             }
             let previously_shown = shown;
             let visible = force_visible || decision.visible;
+            if bitmap {
+                layered::follow_sc_target(overlay, target, area.filter(|_| visible));
+            }
             if visible {
                 if let Some(area) = area {
                     if bitmap { layered::sync_renderer(renderer, target, area, ctx); }
@@ -5572,13 +5682,18 @@ mod native {
                     height: 0,
                 },
             };
-            sync_sc_input(
-                overlay,
-                target,
-                &sc_area,
-                visible && area.is_some(),
-                &mut sc_input_signature,
-            );
+            if bitmap {
+                wake_bitmap_sc_input();
+            } else {
+                sync_sc_input(
+                    overlay,
+                    target,
+                    &sc_area,
+                    visible && area.is_some(),
+                    &mut sc_input_signature,
+                    false,
+                );
+            }
             // Preserve the visible follow/redraw cadence and wake a newly shown window.
             if visible != previously_shown {
                 if bitmap { layered::visibility_changed(); }
