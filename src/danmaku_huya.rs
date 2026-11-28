@@ -10,7 +10,7 @@
 //! - 弹幕走 wss://cdnws.api.huya.com：无路径、无 query、无子协议、无签名、完全匿名。
 //!   wsSecret 只属于虎牙推流地址，与弹幕无关。
 //! - 真正的订阅包是 cmd 16（RegisterGroupReq）；只发 cmd 1 服务器不报错但也不推送。
-//! - 订阅组名必须用房间的 lChannelId，不能用主播 yyuid；用错时服务器静默回空组。
+//! - 订阅组名使用房间的 lChannelId。cmd 17 的 tag1 仅列出支持 P2P 的组，可以为空。
 //! - 推送有 cmd 7（V1）与 cmd 22（V2）两条通道，只认 cmd 7 会漏消息。
 //! - 心跳是 cmd 3 的 WUP 请求（onlineui/OnUserHeartBeat，60 秒一次），服务端回 cmd 4 确认。
 //! - 载荷是腾讯 Tars/JCE 二进制，没有 varint：写入器使用类型窄化
@@ -710,46 +710,21 @@ impl<'a> TarsReader<'a> {
 #[derive(Debug, Default)]
 struct Decoded {
     heartbeat_ack: bool,
-    /// Some：收到 cmd 17 回显（可能为空列表 = 组名/频道 id 错误）。
-    subscribe_groups: Option<Vec<String>>,
+    registration_result: Option<i64>,
     events: Vec<DanmakuEvent>,
 }
 
-/// Room facts the subscription reply is interpreted against: a room that is
-/// currently offline answers with an empty group as well, which is not a
-/// channel-id error.
-#[derive(Debug, Clone, Copy, Default)]
-struct DecodeContext {
-    live: Option<bool>,
-    channel_id: i64,
-}
-
 impl Decoded {
-    fn into_events(self, context: DecodeContext) -> Vec<DanmakuEvent> {
-        let mut events = Vec::new();
-        if let Some(groups) = self.subscribe_groups {
-            if groups.is_empty() {
-                let message = match context.live {
-                    Some(false) => format!(
-                        "虎牙：房间当前未开播，服务端不推送弹幕（订阅组为空；频道 {}）",
-                        context.channel_id
-                    ),
-                    _ if context.channel_id > 0 => format!(
-                        "虎牙：订阅返回空组，lChannelId 可能取错了（当前 {}）",
-                        context.channel_id
-                    ),
-                    _ => "虎牙：订阅返回空组，lChannelId 可能取错了".to_owned(),
-                };
-                events.push(DanmakuEvent::Status(message));
+    fn into_events(mut self) -> Vec<DanmakuEvent> {
+        if let Some(code) = self.registration_result {
+            let message = if code == 0 {
+                "虎牙弹幕已连接，等待新消息".to_owned()
             } else {
-                events.push(DanmakuEvent::Status(format!(
-                    "虎牙：订阅成功 {}",
-                    groups.join(",")
-                )));
-            }
+                format!("虎牙弹幕订阅失败（服务端错误码 {code}）")
+            };
+            self.events.insert(0, DanmakuEvent::Status(message));
         }
-        events.extend(self.events);
-        events
+        self.events
     }
 }
 
@@ -761,13 +736,12 @@ fn limit_text(value: &str) -> String {
 ///
 /// 返回的 DanmakuEvent::Message 只覆盖聊天（uri 1400）。虎牙协议没有付费留言
 /// （SC）消息类型，参考实现也明确拒绝用大额礼物伪造 SC，所以这里不会产出
-/// SuperChat；Status 用于订阅回显，便于上层显示“订阅是否成功”。
+/// SuperChat；Status 用于显示服务端的订阅应答结果。
 pub fn decode(payload: &[u8]) -> Result<Vec<DanmakuEvent>> {
-    let context = DecodeContext::default();
-    Ok(decode_command_with(payload, context)?.into_events(context))
+    Ok(decode_command(payload)?.into_events())
 }
 
-fn decode_command_with(payload: &[u8], _context: DecodeContext) -> Result<Decoded> {
+fn decode_command(payload: &[u8]) -> Result<Decoded> {
     ensure!(
         payload.len() <= MAX_WIRE_BYTES,
         "虎牙弹幕帧超过 {MAX_WIRE_BYTES} 字节上限"
@@ -797,7 +771,8 @@ fn decode_command_with(payload: &[u8], _context: DecodeContext) -> Result<Decode
                 CMD_PUSH_V1 => decode_push_v1(data, &mut decoded.events)?,
                 CMD_PUSH_V2 => decode_push_v2(data, &mut decoded.events)?,
                 CMD_REGISTER_GROUP_RSP => {
-                    decoded.subscribe_groups = Some(decode_register_group_rsp(data)?)
+                    // iResCode is tag 0. Tag 1 lists P2P-capable groups.
+                    decoded.registration_result = TarsReader::new(data).num(0)?;
                 }
                 _ => unreachable!(),
             }
@@ -848,26 +823,6 @@ fn decode_push_v2(data: &[u8], output: &mut Vec<DanmakuEvent>) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// cmd 17：RegisterGroupRsp，tag1 是 list<string>。空列表意味着组名/频道 id 错了
-/// （旧实现实测：用 yyuid 当组名时服务器静默回空组，不报错）。
-fn decode_register_group_rsp(data: &[u8]) -> Result<Vec<String>> {
-    let mut reader = TarsReader::new(data);
-    let Some(count) = reader.enter_list(1)? else {
-        return Ok(Vec::new());
-    };
-    let mut groups = Vec::new();
-    for _ in 0..count {
-        // 列表元素本身是 Str(0, 值) 的完整编码；不要再额外读一次头，
-        // 否则会把“长度字节”当成新头（旧实现踩过，组名永远解析成空串）。
-        if let Some(group) = reader.text(0)? {
-            if groups.len() < 64 {
-                groups.push(limit_text(&group));
-            }
-        }
-    }
-    Ok(groups)
 }
 
 /// 按 uri 分发消息体。只处理 1400（聊天）；礼物/进场/在线数等通道保持忽略，
@@ -1022,9 +977,6 @@ struct RoomIds {
     channel_id: i64,
     /// 主播 yyuid：心跳 lYyid 用；拿不到时旧实现也会带 0 发送。
     yyid: i64,
-    /// Observed live state from the room cache; None means unknown. An offline
-    /// room legitimately answers the subscription with an empty group.
-    live: Option<bool>,
 }
 
 /// 从房间页的脚本片段里抠数字，语义对齐旧实现 JsonLong：
@@ -1046,33 +998,6 @@ fn json_number_after(text: &str, key: &str) -> Option<i64> {
     text[digits..cursor].parse().ok()
 }
 
-/// 从页面里抠一个带引号的字符串值（liveStatus 等），只接受单层普通文本。
-fn json_string_after(text: &str, key: &str) -> Option<String> {
-    let start = text.find(key)? + key.len();
-    let bytes = text.as_bytes();
-    let mut cursor = start;
-    while cursor < bytes.len() && matches!(bytes[cursor], b' ' | b'"') {
-        cursor += 1;
-    }
-    let begin = cursor;
-    while cursor < bytes.len() && bytes[cursor] != b'"' && bytes[cursor] != b'\n' {
-        cursor += 1;
-    }
-    if cursor == begin || cursor >= bytes.len() {
-        return None;
-    }
-    let value = std::str::from_utf8(&bytes[begin..cursor]).ok()?.trim();
-    (!value.is_empty() && value.len() <= 64).then(|| value.to_owned())
-}
-
-fn live_status_from(value: &str) -> Option<bool> {
-    match value.to_ascii_uppercase().as_str() {
-        "ON" | "LIVE" | "1" | "2" => Some(true),
-        "OFF" | "CLOSE" | "REPLAY" | "0" | "4" => Some(false),
-        _ => None,
-    }
-}
-
 /// 依次用房间页、移动页、手机接口缓存补全 id（对齐旧实现 ResolveRoom 的优先级）。
 fn room_ids_from_pages(pc: Option<&str>, mobile: Option<&str>, cache: Option<&str>) -> RoomIds {
     let mut ids = RoomIds::default();
@@ -1085,8 +1010,6 @@ fn room_ids_from_pages(pc: Option<&str>, mobile: Option<&str>, cache: Option<&st
             .filter(|value| *value != 0)
             .or_else(|| json_number_after(page, "\"liveChannel\":"))
             .unwrap_or(0);
-        ids.live =
-            json_string_after(page, "\"liveStatus\":").and_then(|value| live_status_from(&value));
     }
     if ids.channel_id == 0 || ids.yyid == 0 {
         if let Some(page) = mobile {
@@ -1096,10 +1019,6 @@ fn room_ids_from_pages(pc: Option<&str>, mobile: Option<&str>, cache: Option<&st
             if ids.yyid == 0 {
                 ids.yyid = json_number_after(page, "\"lYyid\":").unwrap_or(0);
             }
-            ids.live = ids.live.or_else(|| {
-                json_string_after(page, "\"liveStatus\":")
-                    .and_then(|value| live_status_from(&value))
-            });
         }
     }
     if let Some(page) = cache {
@@ -1117,16 +1036,6 @@ fn room_ids_from_pages(pc: Option<&str>, mobile: Option<&str>, cache: Option<&st
                 .or_else(|| json_number_after(page, "\"privateHost\":").filter(|value| *value != 0))
                 .unwrap_or(0);
         }
-        ids.live = ids
-            .live
-            .or_else(|| {
-                json_string_after(page, "\"liveStatus\":")
-                    .and_then(|value| live_status_from(&value))
-            })
-            .or_else(|| {
-                json_string_after(page, "\"realLiveStatus\":")
-                    .and_then(|value| live_status_from(&value))
-            });
     }
     ids
 }
@@ -1229,7 +1138,7 @@ fn fetch_page(
 /// 匿名解析房间号 -> (lChannelId, yyid)。只访问虎牙公开页面/接口，不读取登录态。
 ///
 /// 注意：页面结构变化会让解析失败；这种情况返回可操作错误，由上层提示用户，
-/// 不能猜一个 id 继续（用错组名服务器只回空组，反而更难排查）。
+/// 组名必须使用解析出的房间频道 id。
 fn resolve_room(room: &str, cancellation: &Cancellation) -> Result<RoomIds> {
     // 复用域层校验：手工构造的 Target 也不能绕过房间号字符集限制拼进 URL。
     Target::parse(&format!("huya:{room}")).context("虎牙房间号无效")?;
@@ -1239,15 +1148,15 @@ fn resolve_room(room: &str, cancellation: &Cancellation) -> Result<RoomIds> {
         &format!("https://www.huya.com/{room}"),
         cancellation,
     )?;
-    let first = room_ids_from_pages(pc.as_deref(), None, None);
-    let mut mobile = None;
-    if first.channel_id == 0 || first.yyid == 0 || first.live.is_none() {
-        mobile = fetch_page(&client, &format!("https://m.huya.com/{room}"), cancellation)?;
+    let ids = room_ids_from_pages(pc.as_deref(), None, None);
+    if ids.channel_id > 0 && ids.yyid > 0 {
+        return Ok(ids);
     }
-    // The cache API is also the authoritative live/offline flag, so it is read
-    // on every connect (the legacy ResolveRoom did the same) even when the page
-    // already yielded the ids. An offline room answers the subscription with an
-    // empty group; that is not a channel-id error.
+    let mobile = fetch_page(&client, &format!("https://m.huya.com/{room}"), cancellation)?;
+    let ids = room_ids_from_pages(pc.as_deref(), mobile.as_deref(), None);
+    if ids.channel_id > 0 && ids.yyid > 0 {
+        return Ok(ids);
+    }
     let mut cache_url =
         url::Url::parse("https://mp.huya.com/cache.php").context("虎牙房间缓存接口地址无效")?;
     cache_url.query_pairs_mut().extend_pairs([
@@ -1345,7 +1254,7 @@ fn huya_once(
 
     let _ = emit(
         sender,
-        DanmakuEvent::Status(format!("虎牙：已连接，正在订阅 chat:{}", room.channel_id)),
+        DanmakuEvent::Status("虎牙弹幕正在订阅".into()),
     );
     socket
         .send(Message::Binary(
@@ -1359,10 +1268,6 @@ fn huya_once(
         .map_err(|_| anyhow!("虎牙弹幕心跳包发送失败"))?;
     socket.flush().context("虎牙弹幕握手后刷新发送缓冲失败")?;
 
-    let decode_context = DecodeContext {
-        live: room.live,
-        channel_id: room.channel_id,
-    };
     let mut last_heartbeat = Instant::now();
     let mut pending_ack = Some(Instant::now());
     let mut missed_acks = 0_u32;
@@ -1395,7 +1300,7 @@ fn huya_once(
             }
         }
         match socket.read() {
-            Ok(Message::Binary(bytes)) => match decode_command_with(&bytes, decode_context) {
+            Ok(Message::Binary(bytes)) => match decode_command(&bytes) {
                 Ok(decoded) => {
                     consecutive_parse_errors = 0;
                     if decoded.heartbeat_ack {
@@ -1403,7 +1308,10 @@ fn huya_once(
                         pending_ack = None;
                         missed_acks = 0;
                     }
-                    for event in decoded.into_events(decode_context) {
+                    if let Some(code) = decoded.registration_result.filter(|&code| code != 0) {
+                        bail!("虎牙弹幕订阅失败（服务端错误码 {code}）");
+                    }
+                    for event in decoded.into_events() {
                         if emit(sender, event) == Delivery::Closed {
                             return Ok(());
                         }
@@ -1673,7 +1581,6 @@ mod tests {
             RoomIds {
                 channel_id: 2_367_547_387,
                 yyid: 2_369_247_112,
-                live: None
             }
         );
 
@@ -1686,7 +1593,6 @@ mod tests {
             RoomIds {
                 channel_id: 777,
                 yyid: 5678,
-                live: None
             }
         );
 
@@ -1700,7 +1606,6 @@ mod tests {
             RoomIds {
                 channel_id: 42,
                 yyid: 7,
-                live: None
             }
         );
 
@@ -1713,7 +1618,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_live_status_and_channel_fallbacks_are_read() {
+    fn cache_live_channel_and_yyid_fallbacks_are_read() {
         // No page ids at all: liveChannel/yyid in the cache API are enough.
         let cache = r#"{"data":{"liveStatus":"OFF","liveChannel":2367547387,"yyid":2369247112,"realLiveStatus":"OFF"}}"#;
         assert_eq!(
@@ -1721,23 +1626,7 @@ mod tests {
             RoomIds {
                 channel_id: 2_367_547_387,
                 yyid: 2_369_247_112,
-                live: Some(false)
             }
-        );
-        // A page's liveStatus wins over the cache when both are present.
-        let page = r#"{"uid":"11","yyid":"22","liveStatus":"ON"}"#;
-        assert_eq!(
-            room_ids_from_pages(Some(page), None, Some(cache)),
-            RoomIds {
-                channel_id: 11,
-                yyid: 22,
-                live: Some(true)
-            }
-        );
-        // Unknown wording never guesses live state.
-        assert_eq!(
-            room_ids_from_pages(None, None, Some(r#"{"liveStatus":"MAYBE"}"#)).live,
-            None
         );
     }
 
@@ -1765,28 +1654,28 @@ mod tests {
     }
 
     #[test]
-    fn empty_group_message_distinguishes_offline_from_misconfiguration() {
-        let decoded = Decoded {
-            heartbeat_ack: false,
-            subscribe_groups: Some(Vec::new()),
-            events: Vec::new(),
-        };
-        let offline = decoded.into_events(DecodeContext {
-            live: Some(false),
-            channel_id: 2_367_547_387,
-        });
-        assert!(matches!(&offline[0], DanmakuEvent::Status(text) if text.contains("未开播")));
-        let decoded = Decoded {
-            heartbeat_ack: false,
-            subscribe_groups: Some(Vec::new()),
-            events: Vec::new(),
-        };
-        let unknown = decoded.into_events(DecodeContext {
-            live: None,
-            channel_id: 123,
-        });
-        assert!(matches!(&unknown[0], DanmakuEvent::Status(text)
-                if text.contains("空组") && text.contains("123")));
+    fn subscription_result_uses_result_code_instead_of_p2p_groups() {
+        // Successful acknowledgement with an empty P2P group list.
+        let accepted = b"\x00\x11\x1d\x00\x00\x03\x0c\x19\x0c";
+        assert_eq!(
+            decode(accepted).unwrap(),
+            vec![DanmakuEvent::Status("虎牙弹幕已连接，等待新消息".into())]
+        );
+
+        // A nonzero result still reports failure when the P2P list is present.
+        let mut body = TarsWriter::new();
+        body.i32(0, 5);
+        body.list_head(1, 1);
+        body.str(0, "chat:123").unwrap();
+        let mut frame = TarsWriter::new();
+        frame.i32(0, CMD_REGISTER_GROUP_RSP as i32);
+        frame.bytes(1, &body.finish()).unwrap();
+        assert_eq!(
+            decode(&frame.finish()).unwrap(),
+            vec![DanmakuEvent::Status(
+                "虎牙弹幕订阅失败（服务端错误码 5）".into()
+            )]
+        );
     }
 
     #[test]

@@ -1806,23 +1806,9 @@ fn read_loop(
     let started = Instant::now();
     let mut watch = HeartbeatAckWatch::new(HEARTBEAT_ACK_TIMEOUT_MS);
     let mut last_heartbeat = Instant::now();
-    let mut saw_frame = false;
-    let mut silence_notice = false;
     while !cancellation.is_cancelled() {
         let now = Instant::now();
         let elapsed_ms = now.duration_since(started).as_millis() as u64;
-        // A signed handshake can succeed while the platform withholds pushes
-        // (anonymous risk control or a pending web verification). Say that
-        // precisely once instead of looking like an ordinary reconnect loop.
-        if !saw_frame && !silence_notice && now.duration_since(started).as_secs() >= 12 {
-            silence_notice = true;
-            if send_status(
-                sender,
-                "抖音：连接已建立但 12 秒内没有收到服务端推送；匿名接收可能被风控，若平台要求登录/网页验证请先在程序内登录抖音",
-            ) {
-                return Ok(());
-            }
-        }
         if now.duration_since(last_heartbeat) >= HEARTBEAT_INTERVAL {
             socket.send(Message::Binary(heartbeat_packet().into()))?;
             watch.begin(elapsed_ms);
@@ -1834,12 +1820,6 @@ fn read_loop(
         match socket.read() {
             Ok(Message::Binary(bytes)) => match inspect_frame(&bytes) {
                 Ok(inspection) => {
-                    if !saw_frame {
-                        saw_frame = true;
-                        if send_status(sender, "抖音：已收到服务端推送，弹幕开始") {
-                            return Ok(());
-                        }
-                    }
                     if inspection.heartbeat {
                         watch.acknowledge();
                     }
@@ -1917,17 +1897,10 @@ fn run_once(
         let cookie = webcast_cookie_header(&cookies, source, &url, &room.ttwid, now_seconds())?;
         match open_socket(host, &url, cookie.as_deref(), cancellation) {
             Ok(socket) => {
-                let status = if room.status == 2 {
-                    format!(
-                        "抖音弹幕已连接{}",
-                        if room.owner.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" · {}", room.owner)
-                        }
-                    )
+                let status = if room.status == 4 {
+                    "抖音房间未开播，等待开播"
                 } else {
-                    "抖音房间未开播，仍在等待弹幕".to_owned()
+                    "抖音弹幕服务器已连接，等待新消息"
                 };
                 if send_status(sender, status) {
                     return Ok(());

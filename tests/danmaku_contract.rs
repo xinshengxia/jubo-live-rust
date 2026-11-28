@@ -80,7 +80,13 @@ fn bilibili_rejects_truncation_bad_auth_and_brotli_instead_of_silent_success() {
     for length in [1, 8, packet.len() - 1] {
         assert!(decode_bili(&packet[..length]).is_err());
     }
-    assert!(decode_bili(&bili_packet(8, 1, br#"{"code":-101}"#).unwrap()).is_err());
+    assert_eq!(
+        decode_bili(&bili_packet(8, 1, br#"{"code":0}"#).unwrap()).unwrap(),
+        vec![DanmakuEvent::Status("B站弹幕已认证，等待新消息".into())]
+    );
+    let rejected = decode_bili(&bili_packet(8, 1, br#"{"code":-101}"#).unwrap()).unwrap_err();
+    assert!(rejected.to_string().contains("错误码 -101"));
+    assert!(decode_bili(&bili_packet(8, 1, b"{}").unwrap()).is_err());
     assert!(decode_bili(&bili_packet(5, 3, b"not-brotli").unwrap()).is_err());
     let mut bad = packet;
     bad[0..4].copy_from_slice(&0_u32.to_be_bytes());
@@ -153,6 +159,13 @@ fn douyu_checks_repeated_length_and_decodes_nested_superchat_once() {
             .push(&douyu_packet("type@=pingreq/", true).unwrap())
             .unwrap()
             .ping_requested
+    );
+    let acknowledgement = douyu_packet("type@=loginres/", true).unwrap();
+    assert_eq!(
+        DouyuDecoder::default().push(&acknowledgement).unwrap().events,
+        vec![DanmakuEvent::Status(
+            "斗鱼弹幕服务器已连接，等待新消息".into()
+        )]
     );
 }
 

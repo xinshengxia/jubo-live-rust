@@ -4570,10 +4570,10 @@ impl Overlay {
                     self.stats_live_events
                 ),
             );
-            // Be honest instead of looking broken: after 15 s without a single
-            // message the room may simply restrict who can chat.
-            if self.stats_received == 0 && self.start.elapsed().as_secs() >= 15 {
-                self.status = "已连接弹幕 · 房间暂无新消息（B站可能限制发言等级/粉丝）".into();
+            if self.stats_received == 0
+                && self.status_at.elapsed().as_secs_f32() >= STATUS_VISIBLE_SECS
+            {
+                self.status = "暂未收到新弹幕".into();
                 self.status_at = Instant::now();
             }
         }

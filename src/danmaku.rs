@@ -753,11 +753,11 @@ fn bili_packets(
             (5, _) => bail!("unsupported Bilibili compression version"),
             (8, _) => {
                 let value: Value = serde_json::from_slice(payload)?;
-                ensure!(
-                    value["code"].as_i64() == Some(0),
-                    "Bilibili rejected danmaku authentication"
-                );
-                output.push(DanmakuEvent::Status("B站弹幕认证成功".into()));
+                let code = value["code"]
+                    .as_i64()
+                    .context("B站弹幕认证回执缺少有效结果码")?;
+                ensure!(code == 0, "B站弹幕认证未通过（错误码 {code}）");
+                output.push(DanmakuEvent::Status("B站弹幕已认证，等待新消息".into()));
             }
             _ => {}
         }
@@ -855,7 +855,7 @@ impl DouyuDecoder {
                 Some("pingreq") => batch.ping_requested = true,
                 Some("loginres") => batch
                     .events
-                    .push(DanmakuEvent::Status("斗鱼弹幕已登录".into())),
+                    .push(DanmakuEvent::Status("斗鱼弹幕服务器已连接，等待新消息".into())),
                 Some("chatmsg") => {
                     if let Some(event) = douyu_message(&fields) {
                         batch.events.push(DanmakuEvent::Message(event));
