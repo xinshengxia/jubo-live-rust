@@ -32,7 +32,6 @@ unsafe extern "system" {
     fn GetDpiForWindow(window: Hwnd) -> u32;
     fn GetClassNameW(window: Hwnd, name: *mut u16, len: i32) -> i32;
     fn UpdateLayeredWindowIndirect(window: Hwnd, update: *const LayeredUpdate) -> i32;
-    fn SetLayeredWindowAttributes(window: Hwnd, color: u32, opacity: u8, flags: u32) -> i32;
 }
 
 #[repr(C)]
@@ -189,6 +188,33 @@ impl Dib {
                 size,
             })
         }
+    }
+
+    fn submit(&self, window: Hwnd, dirty: Option<&Rect>) -> io::Result<()> {
+        let origin = Point::default();
+        let blend = [0, 0, 255, 1]; // AC_SRC_OVER with per-pixel alpha
+        let update = LayeredUpdate {
+            bytes: std::mem::size_of::<LayeredUpdate>() as u32,
+            dst_dc: ptr::null_mut(),
+            dst: ptr::null(),
+            size: &self.size,
+            src_dc: self.dc,
+            origin: &origin,
+            key: 0,
+            blend: &blend,
+            flags: 2 | 8, // ULW_ALPHA | ULW_EX_NORESIZE
+            dirty: dirty.map_or(ptr::null(), |rect| rect),
+        };
+        if unsafe { UpdateLayeredWindowIndirect(window, &update) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn submit_clear(window: Hwnd, size: [i32; 2]) -> io::Result<()> {
+        let dib = Self::new(size)?;
+        unsafe { ptr::write_bytes(dib.bits, 0, dib.len) };
+        dib.submit(window, None)
     }
 }
 
@@ -418,10 +444,10 @@ impl PackBuffer {
 struct Presenter {
     window: Hwnd,
     frame: Option<Framebuffer>,
+    composition_base_size: Option<[i32; 2]>,
     gpu: Option<dcomp::GpuPresenter>,
     gpu_requested: bool,
     sprites: Option<sprite_frames::Frames>,
-    composition_style: bool,
     gpu_fail_after: Option<u64>,
     gpu_submitted: u64,
     painting: bool,
@@ -690,31 +716,33 @@ fn offscreen_x(width: i32) -> i32 {
         .saturating_sub(64) // SM_XVIRTUALSCREEN
 }
 
-const WS_EX_LAYERED: isize = 0x0008_0000;
-
-fn set_extended_style(window: Hwnd, style: isize) -> io::Result<()> {
-    unsafe {
-        // A return of zero can mean either success or failure.
-        windows_sys::Win32::Foundation::SetLastError(0);
-        let previous = SetWindowLongPtrW(window, -20, style);
-        if previous == 0 && windows_sys::Win32::Foundation::GetLastError() != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-fn reset_bitmap_style(window: Hwnd) -> io::Result<()> {
-    let style = unsafe { GetWindowLongPtrW(window, -20) };
-    // ULW is unavailable after SetLayeredWindowAttributes until the layer bit is reset.
-    let unlayered = style & !WS_EX_LAYERED;
-    set_extended_style(window, unlayered).map_err(|e| io::Error::other(format!("clear layered style: {e}")))?;
+fn enable_bitmap_window(window: Hwnd) {
     let window_style = unsafe { GetWindowLongPtrW(window, -16) };
     if window_style & 0x0800_0000 != 0 {
         unsafe { EnableWindow(window, 1) };
     }
-    set_extended_style(window, unlayered | WS_EX_LAYERED).map_err(|e| io::Error::other(format!("restore layered style: {e}")))?;
-    Ok(())
+}
+
+fn restore_lost_layered_style(window: Hwnd) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    const GWL_EXSTYLE: i32 = -20;
+    const WS_EX_LAYERED: isize = 0x0008_0000;
+    unsafe {
+        SetLastError(0);
+        let style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        if style == 0 && GetLastError() != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if style & WS_EX_LAYERED != 0 {
+            return Ok(false);
+        }
+        SetLastError(0);
+        let previous = SetWindowLongPtrW(window, GWL_EXSTYLE, style | WS_EX_LAYERED);
+        if previous == 0 && GetLastError() != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(true)
 }
 
 pub(in crate::overlay) fn create(
@@ -791,10 +819,10 @@ pub(in crate::overlay) fn create(
             *slot.borrow_mut() = Some(Presenter {
                 window,
                 frame: None,
+                composition_base_size: None,
                 gpu: None,
                 gpu_requested,
                 sprites: sprites_requested.then(sprite_frames::Frames::default),
-                composition_style: gpu_requested || sprites_requested,
                 gpu_fail_after: std::env::var_os("LIVE_HUB_OVERLAY_FIXTURE")
                     .and_then(|_| std::env::var("LIVE_HUB_OVERLAY_DIAG_DCOMP_FAIL_AFTER").ok())
                     .and_then(|frames| frames.parse().ok()),
@@ -873,7 +901,7 @@ fn save_renderer_screenshot(
 }
 
 impl Presenter {
-    fn fall_back_to_bitmap(&mut self, gl: &glow::Context) -> anyhow::Result<()> {
+    fn fall_back_to_bitmap(&mut self, gl: &glow::Context) {
         invalidate_sc_frame();
         self.gpu_requested = false;
         self.previous_scene = None;
@@ -881,36 +909,21 @@ impl Presenter {
         if let Some(mut gpu) = self.gpu.take() {
             gpu.destroy(gl);
         }
-        if self.composition_style {
-            reset_bitmap_style(self.window)?;
-            self.composition_style = false;
-        }
-        Ok(())
+        enable_bitmap_window(self.window);
     }
 
-    fn initialize_gpu(&mut self, gl: &glow::Context) -> anyhow::Result<()> {
-        if !self.gpu_requested {
-            if self.composition_style {
-                self.fall_back_to_bitmap(gl)?;
-            }
-        } else if self.gpu.is_none() {
-            let initialized = (|| {
-                if unsafe { SetLayeredWindowAttributes(self.window, 0, 255, 2) } == 0 {
-                    return Err(io::Error::last_os_error().into());
-                }
-                dcomp::GpuPresenter::new(self.window)
-            })();
-            match initialized {
+    fn initialize_gpu(&mut self, gl: &glow::Context) {
+        if self.gpu_requested && self.gpu.is_none() {
+            match dcomp::GpuPresenter::new(self.window) {
                 Ok(gpu) => self.gpu = Some(gpu),
                 Err(error) => {
                     self.report(Err(
                         error.context("DirectComposition initialization; switching to bitmap")
                     ));
-                    self.fall_back_to_bitmap(gl)?;
+                    self.fall_back_to_bitmap(gl);
                 }
             }
         }
-        Ok(())
     }
 
     fn present_gpu(
@@ -980,16 +993,34 @@ impl Presenter {
             .unwrap_or(0);
         if NEEDS_REPRESENT.swap(false, Ordering::AcqRel) || generation != self.sc_generation {
             self.previous_scene = None;
+            self.composition_base_size = None;
             self.sc_generation = generation;
         }
         if unsafe { IsWindowVisible(self.window) } == 0
             || !client_area(self.window).is_some_and(|area| [area.width, area.height] == size)
         {
             self.previous_scene = None;
+            self.composition_base_size = None;
             invalidate_sc_frame();
             return Ok(());
         }
-        if self.sprites.is_none() { self.initialize_gpu(gl)?; }
+        // DWM draws the HWND backing pixels below the visuals. A hide/show or a
+        // resize round trip can invalidate them while the FBO keeps the same size.
+        if (self.sprites.is_some() || self.gpu_requested) && self.composition_base_size != Some(size) {
+            if let Err(error) = Dib::submit_clear(self.window, size) {
+                if client_area(self.window).is_some_and(|area| [area.width, area.height] != size) {
+                    return Ok(());
+                }
+                if self.sprites.is_some() {
+                    return Err(error.into());
+                }
+                self.report(Err(anyhow::Error::new(error)
+                    .context("transparent composition base; switching to bitmap")));
+                self.fall_back_to_bitmap(gl);
+            } else {
+                self.composition_base_size = Some(size);
+            }
+        }
         if self.frame.as_ref().map(|f| f.size) != Some(size) {
             self.previous_scene = None;
             invalidate_sc_frame();
@@ -1009,6 +1040,7 @@ impl Presenter {
         {
             return Ok(());
         }
+        self.initialize_gpu(gl);
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.frame.as_ref().unwrap().fbo));
             gl.disable(glow::SCISSOR_TEST);
@@ -1037,7 +1069,7 @@ impl Presenter {
                     self.report(Err(
                         error.context("DirectComposition frame; switching to bitmap")
                     ));
-                    self.fall_back_to_bitmap(gl)?;
+                    self.fall_back_to_bitmap(gl);
                     unsafe {
                         gl.bind_framebuffer(
                             glow::FRAMEBUFFER,
@@ -1099,35 +1131,29 @@ impl Presenter {
             }
             return Ok(());
         };
-        let origin = Point::default();
-        let blend = [0, 0, 255, 1]; // AC_SRC_OVER, SourceConstantAlpha, AC_SRC_ALPHA
-        let update = LayeredUpdate {
-            bytes: std::mem::size_of::<LayeredUpdate>() as u32,
-            dst_dc: ptr::null_mut(),
-            dst: ptr::null(),
-            size: &dib.size,
-            src_dc: dib.dc,
-            origin: &origin,
-            key: 0,
-            blend: &blend,
-            flags: 2 | 8,
-            dirty: if previous.is_none() {
-                ptr::null()
-            } else {
-                &dirty
-            },
-        };
-        if unsafe { UpdateLayeredWindowIndirect(self.window, &update) } == 0 {
-            let error = io::Error::last_os_error();
+        if let Err(error) = dib.submit(self.window, previous.as_ref().map(|_| &dirty)) {
             invalidate_sc_frame();
             // The asynchronous watcher can resize the destination during
             // readback. A stale frame must never resize the player overlay back.
             if client_area(self.window).is_some_and(|area| [area.width, area.height] != dib.size) {
                 return Ok(());
             }
-            return Err(anyhow::anyhow!(
-                "UpdateLayeredWindowIndirect {w}x{h}: {error}"
-            ));
+            if !restore_lost_layered_style(self.window)? {
+                return Err(anyhow::anyhow!(
+                    "UpdateLayeredWindowIndirect {w}x{h}: {error}"
+                ));
+            }
+            // Reapplying WS_EX_LAYERED discards the window's retained pixels.
+            // Submit the entire DIB before publishing any card hit targets.
+            if let Err(retry_error) = dib.submit(self.window, None) {
+                if client_area(self.window).is_some_and(|area| [area.width, area.height] != dib.size) {
+                    return Ok(());
+                }
+                return Err(anyhow::anyhow!(
+                    "UpdateLayeredWindowIndirect {w}x{h} after restoring layered style: {retry_error}"
+                ));
+            }
+            diag_log("layered window: restored layered style and submitted full bitmap");
         }
         self.cleared_while_hidden = self.content_hidden;
         if layout_matches

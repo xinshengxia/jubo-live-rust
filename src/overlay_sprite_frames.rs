@@ -159,9 +159,7 @@ impl Presenter {
         self.previous_scene = None;
         self.cleared_while_hidden = false;
         invalidate_sc_frame();
-        if let Err(error) = reset_bitmap_style(self.window) {
-            self.report(Err(error.into()));
-        }
+        enable_bitmap_window(self.window);
         ctx.request_repaint();
     }
 
@@ -174,9 +172,6 @@ impl Presenter {
     ) -> anyhow::Result<()> {
         let frames = self.sprites.as_mut().unwrap();
         if frames.device.is_none() {
-            if unsafe { SetLayeredWindowAttributes(self.window, 0, 255, 2) } == 0 {
-                return Err(io::Error::last_os_error().into());
-            }
             frames.device = Some(dcomp::SpritePresenter::new(self.window)?);
         }
         let device = frames.device.as_mut().unwrap();
