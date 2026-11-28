@@ -4150,14 +4150,13 @@ impl Overlay {
         let margin = (12.0 / dpi).clamp(6.0, 20.0);
         let status_font = FontId::proportional((15.0 / dpi).clamp(10.0, 19.0));
         let hint_font = FontId::proportional((13.0 / dpi).clamp(9.0, 17.0));
-        let shortcut_gold = Color32::from_rgb(255, 214, 102);
         // The persistent shortcut hint is a Rust-only addition; users can turn
         // it off in the danmaku/SC settings without losing status feedback.
         let hint = self.options.show_shortcut_hint.then(|| {
             painter.layout_no_wrap(
                 hint_text(&self.settings),
                 hint_font,
-                shortcut_gold,
+                Color32::from_white_alpha(150),
             )
         });
         let mut top = rect.bottom() - margin;
@@ -4167,7 +4166,7 @@ impl Overlay {
                 painter,
                 Pos2::new(rect.left() + margin, top),
                 hint,
-                shortcut_gold,
+                Color32::from_white_alpha(150),
                 1.0,
             );
         }
@@ -4192,14 +4191,14 @@ impl Overlay {
             let feedback = painter.layout_no_wrap(
                 self.feedback.clone(),
                 status_font,
-                shortcut_gold,
+                Color32::from_rgb(255, 214, 102),
             );
             top -= feedback.size().y + 3.0;
             paint_galley_with_outline(
                 painter,
                 Pos2::new(rect.left() + margin, top),
                 feedback,
-                shortcut_gold,
+                Color32::from_rgb(255, 214, 102),
                 1.0,
             );
         }
