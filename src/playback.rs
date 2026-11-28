@@ -27,6 +27,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use url::Url;
 
+#[path = "potplayer_reload.rs"]
+pub mod potplayer_reload;
+
 /// Upper bound for the relay's one-line READY handshake.
 const RELAY_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Relay stdout is a single protocol line; anything else is not our protocol.
@@ -2233,6 +2236,12 @@ where
             }
             return Err(error).context("无法绑定播放器生命周期，已停止本次播放");
         }
+    }
+    #[cfg(windows)]
+    if player == Player::PotPlayer
+        && let Err(error) = potplayer_reload::start(&player_child)
+    {
+        crate::diag::log("playback", crate::diag::Level::Warn, &format!("PotPlayer 刷新快捷键未启动：{error}"));
     }
     let title = resolved.title.clone();
     let telemetry_url = relay.is_some().then(|| playable.url.clone());

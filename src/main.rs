@@ -46,6 +46,8 @@ enum Action {
         #[arg(long)]
         refresh_request: Option<String>,
     },
+    #[command(hide = true)]
+    PotplayerReload { pid: u32, started: u64 },
     /// Open the native desktop launcher.
     Gui,
     /// Parse a room without network or persistent writes.
@@ -708,6 +710,7 @@ fn run() -> Result<()> {
 fn action_name(action: &Action) -> &'static str {
     match action {
         Action::MpvHelper { .. } => "mpv-helper",
+        Action::PotplayerReload { .. } => "potplayer-reload",
         Action::Gui => "gui",
         Action::Parse { .. } => "parse",
         Action::Resolve { .. } => "resolve",
@@ -732,6 +735,7 @@ fn action_writes_data(action: &Action) -> bool {
         action,
         Action::Parse { .. }
             | Action::MpvHelper { .. }
+            | Action::PotplayerReload { .. }
             | Action::Plan { .. }
             | Action::Capabilities
             | Action::SelfTest
@@ -742,6 +746,7 @@ fn action_writes_data(action: &Action) -> bool {
 fn dispatch(data_dir: Option<PathBuf>, action: Action) -> Result<()> {
     match action {
         Action::MpvHelper { refresh_request } => playback::run_mpv_helper(refresh_request.as_deref())?,
+        Action::PotplayerReload { pid, started } => playback::potplayer_reload::watch(pid, started)?,
         Action::Parse { target } => println!(
             "{}",
             serde_json::to_string_pretty(&Target::parse(&target)?)?
