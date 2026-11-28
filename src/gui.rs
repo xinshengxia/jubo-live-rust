@@ -354,7 +354,7 @@ impl Page {
 
     pub fn subtitle(self) -> &'static str {
         match self {
-            Self::Favorites => "喜欢的主播，打开就能看。",
+            Self::Favorites => "在 mpv 播放窗口按 Ctrl+R 刷新直播流。",
             Self::Recent => "选择熟悉的播放器，从最近的房间继续。",
             Self::Lookup => "查询、核验、收藏，找到喜欢的主播。",
             Self::Sessions => "查看正在观看的房间，按上次选项重新打开。",

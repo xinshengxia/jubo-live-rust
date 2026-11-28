@@ -13,12 +13,42 @@ pub(super) struct Updater {
     ticket: Option<String>,
     worker: Option<Child>,
     installing: bool,
+    downloading_online: bool,
+    download: Option<DownloadProgress>,
     newer_version: bool,
     automatic: Option<bool>,
     message: String,
     last_poll: Option<Instant>,
     next_check: Option<Instant>,
     closing: bool,
+}
+
+const DOWNLOAD_POLL: Duration = Duration::from_millis(250);
+
+#[derive(serde::Deserialize)]
+struct DownloadProgress {
+    downloaded: u64,
+    total: u64,
+}
+
+impl DownloadProgress {
+    fn read(dir: &Path, status: Option<&str>, online: bool) -> Option<Self> {
+        if !online || status != Some("正在下载更新包…") || dir.join("cancel").exists() {
+            return None;
+        }
+        let bytes = fs::read(dir.join("download.json")).ok()?;
+        let progress: Self = serde_json::from_slice(&bytes).ok()?;
+        (progress.total > 0 && progress.downloaded <= progress.total).then_some(progress)
+    }
+
+    fn label(&self) -> String {
+        let percent = u128::from(self.downloaded) * 100 / u128::from(self.total);
+        format!(
+            "{percent}%  ·  {} / {}",
+            super::data_page::size_text(self.downloaded),
+            super::data_page::size_text(self.total)
+        )
+    }
 }
 
 fn cache() -> Option<PathBuf> {
@@ -107,6 +137,9 @@ impl Updater {
             });
         }
         self.newer_version = false;
+        self.download = None;
+        self.downloading_online = install && package.is_none();
+        self.last_poll = None;
         let ticket = uuid::Uuid::new_v4().simple().to_string();
         match start(
             if install { "Install" } else { "Check" },
@@ -125,7 +158,10 @@ impl Updater {
                 }
                 .into();
             }
-            Err(err) => self.message = format!("无法启动更新任务：{err}"),
+            Err(err) => {
+                self.downloading_online = false;
+                self.message = format!("无法启动更新任务：{err}");
+            }
         }
     }
 
@@ -135,6 +171,7 @@ impl Updater {
         };
         let finished = child.try_wait();
         let text = fs::read_to_string(dir.join("status.txt")).ok();
+        self.download = DownloadProgress::read(dir, text.as_deref(), self.downloading_online);
         if let Some(s) = &text {
             self.message.clone_from(s);
         }
@@ -155,6 +192,8 @@ impl Updater {
         }
         self.worker = None;
         self.installing = false;
+        self.downloading_online = false;
+        self.download = None;
     }
 
     pub(super) fn page(&mut self, ui: &mut egui::Ui, data: &Path, card: egui::Color32) {
@@ -176,6 +215,15 @@ impl Updater {
                     } else {
                         &self.message
                     });
+                    if self.downloading_online {
+                        ui.ctx().request_repaint_after(DOWNLOAD_POLL);
+                    }
+                    if let Some(progress) = &self.download {
+                        let fraction = (progress.downloaded as f64 / progress.total as f64) as f32;
+                        ui.add_space(6.0);
+                        super::widgets::progress(ui, fraction, ui.available_width());
+                        ui.small(progress.label());
+                    }
                     ui.add_space(16.0);
                     ui.horizontal_wrapped(|ui| {
                         if ui
@@ -191,7 +239,10 @@ impl Updater {
                                 match fs::create_dir_all(&dir)
                                     .and_then(|_| fs::write(dir.join("cancel"), b"cancel"))
                                 {
-                                    Ok(()) => self.message = "已请求取消安装。".into(),
+                                    Ok(()) => {
+                                        self.download = None;
+                                        self.message = "已请求取消安装。".into();
+                                    }
                                     Err(err) => self.message = format!("无法取消：{err}"),
                                 }
                             }
@@ -264,11 +315,16 @@ impl Updater {
         data: &Path,
         idle: impl FnOnce() -> bool,
     ) -> (bool, Option<String>) {
+        let interval = if self.downloading_online {
+            DOWNLOAD_POLL
+        } else {
+            Duration::from_secs(2)
+        };
         if !self.enabled
             || self.closing
             || self
                 .last_poll
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(2))
+                .is_some_and(|t| t.elapsed() < interval)
         {
             return (false, None);
         }
@@ -323,6 +379,35 @@ impl Updater {
             }
         }
         (self.closing, notice)
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+
+    #[test]
+    fn download_values_follow_only_the_active_online_download() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let path = dir.join("download.json");
+        let status = Some("正在下载更新包…");
+        assert!(DownloadProgress::read(dir, status, true).is_none());
+        for invalid in [
+            r#"{"downloaded":10,"total":0}"#,
+            r#"{"downloaded":21,"total":20}"#,
+            "{",
+        ] {
+            fs::write(&path, invalid).unwrap();
+            assert!(DownloadProgress::read(dir, status, true).is_none());
+        }
+        fs::write(&path, r#"{"downloaded":256,"total":1024}"#).unwrap();
+        let row = DownloadProgress::read(dir, status, true).unwrap();
+        assert_eq!(row.label(), "25%  ·  256 B / 1.00 KiB");
+        assert!(DownloadProgress::read(dir, status, false).is_none());
+        assert!(DownloadProgress::read(dir, Some("正在校验安装包…"), true).is_none());
+        fs::write(dir.join("cancel"), b"cancel").unwrap();
+        assert!(DownloadProgress::read(dir, status, true).is_none());
     }
 }
 
